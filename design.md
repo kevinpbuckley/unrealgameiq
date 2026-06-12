@@ -1,0 +1,219 @@
+# Unreal Game IQ — Design Document
+
+**Status:** Draft v0.1 · June 2026
+**Owner:** Buckley Builds LLC
+**Related products:** [VibeUE](https://www.vibeue.com/) (acts on a live editor), [Unreal Engine Skills](https://www.unrealengineskills.com/) (engine knowledge for agents)
+
+---
+
+## 1. One-line pitch
+
+**Unreal Game IQ knows your game.** It builds a continuously updated, queryable model of an Unreal Engine project — assets, Blueprints, C++, config, and how they connect and change over time — and exposes that model to you and to AI agents. Ask a real question about your game and get a grounded, cited answer; point an agent at your project and it stops guessing.
+
+## 2. The problem
+
+An Unreal project is the worst-indexed codebase in software:
+
+1. **Half the logic is invisible to text tools.** Blueprints, DataTables, Behavior Trees, materials, and levels are binary `.uasset` files. `grep` returns nothing. An AI agent pointed at the repo literally cannot read half the game. This is the single biggest reason agents underperform on UE projects.
+2. **The connective tissue is implicit.** "What breaks if I delete this texture?" "Who calls this event?" "Which levels use this Blueprint?" The answers exist only inside the editor's Asset Registry and reference viewer — slow to open, impossible for an agent to use, and gone the moment the editor closes.
+3. **Knowledge lives in heads.** "How does the damage system work?" spans a C++ component, two Blueprints, a DataTable, and a config file. Nobody documented it; the one person who knew left the team or forgot.
+4. **Change is opaque.** A `.uasset` diff in source control is a binary blob. "What actually changed in combat since the last milestone?" is unanswerable without replaying history in the editor.
+
+Existing tools each see a slice: the editor sees everything but only interactively; IDEs see C++ only; source control sees files, not meaning. Nothing holds the whole game in one queryable place.
+
+## 3. Product pillars (matches the site)
+
+| Pillar | Meaning |
+|---|---|
+| **Knows your game** | A persistent index of every asset, Blueprint, class, and the dependency/reference graph between them — kept fresh as the project changes, with history. |
+| **Answers, not searches** | Natural-language questions get grounded, cited answers ("Fall damage is applied in `BP_PlayerCharacter` → `OnLanded`, which calls `UHealthComponent::ApplyDamage` defined in `HealthComponent.cpp:142`"), not a list of 200 search hits. |
+| **Built for AI workflows** | The index is exposed as an MCP server. Any agent (Claude Code, Copilot, Cursor) gets project context as tools — the missing third leg next to engine knowledge (UE Skills) and editor control (VibeUE). |
+
+## 4. Who it's for
+
+- **Primary: solo devs and small teams using AI agents.** They want the agent to stop guessing about their project. Game IQ is what makes "fix the bug in my reload logic" work when the reload logic is a Blueprint.
+- **Secondary: the humans on those teams.** Onboarding ("explain the inventory system"), hygiene ("what's unused?", "why is the build 40 GB?"), and impact analysis before risky changes.
+- **Later: mid-size studios** with Perforce, build farms, and stricter IP requirements. Local-first design (see §9) is what keeps this door open.
+
+## 5. How it works — the loop
+
+```
+                ┌──────────────────────────────────────────────┐
+                │                YOUR PROJECT                  │
+                │  .uproject  Source/  Content/  Config/  VCS  │
+                └──────┬───────────────────────────┬───────────┘
+                       │ extract                   │ watch
+                       ▼                           ▼
+            ┌─────────────────┐          ┌──────────────────┐
+            │   EXTRACTORS    │          │  CHANGE WATCHER  │
+            │ asset registry  │◄─────────│ fs events + VCS  │
+            │ BP graph dump   │ re-index │ commits          │
+            │ C++ reflection  │  deltas  └──────────────────┘
+            │ config/ini      │
+            └────────┬────────┘
+                     ▼
+            ┌─────────────────┐
+            │  KNOWLEDGE BASE │   entities + edges + text + vectors
+            │  (local SQLite) │   snapshots over time
+            └────────┬────────┘
+                     ▼
+            ┌─────────────────┐
+            │   QUERY ENGINE  │   graph queries · hybrid search · synthesis
+            └────────┬────────┘
+                     ▼
+        ┌────────────┴────────────┐
+        ▼                         ▼
+  ┌───────────┐            ┌────────────┐
+  │ MCP SERVER│            │  CLI / UI  │
+  │ (agents)  │            │  (humans)  │
+  └───────────┘            └────────────┘
+```
+
+### 5.1 Extraction (the hard, defensible part)
+
+Extraction must cover **every `.uasset` in the project — not just Blueprints**. A question like "which meshes still use the old skeleton?" or "what's driving this material parameter?" is exactly the kind of thing Game IQ exists to answer. To make full coverage tractable, extraction is a small *framework* rather than a fixed list of extractors: every asset gets shallow coverage for free, and high-value asset classes get bespoke deep extractors ("recipes"). Three depth tiers:
+
+- **Tier 0 — Registry (every asset, free).** From the Asset Registry: identity, class, package path, tags/metadata, and the **dependency/referencer graph**. Covers all assets of every type with zero per-type code, and alone answers "what uses X?".
+- **Tier 1 — Typed summary (per-class recipes).** Structured extraction of what each asset *is*: its shape, settings, and outgoing semantic links.
+- **Tier 2 — Logic rendering (the killer feature).** Graph-bearing assets rendered as **pseudocode/structured text** ("On BeginPlay → if HasWeapon → Spawn BP_Muzzle…") so their logic is greppable, embeddable, and quotable in answers.
+
+Initial recipe set, covering the asset classes that dominate real questions:
+
+| Asset class | Tier 1 summary | Tier 2 logic |
+|---|---|---|
+| Blueprint (Actor/Component/Widget/etc.) | parent class, variables, components, functions, dispatchers, interfaces | event/function graphs as pseudocode |
+| Material / Material Function | shading model, blend mode, parameters, texture refs, usage flags | expression graph as pseudocode |
+| Material Instance | parent chain + **only the overridden parameters** | — |
+| Skeleton | bone hierarchy, sockets, slots, curve names | — |
+| Skeletal Mesh | skeleton link, LODs, material slots, morph targets, vert/tri counts, physics asset | — |
+| Static Mesh | LODs, material slots, UV channels, collision setup, sockets, tri counts | — |
+| Texture | dimensions, format, compression, sRGB, mip/LOD settings, on-disk size | — |
+| Anim Sequence / Montage / BlendSpace | skeleton, length, curves, notifies, slots | — |
+| Anim Blueprint | target skeleton, anim graph structure | state machines + transition rules as text |
+| Behavior Tree / Blackboard | composites, decorators, services, tasks, blackboard keys | tree as indented text |
+| Niagara System / Emitter | emitters, modules, exposed parameters | module stack summary |
+| Level / World | actor inventory (class, name, transform), per-actor property overrides, sublevels/data layers | — |
+| DataTable / CurveTable | row struct + full row data | — |
+| Sound Cue / MetaSound | graph nodes, wave refs, attenuation | graph summary |
+| Physics Asset, Input assets, GameplayTags, DataAssets | typed property summaries | — |
+
+**Generic fallback recipe — no asset is invisible.** Any asset class without a bespoke recipe (plugin types, marketplace systems, new engine features) is exported as a *property bag* via UE's reflection/export-text path: every editable property, serialized to structured text, plus its Tier 0 graph edges. Shallower than a recipe, but it guarantees 100% coverage — and writing a new recipe later is mostly a formatting pass over data the fallback already captures. Recipes are versioned and pluggable so users/plugins can register their own for custom asset types.
+
+Alongside the asset framework, two non-asset extractors:
+
+- **C++ extractor.** Parses `Source/` for the reflection surface (UCLASS / USTRUCT / UFUNCTION / UPROPERTY / delegates) plus class hierarchy and file locations. MVP uses a lightweight header parse (the reflection macros make UE headers unusually regular); a clangd-index backend can come later for call graphs. Cross-links everywhere: a BP node calling a `UFUNCTION`, a mesh referencing a C++ component class, a DataTable using a USTRUCT row type — all become edges.
+- **Config/project extractor.** `.ini` files, `.uproject`/`.uplugin`, enabled plugins, maps list, input actions, GameplayTags. Small, but answers a disproportionate number of real questions.
+
+**Editor-optional is a core principle.** Tier 0, the C++ extractor, and config parsing run with no editor. Tier 1/2 recipes need editor machinery; we ship them as (a) a commandlet you can run headless (`-run=GameIQExport`), and (b) a live in-editor plugin/Python bridge for instant freshness while you work. A project that has never opened the editor on this machine still gets a useful (if shallower) index, with a file-parsing fallback tier (UAssetAPI-style, §11) as a later option.
+
+### 5.2 Knowledge base
+
+Local-first **SQLite** in `<project>/.gameiq/` (gitignored by default; optionally committed as a team-shared cache).
+
+Data model — deliberately boring:
+
+- **`entities`** — one row per thing: any asset (mesh, material, texture, skeleton, level…), Blueprint, BP function/variable, material parameter, socket, level actor, C++ class/function/property, config section, plugin. Columns: id, kind, name, path, parent, summary, raw JSON detail (the recipe output).
+- **`edges`** — typed relations: generic `references`/`depends-on` from the registry, plus semantic types from recipes: `inherits`, `calls`, `implements`, `uses-material`, `uses-skeleton`, `overrides-parameter`, `placed-in-level`, `plays-on`, `casts-to`. Typed edges are what turn "what references X" into "which *meshes* use this *skeleton*."
+- **`chunks`** — text units for retrieval (BP pseudocode per function, recipe summaries per asset, C++ signatures + doc comments, config blocks) with **FTS5** full-text index and an **embedding vector** (small local model by default; pluggable).
+- **`snapshots`** — index state per VCS revision (or timestamp), so "what changed since X" is a diff of two snapshots, with binary `.uasset` changes rendered as *semantic* diffs ("`BP_Enemy`: function `TakeDamage` modified — 3 nodes added; variable `Armor` default 50 → 75").
+
+### 5.3 Query engine
+
+Three tiers, cheapest first:
+
+1. **Graph queries** — exact, instant: lookups, reference traversal, impact analysis (transitive closure over `edges`), stats. No LLM involved.
+2. **Hybrid retrieval** — FTS5 + vector search over `chunks`, fused and reranked. Powers "find anything about reloading."
+3. **Synthesis (`ask`)** — retrieval feeds an LLM that composes an answer **with citations** (entity ids → asset paths / `file:line`). Every claim must trace to an entity; uncited claims are dropped. When invoked via MCP, the *calling agent* is the synthesizer — Game IQ returns assembled, cited context. Game IQ only needs its own LLM (bring-your-own-key Claude) for the human-facing CLI/UI `ask`.
+
+## 6. Surfaces
+
+### 6.1 MCP server (the product's center of gravity)
+
+`gameiq mcp` (stdio, local; same shape as the rest of the ecosystem). Proposed v1 tool surface:
+
+| Tool | What it does |
+|---|---|
+| `search_project(query, kind?)` | Hybrid search across everything; returns ranked entities with summaries. |
+| `get_entity(id)` | Full detail: BP pseudocode, C++ signature + location, asset metadata. |
+| `references(id, direction, depth?)` | Who uses this / what does this use. |
+| `impact(id)` | Transitive "what could break if I change or delete this," ranked by edge type. |
+| `explain(topic)` | Retrieval bundle for a system ("damage", "inventory"): the relevant entities, their edges, and pseudocode — pre-assembled context for the agent to reason over. |
+| `changes(since)` | Semantic digest of project changes since a revision/date. |
+| `project_stats(facet)` | Counts, sizes, unused-asset candidates, largest dependencies — the hygiene queries. |
+
+Design rule learned from the UE Skills MCP v2 consolidation: **few tools, rich parameters** — possibly literally one `game-iq` multi-action tool, matching the `unreal-engine-skills-manager` pattern, so the tool count stays low in agent contexts.
+
+### 6.2 CLI
+
+`gameiq index` (build/refresh), `gameiq watch`, `gameiq ask "..."`, `gameiq impact <asset>`, `gameiq changes --since <rev>`, `gameiq stats`. The CLI is also the CI entry point (index on the build machine; fail PRs that delete still-referenced assets).
+
+### 6.3 The ecosystem story
+
+This is the moat — three products, one loop, all under Buckley Builds:
+
+- **Unreal Engine Skills** = how the *engine* works (universal knowledge).
+- **Unreal Game IQ** = how *your game* works (project knowledge). ← this product
+- **VibeUE** = hands on the *live editor* (action).
+
+An agent task like "add fall damage" becomes: Game IQ `explain("damage")` → grounded plan → UE Skills for correct engine APIs → edit C++ / drive VibeUE for Blueprint changes → Game IQ re-indexes and verifies the new edges exist. Each product is useful alone; together they're a complete agent stack for UE. Cross-promote accordingly.
+
+## 7. MVP (v0.1) — cut ruthlessly
+
+**In:**
+- Tier 0 for **all** assets (Asset Registry, editor-less) + C++ header reflection parse + config parse.
+- The extraction commandlet with the **generic property-bag fallback** (so every asset type has *some* depth from day one) and Tier 1 recipes for the highest-traffic classes: Blueprint, Material/Material Instance, Skeleton, Skeletal/Static Mesh, Texture, Anim assets, DataTable, Level.
+- SQLite store, FTS5 search (embeddings behind a flag), graph queries with typed edges.
+- MCP server with `search_project`, `get_entity`, `references`, `impact`, `project_stats`.
+- CLI: `gameiq index`, `gameiq mcp`. Windows first.
+
+**The one hard MVP feature:** Tier 2 pseudocode for Blueprints (headless commandlet) — the demo that makes people gasp ("my agent just read my Blueprint"). Other Tier 2 renderings (materials, Anim BP state machines, Behavior Trees) follow in v0.2 on the same machinery.
+
+**Out (v0.2+):** live watcher, snapshots/`changes`, semantic uasset diffing, `explain` bundles, embeddings-by-default, Perforce, dashboard UI, team sync (Turso — same infra as the MCP usage tracking), Mac/Linux.
+
+**Success criterion:** on a real project, an agent with Game IQ correctly answers "where is X handled and what references it?" for Blueprint-implemented logic that the same agent without Game IQ cannot answer at all.
+
+## 8. Freshness model
+
+- **MVP:** explicit `gameiq index` (full or `--changed` incremental; the Asset Registry makes incremental cheap).
+- **v0.2:** filesystem watcher on `Content/` + `Source/` with debounced re-extraction; VCS hook for snapshot-on-commit.
+- **With the editor open:** the in-editor bridge pushes saves immediately — sub-second freshness, which is what live agent workflows need.
+- Every query response carries an index-age stamp so agents (and humans) know how stale the answer might be.
+
+## 9. Privacy & IP
+
+Non-negotiable for adoption: **the index never leaves the developer's machine by default.** No cloud ingestion of game content. Embeddings computed locally. Telemetry limited to anonymous usage counts (opt-out), same convention as the skills MCP usage tracking. Team-sync of the index (later) goes through infrastructure the team controls or an explicit opt-in cloud tier. This is both the right thing and a sales weapon against any cloud-first competitor.
+
+## 10. Tech stack (proposed)
+
+- **Core / CLI / MCP:** TypeScript on Node — matches the team's existing MCP servers and tooling, mature MCP SDK, easy distribution (`npx gameiq`). Performance-critical parsing can drop to a native module later if profiling demands it.
+- **Extractors in UE:** UE Python + a small C++ plugin/commandlet (reuse VibeUE's proven editor-bridge patterns).
+- **Store:** SQLite (better-sqlite3) + FTS5; sqlite-vec for vectors. Turso/libSQL enters only for the future team-sync tier — same stack already used for vibeue usage data.
+- **Licensing/business (placeholder):** free core for indie/solo, paid team tier (sync, CI, dashboard). Decide before public beta.
+
+## 11. Prior art & building blocks
+
+Techniques and libraries worth studying or reusing:
+
+- **[UAssetAPI](https://github.com/atenfyr/UAssetAPI)/UAssetGUI** (MIT, .NET) — reads/writes uncooked `.uasset` incl. raw Kismet (Blueprint) bytecode, JSON serialization. **Proves editor-less Blueprint reading is feasible.** Caveat: it sees compiled bytecode, not the node graph — pseudocode from bytecode is decompilation (harder, lossier). Likely conclusion: editor/commandlet path for full-fidelity graphs (§5.1), UAssetAPI-style parsing as the no-editor fallback tier.
+- **[CUE4Parse](https://github.com/FabianFG/CUE4Parse)** (Apache-2.0, FModel team) — battle-tested C# parser for *cooked* packages; relevant later for packaged-build size/stats analysis, plus `kismet-analyzer` for bytecode analysis.
+- **[BPMerge](https://forums.unrealengine.com/t/open-source-bpmerge-deterministic-3-way-merge-for-unreal-engine-blueprints/2722265)** (open source) — extracts a **semantic IR from `.uasset`** for 3-way Blueprint merge, writes back via editor Python. Direct validation of our snapshot/semantic-diff design (§5.2); study its IR before inventing ours.
+- **Asset diff ecosystem** — Epic's own [asset text-export diffing](https://www.unrealengine.com/en-US/blog/diffing-unreal-assets) and the in-editor Blueprint diff tool, plus community tools ([uasset-diff-tool](https://github.com/theqoqqi/uasset-diff-tool), BPDiffer). Confirms the pain around binary diffs is real and unsolved outside the editor.
+- **tree-sitter (C++ grammar)** — proven approach for fast, robust parsing of UE's reflection macros without a full compiler; the right base for our C++ extractor.
+- **Generic code-AI indexers** (Cursor, Sourcegraph, Greptile) — index text only; Blueprints are invisible to all of them. They set UX expectations ("my agent knows my codebase") that UE projects can't meet today — that expectation gap is our market.
+
+**Net read:** nobody ships a **persistent, editor-optional, agent-agnostic project intelligence layer** for UE as a standalone product. The specific shape (open MCP + local-first + history) is unclaimed — and the window won't stay open forever. Ship the MVP fast.
+
+## 12. Open questions
+
+1. **Pseudocode fidelity:** how lossy can the Blueprint rendering be before agents draw wrong conclusions? Needs an eval set (reuse the skill-eval harness approach from the UES repo).
+2. **Index time/size budget:** target = full index of a 50 GB project in minutes, incremental updates in seconds. Validate on a real mid-size project early.
+3. **One multi-action MCP tool vs. several:** follow the UES v2 consolidation? (Leaning yes.)
+4. **Commit the index?** Shared `.gameiq/` cache in VCS vs. everyone indexing locally. Probably: local by default, exportable bundle for teams.
+5. **Trademark check:** clear "Game IQ" before launch.
+6. **UEFN/Verse:** out of scope for now, but the entity/edge model shouldn't preclude it.
+7. **Level extraction at scale:** a 10k-actor open-world map could explode index size if every actor becomes an entity with full overrides. Need an aggregation strategy (per-class counts + only actors with meaningful overrides?) and a real-world benchmark.
+8. **Recipe priority order beyond MVP:** which Tier 1/2 recipes matter most after the initial set — Niagara? MetaSounds? PCG graphs? Decide from beta-user query logs rather than guessing.
+
+## 13. Trademark note
+
+All public materials follow the existing convention: Unreal® is a trademark of Epic Games, Inc.; Unreal Game IQ is an independent Buckley Builds LLC product, not affiliated with or endorsed by Epic Games. Keep marketing version-agnostic ("Unreal Engine", not "UE5.x").
