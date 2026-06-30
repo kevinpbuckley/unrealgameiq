@@ -71,11 +71,11 @@ Existing tools each see a slice: the editor sees everything but only interactive
 
 ### 5.1 Extraction (the hard, defensible part)
 
-Extraction must cover **every `.uasset` in the project — not just Blueprints**. A question like "which meshes still use the old skeleton?" or "what's driving this material parameter?" is exactly the kind of thing Game IQ exists to answer. To make full coverage tractable, extraction is a small *framework* rather than a fixed list of extractors: every asset gets shallow coverage for free, and high-value asset classes get bespoke deep extractors ("recipes"). Three depth tiers:
+Extraction must cover **every `.uasset` in the project — not just Blueprints**. A question like "which meshes still use the old skeleton?" or "what's driving this material parameter?" is exactly the kind of thing Game IQ exists to answer. To make full coverage tractable, extraction is a small *framework* rather than a fixed list of extractors: every asset gets shallow coverage for free **from UE's own reflection/export machinery** (so "an extractor per asset type" is largely a myth — see below), and high-value asset classes get bespoke deep extractors ("recipes") that are mostly curation on top of that free baseline. Three depth tiers:
 
 - **Tier 0 — Registry (every asset, free).** From the Asset Registry: identity, class, package path, tags/metadata, and the **dependency/referencer graph**. Covers all assets of every type with zero per-type code, and alone answers "what uses X?".
 - **Tier 1 — Typed summary (per-class recipes).** Structured extraction of what each asset *is*: its shape, settings, and outgoing semantic links.
-- **Tier 2 — Logic rendering (the killer feature).** Graph-bearing assets rendered as **pseudocode/structured text** ("On BeginPlay → if HasWeapon → Spawn BP_Muzzle…") so their logic is greppable, embeddable, and quotable in answers.
+- **Tier 2 — Logic rendering (the killer feature).** Graph-bearing assets rendered as **pseudocode/structured text** ("On BeginPlay → if HasWeapon → Spawn BP_Muzzle…") so their logic is greppable, embeddable, and quotable in answers. The engine hands us the raw graph as faithful text via `FEdGraphUtilities::ExportNodesToText` (the BP-node clipboard format) — **no bytecode decompilation** — so the only custom code is the per-graph-family renderer (K2 Blueprint, material expressions, anim state machines, Behavior Trees) that turns that node/pin text into pseudocode.
 
 Initial recipe set, covering the asset classes that dominate real questions:
 
@@ -97,7 +97,7 @@ Initial recipe set, covering the asset classes that dominate real questions:
 | Sound Cue / MetaSound | graph nodes, wave refs, attenuation | graph summary |
 | Physics Asset, Input assets, GameplayTags, DataAssets | typed property summaries | — |
 
-**Generic fallback recipe — no asset is invisible.** Any asset class without a bespoke recipe (plugin types, marketplace systems, new engine features) is exported as a *property bag* via UE's reflection/export-text path: every editable property, serialized to structured text, plus its Tier 0 graph edges. Shallower than a recipe, but it guarantees 100% coverage — and writing a new recipe later is mostly a formatting pass over data the fallback already captures. Recipes are versioned and pluggable so users/plugins can register their own for custom asset types.
+**Reflection export is the foundation, not a fallback — no asset is invisible.** UE serializes any loaded UObject's `UPROPERTY`s to structured text with *zero per-type code* — via `FJsonObjectConverter` (UStruct→JSON), the lower-level `FProperty::ExportTextItem`, or the generic `ObjectExporterT3D`; for Levels/Actors, `LevelExporterT3D`/`ActorExporterT3D` (the editor's own copy/paste format) yield the actor inventory and per-asset overrides directly. This property-bag export runs for *every* asset class — plugin types, marketplace systems, new engine features — guaranteeing 100% coverage. A Tier 1 recipe is then a thin **curation** pass over that free baseline (pick the ~10 fields that matter, name the semantic edges), plus a small garnish of **computed** values that aren't stored as properties (tri counts, LOD screen sizes, texture dimensions, on-disk size — small accessor calls). Recipes are versioned and pluggable so users/plugins can register their own for custom asset types. *(All of this needs the UObject loaded — i.e. the commandlet/in-editor path; it does nothing for the editor-less path, which still relies on raw file parsing — see §11.)*
 
 Alongside the asset framework, two non-asset extractors:
 
@@ -112,9 +112,9 @@ Local-first **SQLite** in `<project>/.gameiq/` (gitignored by default; optionall
 
 Data model — deliberately boring:
 
-- **`entities`** — one row per thing: any asset (mesh, material, texture, skeleton, level…), Blueprint, BP function/variable, material parameter, socket, level actor, C++ class/function/property, config section, plugin. Columns: id, kind, name, path, parent, summary, raw JSON detail (the recipe output).
+- **`entities`** — one row per thing: any asset (mesh, material, texture, skeleton, level…), Blueprint, BP function/variable, material parameter, socket, level actor, C++ class/function/property, config section, plugin, **design-doc section**. Columns: id, kind, name, path, parent, **`source` (code / asset / config / doc — fact vs. intent)**, summary, raw JSON detail (the recipe output).
 - **`edges`** — typed relations: generic `references`/`depends-on` from the registry, plus semantic types from recipes: `inherits`, `calls`, `implements`, `uses-material`, `uses-skeleton`, `overrides-parameter`, `placed-in-level`, `plays-on`, `casts-to`. Typed edges are what turn "what references X" into "which *meshes* use this *skeleton*."
-- **`chunks`** — text units for retrieval (BP pseudocode per function, recipe summaries per asset, C++ signatures + doc comments, config blocks) with **FTS5** full-text index and an **embedding vector** (small local model by default; pluggable).
+- **`chunks`** — text units for retrieval (BP pseudocode per function, recipe summaries per asset, C++ signatures + doc comments, config blocks, ingested design-doc sections) with **FTS5** full-text index and an **embedding vector** (small local model by default; pluggable).
 - **`snapshots`** — index state per VCS revision (or timestamp), so "what changed since X" is a diff of two snapshots, with binary `.uasset` changes rendered as *semantic* diffs ("`BP_Enemy`: function `TakeDamage` modified — 3 nodes added; variable `Armor` default 50 → 75").
 
 ### 5.3 Query engine
@@ -124,6 +124,25 @@ Three tiers, cheapest first:
 1. **Graph queries** — exact, instant: lookups, reference traversal, impact analysis (transitive closure over `edges`), stats. No LLM involved.
 2. **Hybrid retrieval** — FTS5 + vector search over `chunks`, fused and reranked. Powers "find anything about reloading."
 3. **Synthesis (`ask`)** — retrieval feeds an LLM that composes an answer **with citations** (entity ids → asset paths / `file:line`). Every claim must trace to an entity; uncited claims are dropped. When invoked via MCP, the *calling agent* is the synthesizer — Game IQ returns assembled, cited context. Game IQ only needs its own LLM (bring-your-own-key Claude) for the human-facing CLI/UI `ask`.
+
+### 5.4 Design-intent ingestion (read-only)
+
+Beyond the project's own files, Game IQ ingests **external design documents** — Game Design Doc, Level Design Docs, brand/style guidelines — as a first-class knowledge source. **Scope is ingestion, not management: Game IQ reads and indexes these docs; it is never a place to author, edit, or store them.** They stay in whatever the team already uses (Google Drive, Notion, Confluence, local markdown); Game IQ pulls, chunks, and embeds them into the same store.
+
+Two phases, deliberately:
+
+- **Phase 1 — ingest as chunks; let the agent connect (the near-term plan).** Doc sections land as ordinary `chunks` (FTS5 + embeddings), retrievable side-by-side with Blueprint pseudocode, C++ signatures, and asset summaries. There is **no explicit doc→code edge graph** — when an agent asks "is the stamina system implemented?", hybrid retrieval surfaces both the GDD section and the relevant code/assets in one bundle, and the **agent does the intent→implementation reasoning itself**, exactly as it already reasons over mixed context. Cheap, ships early, and sidesteps the hard linking problem entirely.
+- **Phase 2 — explicit links + conformance (later).** Once Phase 1 proves useful, add typed edges (`GDD§"Damage" —describes→ UHealthComponent`, `BrandGuide —constrains→ M_UI_Button`) to power deterministic **intent-vs-implementation conformance / drift** queries that don't rely on the agent connecting the dots each time:
+  - "Brand guide primary color is `#1B9AAA` — which materials/widgets violate it?"
+  - "GDD describes a stamina system — is any of it implemented, or still just a doc?"
+  - "Combat changed since the milestone (the §5.2 semantic diffs) — does the GDD still match?"
+
+Two rules hold across both phases:
+
+- **Local-first holds (§9).** Docs are pulled and indexed *locally*; game content is never pushed to a doc service. A cloud doc source is a *read* source, not an exfiltration path.
+- **Provenance is tagged.** Every entity/chunk records its `source` (code / asset / config / doc). Code is fact; a doc is *intent*. An answer never presents "the GDD says…" as ground truth — even in Phase 1, where the agent is doing the connecting, the provenance tag keeps the two sides distinct.
+
+Connectors are pluggable in the same spirit as recipes (§5.1): start with local markdown + Google Drive, add Notion/Confluence as demand shows. **v0.3+** — the chunk model already accommodates Phase 1; Phase 2 reuses the existing entity/edge machinery once the core technical index is proven.
 
 ## 6. Surfaces
 
@@ -168,7 +187,7 @@ An agent task like "add fall damage" becomes: Game IQ `explain("damage")` → gr
 
 **The one hard MVP feature:** Tier 2 pseudocode for Blueprints (headless commandlet) — the demo that makes people gasp ("my agent just read my Blueprint"). Other Tier 2 renderings (materials, Anim BP state machines, Behavior Trees) follow in v0.2 on the same machinery.
 
-**Out (v0.2+):** live watcher, snapshots/`changes`, semantic uasset diffing, `explain` bundles, embeddings-by-default, Perforce, dashboard UI, team sync (Turso — same infra as the MCP usage tracking), Mac/Linux.
+**Out (v0.2+):** live watcher, snapshots/`changes`, semantic uasset diffing, `explain` bundles, embeddings-by-default, Perforce, dashboard UI, team sync (Turso — same infra as the MCP usage tracking), Mac/Linux, design-doc ingestion + intent-vs-implementation conformance (§5.4, v0.3+).
 
 **Success criterion:** on a real project, an agent with Game IQ correctly answers "where is X handled and what references it?" for Blueprint-implemented logic that the same agent without Game IQ cannot answer at all.
 
@@ -194,7 +213,7 @@ Non-negotiable for adoption: **the index never leaves the developer's machine by
 
 Techniques and libraries worth studying or reusing:
 
-- **[UAssetAPI](https://github.com/atenfyr/UAssetAPI)/UAssetGUI** (MIT, .NET) — reads/writes uncooked `.uasset` incl. raw Kismet (Blueprint) bytecode, JSON serialization. **Proves editor-less Blueprint reading is feasible.** Caveat: it sees compiled bytecode, not the node graph — pseudocode from bytecode is decompilation (harder, lossier). Likely conclusion: editor/commandlet path for full-fidelity graphs (§5.1), UAssetAPI-style parsing as the no-editor fallback tier.
+- **[UAssetAPI](https://github.com/atenfyr/UAssetAPI)/UAssetGUI** (MIT, .NET) — reads/writes uncooked `.uasset` incl. raw Kismet (Blueprint) bytecode, JSON serialization. **Proves editor-less Blueprint reading is feasible.** Caveat: it sees compiled bytecode, not the node graph — pseudocode from bytecode is decompilation (harder, lossier). Likely conclusion: the editor/commandlet path renders full-fidelity graphs from `FEdGraphUtilities::ExportNodesToText` (the actual node graph as text, not bytecode — §5.1), relegating UAssetAPI-style bytecode parsing to the no-editor fallback tier only.
 - **[CUE4Parse](https://github.com/FabianFG/CUE4Parse)** (Apache-2.0, FModel team) — battle-tested C# parser for *cooked* packages; relevant later for packaged-build size/stats analysis, plus `kismet-analyzer` for bytecode analysis.
 - **[BPMerge](https://forums.unrealengine.com/t/open-source-bpmerge-deterministic-3-way-merge-for-unreal-engine-blueprints/2722265)** (open source) — extracts a **semantic IR from `.uasset`** for 3-way Blueprint merge, writes back via editor Python. Direct validation of our snapshot/semantic-diff design (§5.2); study its IR before inventing ours.
 - **Asset diff ecosystem** — Epic's own [asset text-export diffing](https://www.unrealengine.com/en-US/blog/diffing-unreal-assets) and the in-editor Blueprint diff tool, plus community tools ([uasset-diff-tool](https://github.com/theqoqqi/uasset-diff-tool), BPDiffer). Confirms the pain around binary diffs is real and unsolved outside the editor.
@@ -213,6 +232,7 @@ Techniques and libraries worth studying or reusing:
 6. **UEFN/Verse:** out of scope for now, but the entity/edge model shouldn't preclude it.
 7. **Level extraction at scale:** a 10k-actor open-world map could explode index size if every actor becomes an entity with full overrides. Need an aggregation strategy (per-class counts + only actors with meaningful overrides?) and a real-world benchmark.
 8. **Recipe priority order beyond MVP:** which Tier 1/2 recipes matter most after the initial set — Niagara? MetaSounds? PCG graphs? Decide from beta-user query logs rather than guessing.
+9. **Design-doc ingestion (§5.4):** Phase 1 just makes doc sections retrievable and lets the agent connect intent to implementation — the open question is whether agent-side connecting is *good enough* in practice, or whether the explicit doc→code edges of Phase 2 are needed sooner than expected. The hard Phase 2 problem is *how* to link a prose section to the right entities (heading/naming heuristics vs. LLM-assisted matching). Which connectors first (local markdown + Drive likely)?
 
 ## 13. Trademark note
 
