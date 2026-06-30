@@ -1,0 +1,20 @@
+# Node
+node_modules/
+dist/
+*.tsbuildinfo
+npm-debug.log*
+
+# Game IQ generated index (also gitignored inside target projects by `gameiq init`)
+.gameiq/
+
+# UE plugin build artifacts (when plugin/GameIQ is compiled in a project)
+plugin/**/Binaries/
+plugin/**/Intermediate/
+plugin/**/Saved/
+plugin/**/DerivedDataCache/
+
+# OS / editor
+.DS_Store
+.vs/
+.idea/
+*.swp

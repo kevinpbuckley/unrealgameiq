@@ -1,0 +1,33 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "0.1.0",
+  "FriendlyName": "Unreal Game IQ",
+  "Description": "Extracts a queryable model of this project (assets, Blueprints, dependency graph) for the Game IQ index. Editor-only; runs headless as the GameIQExport commandlet or live via the in-editor bridge.",
+  "Category": "Programming",
+  "CreatedBy": "Buckley Builds LLC",
+  "CreatedByURL": "https://www.unrealgameiq.com/",
+  "DocsURL": "",
+  "MarketplaceURL": "",
+  "SupportURL": "",
+  "CanContainContent": true,
+  "IsBetaVersion": true,
+  "IsExperimentalVersion": false,
+  "Installed": false,
+  "EditorOnly": true,
+  "EnabledByDefault": false,
+  "Modules": [
+    {
+      "Name": "GameIQ",
+      "Type": "Editor",
+      "LoadingPhase": "PostEngineInit",
+      "TargetAllowList": ["Editor"]
+    }
+  ],
+  "Plugins": [
+    {
+      "Name": "PythonScriptPlugin",
+      "Enabled": true
+    }
+  ]
+}

@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "generatedAtIso": "2026-06-29T00:00:00.000Z",
+  "producer": "GameIQExport-commandlet@0.1.0",
+  "project": { "name": "SampleGame", "root": "." },
+  "entities": [
+    {
+      "id": "asset:/Game/Blueprints/BP_PlayerCharacter",
+      "kind": "blueprint",
+      "name": "BP_PlayerCharacter",
+      "path": "/Game/Blueprints/BP_PlayerCharacter",
+      "source": "asset",
+      "summary": "Blueprint based on APlayerCharacter",
+      "detail": { "parentClass": "APlayerCharacter" }
+    },
+    {
+      "id": "asset:/Game/Blueprints/BP_PlayerCharacter::OnLanded",
+      "kind": "bp-function",
+      "name": "OnLanded",
+      "path": "/Game/Blueprints/BP_PlayerCharacter",
+      "parent": "asset:/Game/Blueprints/BP_PlayerCharacter",
+      "source": "asset",
+      "summary": "Event OnLanded"
+    }
+  ],
+  "edges": [
+    { "src": "asset:/Game/Blueprints/BP_PlayerCharacter", "dst": "cpp:PlayerCharacter", "type": "inherits" },
+    {
+      "src": "asset:/Game/Blueprints/BP_PlayerCharacter",
+      "dst": "cpp:HealthComponent",
+      "type": "calls",
+      "attrs": { "function": "ApplyDamage" }
+    }
+  ],
+  "chunks": [
+    {
+      "id": "asset:/Game/Blueprints/BP_PlayerCharacter::OnLanded#pseudo",
+      "entityId": "asset:/Game/Blueprints/BP_PlayerCharacter::OnLanded",
+      "kind": "bp-pseudocode",
+      "text": "Event OnLanded(FallDistance):\n  if FallDistance > 200:\n    Health -> ApplyDamage(FallDistance * 0.1)  // applies fall damage to the player"
+    }
+  ]
+}

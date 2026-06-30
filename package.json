@@ -1,0 +1,24 @@
+{
+  "name": "unreal-game-iq",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Unreal Game IQ — a continuously updated, queryable index of an Unreal Engine project, exposed to humans and AI agents.",
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc --build",
+    "clean": "tsc --build --clean",
+    "test": "npm run test --workspaces --if-present",
+    "gameiq": "node --import tsx packages/core/src/cli/index.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
