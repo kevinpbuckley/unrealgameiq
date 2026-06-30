@@ -176,6 +176,29 @@ This is the moat — three products, one loop, all under Buckley Builds:
 
 An agent task like "add fall damage" becomes: Game IQ `explain("damage")` → grounded plan → UE Skills for correct engine APIs → edit C++ / drive VibeUE for Blueprint changes → Game IQ re-indexes and verifies the new edges exist. Each product is useful alone; together they're a complete agent stack for UE. Cross-promote accordingly.
 
+### 6.4 Why not just VibeUE? (probe vs. index)
+
+VibeUE can already read a Blueprint, its references, and live diffs — so the fair challenge is "why is Game IQ not redundant?" The answer is that those are **point inspections against a live editor**: VibeUE is a *probe* (editor open, project loaded, you point it at one thing you already know). Game IQ is *persistent memory* — a precomputed graph + searchable corpus + history that answers with the editor closed. Same primitive ("read this asset"); opposite system. VibeUE inspects; Game IQ remembers and searches.
+
+Game IQ earns its existence **only** on the four axes a live probe is structurally bad at — and at least one must be in the MVP demo or the product has no reason to exist next to VibeUE:
+
+- **Scale** — "which of my 4,000 meshes use the deprecated skeleton?" is one indexed graph query, not thousands of sequential live reads.
+- **Availability** — answers at 2am, in CI, in a git hook, on a machine that never opened the editor.
+- **Discovery** — "where is reload handled?" when you *don't* know the asset name (hybrid search over a corpus VibeUE doesn't have).
+- **History** — "what changed in combat since the milestone?" diffed against any VCS revision, offline.
+
+Relationship, not rivalry: Game IQ does **not** reimplement VibeUE's live reading. VibeUE is the best in-editor extraction surface; Game IQ writes those reads into the persistent index so the same knowledge is queryable whole-project, offline, by any agent, across time. (Game IQ ships its own UE plugin rather than bundling into VibeUE — see §10.1 — but the bridge patterns are shared.)
+
+### 6.5 Epic Developer Assistant / Toolset Registry (UE 5.8)
+
+UE 5.8 ships (Experimental, `EditorOnly`, `NoRedist`, off by default) the **`AIAssistant`** plugin ("Epic Developer Assistant" / EDA) and a **`ToolsetRegistry`** framework: you register a `UToolsetDefinition` with static `UFUNCTION`s marked `meta=(AICallable)`, and the in-editor assistant can call them. This is the "AI Editor Toolset" path.
+
+**Decision: the standalone MCP server stays the product; the Toolset Registry is a *fourth surface*, not a replacement.** The Toolset path is `EditorOnly`, in-process, and reaches only Epic's EDA — it contradicts Game IQ's two non-negotiables (editor-optional, agent-agnostic) and rests on an experimental, Epic-controlled API. So:
+
+- Keep the MCP/CLI core (§6.1–6.2) as center of gravity.
+- Add a thin `UToolsetDefinition` adapter that exposes `search_project`/`impact`/`explain` to the EDA — cheap, and it puts Game IQ *inside* Epic's assistant with live **dock context** (the EDA exposes the focused asset/graph/selected nodes) the headless extractor can't see. A later, optional surface.
+- Read it competitively too: EDA + its `AgentSkill` concept + project/user context prompts is Epic encroaching on all three Buckley Builds products at once (engine knowledge, project context, in-editor action) — a reason to own the cross-agent, editor-optional, historical layer Epic won't build, not to nest inside their assistant.
+
 ## 7. MVP (v0.1) — cut ruthlessly
 
 **In:**
@@ -193,10 +216,16 @@ An agent task like "add fall damage" becomes: Game IQ `explain("damage")` → gr
 
 ## 8. Freshness model
 
-- **MVP:** explicit `gameiq index` (full or `--changed` incremental; the Asset Registry makes incremental cheap).
-- **v0.2:** filesystem watcher on `Content/` + `Source/` with debounced re-extraction; VCS hook for snapshot-on-commit.
-- **With the editor open:** the in-editor bridge pushes saves immediately — sub-second freshness, which is what live agent workflows need.
+Freshness has two separable jobs, and conflating them is the common mistake: **detection** (what changed) is cheap and editor-free; **extraction** (reading the changed thing) is not, because a binary `.uasset` must be loaded into a UE process to render Tier 1/2 — detecting the change doesn't read it.
+
+- **Detection** — a filesystem watcher on `Content/` + `Source/` (a `.uasset` only hits disk on *save*, which is the right granularity) plus a VCS hook. Editor-free, and it naturally covers both "I saved" and "I synced/pulled." Text artifacts (C++, config) and the Tier 0 graph are *also* extracted here with no editor.
+- **Extraction of changed binary assets** — needs a live UE process. Three modes, increasing freshness:
+  1. **`gameiq index`** (MVP) — explicit full or `--changed` incremental run via the headless commandlet; the Asset Registry makes incremental cheap.
+  2. **Watcher → debounced commandlet** (v0.2) — the watcher batches changed packages and fires a headless `UnrealEditor-Cmd -run=GameIQExport`. No interactive editor; freshness in *seconds* (bounded by UE process cold-start, so batch — don't run per-save).
+  3. **In-editor bridge** (the plugin) — when the editor is already open during active work, the asset is already loaded in memory: sub-second freshness, and it's the only mode that can see *unsaved* in-editor edits. This is what live agent workflows need.
 - Every query response carries an index-age stamp so agents (and humans) know how stale the answer might be.
+
+The plugin is therefore **in scope** (not merely an optional nicety): the watcher+commandlet path can't see unsaved state and pays cold-start, so the live mode is the bridge. See §10.1 for how the plugin is delivered.
 
 ## 9. Privacy & IP
 
@@ -204,10 +233,30 @@ Non-negotiable for adoption: **the index never leaves the developer's machine by
 
 ## 10. Tech stack (proposed)
 
+Game IQ is **a standalone Node/TypeScript app, not a UE plugin** — the plugin is one (deepest) extraction backend, not the product. The core installs once via `npx gameiq` and runs across many projects, writing each project's index to its `.gameiq/`. It never opens Unreal for the editor-less tiers; it invokes the commandlet / talks to the in-editor bridge only for deep binary extraction.
+
 - **Core / CLI / MCP:** TypeScript on Node — matches the team's existing MCP servers and tooling, mature MCP SDK, easy distribution (`npx gameiq`). Performance-critical parsing can drop to a native module later if profiling demands it.
-- **Extractors in UE:** UE Python + a small C++ plugin/commandlet (reuse VibeUE's proven editor-bridge patterns).
+- **Extractors in UE:** UE Python + a small C++ plugin/commandlet (shares VibeUE's proven editor-bridge patterns, but ships as its own plugin — Game IQ is not bundled with VibeUE).
 - **Store:** SQLite (better-sqlite3) + FTS5; sqlite-vec for vectors. Turso/libSQL enters only for the future team-sync tier — same stack already used for vibeue usage data.
 - **Licensing/business (placeholder):** free core for indie/solo, paid team tier (sync, CI, dashboard). Decide before public beta.
+
+### 10.1 Repository & distribution layout
+
+**One monorepo, two distributable artifacts.** The decisive reason for a monorepo over split repos: the plugin *produces* the extraction output and the core *consumes* it — every Tier 2 recipe changes both sides, so they share a schema (`packages/shared`) and must version in lockstep. One atomic commit, no cross-repo skew.
+
+```
+unreal-game-iq/
+  packages/
+    core/        # TS: CLI, MCP server, query engine, SQLite  → publishes to npm
+    shared/      # the entity/edge/export schema both sides import
+  plugin/
+    GameIQ/      # contents == <Game>/Plugins/GameIQ/ ; .uplugin + Source/ + Content/Python/
+  design.md
+```
+
+- **The core lives nowhere inside the game** — it's project-agnostic, installed once, indexes into each project's `.gameiq/`.
+- **Only `plugin/GameIQ/` maps into a game**, at `<Game>/Plugins/GameIQ/`. It stays a clean plugin folder (nothing but `.uplugin`, `Source/`, `Content/`, `Resources/`) so no Node files leak into a packaged game.
+- **Delivery: CLI-managed.** `gameiq init` detects the `.uproject`, copies/symlinks `plugin/GameIQ` into `Plugins/`, registers it, and gitignores it by default — mirroring the `.gameiq/` index convention (§5.2: gitignored by default, optionally committed for hermetic team builds). Submodule / marketplace zip are fallbacks.
 
 ## 11. Prior art & building blocks
 
@@ -233,6 +282,8 @@ Techniques and libraries worth studying or reusing:
 7. **Level extraction at scale:** a 10k-actor open-world map could explode index size if every actor becomes an entity with full overrides. Need an aggregation strategy (per-class counts + only actors with meaningful overrides?) and a real-world benchmark.
 8. **Recipe priority order beyond MVP:** which Tier 1/2 recipes matter most after the initial set — Niagara? MetaSounds? PCG graphs? Decide from beta-user query logs rather than guessing.
 9. **Design-doc ingestion (§5.4):** Phase 1 just makes doc sections retrievable and lets the agent connect intent to implementation — the open question is whether agent-side connecting is *good enough* in practice, or whether the explicit doc→code edges of Phase 2 are needed sooner than expected. The hard Phase 2 problem is *how* to link a prose section to the right entities (heading/naming heuristics vs. LLM-assisted matching). Which connectors first (local markdown + Drive likely)?
+10. **Plugin delivery — source vs. precompiled (§10.1):** a source plugin needs the game to be a C++ project and compiles per engine version (5.7 vs 5.8…); precompiled binaries avoid that but mean maintaining a per-version build matrix (and a Fab/marketplace listing). Decide before beta — it gates BP-only projects.
+11. **EDA / Toolset Registry investment (§6.5):** how much to build against an Experimental, `NoRedist` 5.8 API while it churns — ship the thin adapter early for the dock-context win, or wait until it stabilizes?
 
 ## 13. Trademark note
 
