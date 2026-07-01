@@ -18,8 +18,9 @@ Everything here emits the **ExtractorOutput** JSON contract (`packages/shared`) 
 
 `GameIQExport` is fast and loads no assets. `GameIQAssets` loads each non-Blueprint asset
 for a typed recipe (meshes → LODs/tris/materials, textures → dimensions, skeletons → bones,
-data tables → row struct, levels → actor inventory + per-class counts) and emits semantic
-edges (`uses-material`, `uses-skeleton`, `placed-in-level`). `GameIQBlueprints` walks each
+materials → blend mode/two-sided/parent/texture params, data tables → row struct, levels →
+actor inventory + per-class counts) and emits semantic edges (`uses-material`,
+`uses-texture`, `uses-skeleton`, `placed-in-level`). `GameIQBlueprints` walks each
 Blueprint's graphs into pseudocode and extracts its variables, components, and interfaces —
 the "my agent read my Blueprint" pass.
 
