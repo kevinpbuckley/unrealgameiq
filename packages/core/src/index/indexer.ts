@@ -3,6 +3,7 @@ import { ingest, type IngestSummary } from "../ingest/ingest.js";
 import { extractCpp } from "../extract/cpp.js";
 import { extractConfig } from "../extract/config.js";
 import { findCommandletOutputs, gameiqPaths, projectInfo } from "../extract/project.js";
+import { effectiveExcludes } from "../config.js";
 import { Store } from "../store/store.js";
 import { readJsonFile } from "../util/readJson.js";
 
@@ -14,6 +15,8 @@ export interface IndexOptions {
   mode?: "replace" | "merge";
   /** Extra extractor JSON files to ingest (e.g. from a UE commandlet run). */
   extractorJson?: string[];
+  /** Extra directories to exclude from the editor-less walk (merged with gameiq.config.json). */
+  exclude?: string[];
 }
 
 export interface IndexResult {
@@ -33,10 +36,11 @@ export function indexProject(opts: IndexOptions): IndexResult {
   const { dbPath: defaultDb } = gameiqPaths(opts.projectRoot);
   const dbPath = opts.dbPath ?? defaultDb;
   const generatedAtIso = new Date().toISOString();
+  const excludes = effectiveExcludes(opts.projectRoot, opts.exclude ?? []);
 
   const outputs: ExtractorOutput[] = [
-    extractCpp(opts.projectRoot, generatedAtIso, info.name),
-    extractConfig(opts.projectRoot, generatedAtIso, info.name),
+    extractCpp(opts.projectRoot, generatedAtIso, info.name, excludes),
+    extractConfig(opts.projectRoot, generatedAtIso, info.name, excludes),
   ];
 
   const jsonPaths = [...findCommandletOutputs(opts.projectRoot), ...(opts.extractorJson ?? [])];

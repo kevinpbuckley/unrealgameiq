@@ -121,9 +121,14 @@ function kindForMacro(macro: string): EntityKind {
   return "cpp-class"; // UCLASS, UINTERFACE
 }
 
-export function extractCpp(projectRoot: string, generatedAtIso: string, projectName: string): ExtractorOutput {
+export function extractCpp(
+  projectRoot: string,
+  generatedAtIso: string,
+  projectName: string,
+  excludes: string[] = [],
+): ExtractorOutput {
   const out = emptyOutput(CPP_PRODUCER, { name: projectName, root: projectRoot }, generatedAtIso);
-  const headers = walkFiles(projectRoot, [".h"]);
+  const headers = walkFiles(projectRoot, [".h"], excludes);
 
   const allClasses: ParsedClass[] = [];
   for (const file of headers) {

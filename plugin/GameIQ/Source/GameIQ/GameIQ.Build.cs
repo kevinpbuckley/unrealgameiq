@@ -17,9 +17,10 @@ public class GameIQ : ModuleRules
 		{
 			"CoreUObject",
 			"Engine",
-			"AssetRegistry", // Tier 0: identity + dependency/referencer graph, no asset loading
-			"Json",          // emit the ExtractorOutput contract as JSON
-			"Projects",      // plugin/project paths
+			"AssetRegistry",     // Tier 0: identity + dependency/referencer graph, no asset loading
+			"Json",              // emit the ExtractorOutput contract as JSON
+			"Projects",          // plugin/project paths
+			"DeveloperSettings", // Project Settings entry (UGameIQSettings)
 		});
 
 		// Editor-only machinery for the live in-editor bridge and Tier 2 graph export

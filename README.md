@@ -45,6 +45,21 @@ pwsh scripts/deploy.ps1 -Project <path-to-uproject-dir> -All
 npm run gameiq -- index --project <path-to-uproject-dir>
 ```
 
+### Excluding directories (config)
+
+By default the editor-less C++/config walk indexes the whole project tree — including
+third-party plugin source. To keep the index focused on *your* game, add a
+`gameiq.config.json` at the project root:
+
+```json
+{ "exclude": ["Plugins/VibeUE", "Plugins/SomeMarketplacePlugin"] }
+```
+
+Entries match a directory name (`VibeUE`) or a project-relative path (`Plugins/VibeUE`).
+Game IQ's own plugin is always excluded. You can also pass `--exclude <dir...>` to `index`,
+or edit the list in the editor under **Project Settings → Plugins → Game IQ** (the plugin
+writes `gameiq.config.json` for you).
+
 ### Use it from an AI agent (MCP)
 
 The core serves the index over the Model Context Protocol. Register it with any MCP client

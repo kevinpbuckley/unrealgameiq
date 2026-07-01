@@ -7,3 +7,10 @@ export { extractCpp, CPP_PRODUCER } from "./extract/cpp.js";
 export { extractConfig, CONFIG_PRODUCER } from "./extract/config.js";
 export { runAction, type GameIqArgs } from "./mcp/actions.js";
 export { createMcpServer, runStdio } from "./mcp/server.js";
+export {
+  loadConfig,
+  effectiveExcludes,
+  CONFIG_FILENAME,
+  ALWAYS_EXCLUDE,
+  type GameIqConfig,
+} from "./config.js";

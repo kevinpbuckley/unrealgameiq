@@ -48,6 +48,7 @@ export function extractConfig(
   projectRoot: string,
   generatedAtIso: string,
   projectName: string,
+  excludes: string[] = [],
 ): ExtractorOutput {
   const out = emptyOutput(CONFIG_PRODUCER, { name: projectName, root: projectRoot }, generatedAtIso);
   const entities: Entity[] = [];
@@ -55,7 +56,7 @@ export function extractConfig(
   const chunks: Chunk[] = [];
 
   // --- .ini sections ---
-  for (const file of walkFiles(projectRoot, [".ini"])) {
+  for (const file of walkFiles(projectRoot, [".ini"], excludes)) {
     let text: string;
     try {
       text = readFileSync(file, "utf8");
@@ -85,7 +86,7 @@ export function extractConfig(
   }
 
   // --- .uproject / .uplugin enabled plugins ---
-  for (const file of walkFiles(projectRoot, [".uproject", ".uplugin"])) {
+  for (const file of walkFiles(projectRoot, [".uproject", ".uplugin"], excludes)) {
     let json: { Plugins?: Array<{ Name?: string; Enabled?: boolean }>; Modules?: Array<{ Name?: string }> };
     const rel = relative(projectRoot, file).replaceAll("\\", "/");
     try {

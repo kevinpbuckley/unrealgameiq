@@ -46,12 +46,14 @@ program
   .requiredOption("-p, --project <dir>", "path to the project root (folder containing the .uproject)")
   .option("--db <path>", "override index DB path")
   .option("--changed", "incremental merge instead of full rebuild")
-  .action((opts: { project: string; db?: string; changed?: boolean }) => {
+  .option("--exclude <dir...>", "extra directories to exclude (merged with gameiq.config.json)")
+  .action((opts: { project: string; db?: string; changed?: boolean; exclude?: string[] }) => {
     const root = resolve(opts.project);
     const result = indexProject({
       projectRoot: root,
       dbPath: opts.db ? resolve(opts.db) : undefined,
       mode: opts.changed ? "merge" : "replace",
+      exclude: opts.exclude,
     });
     process.stdout.write(`Indexed "${result.projectName}" → ${result.dbPath}\n`);
     for (const p of result.producers) {
@@ -156,6 +158,12 @@ program
       gi += (gi.endsWith("\n") || gi.length === 0 ? "" : "\n") + line + "\n";
       writeFileSync(giPath, gi);
       process.stdout.write(`Added ${line} to .gitignore\n`);
+    }
+    // Scaffold a starter config so exclusions are easy to add (also editable in Project Settings).
+    const cfgPath = join(root, "gameiq.config.json");
+    if (!existsSync(cfgPath)) {
+      writeFileSync(cfgPath, JSON.stringify({ exclude: [] }, null, 2) + "\n");
+      process.stdout.write(`Wrote ${cfgPath}\n`);
     }
     process.stdout.write("Next: enable the plugin in the editor (or .uproject), then `gameiq index`.\n");
   });
