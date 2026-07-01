@@ -47,6 +47,7 @@ export const EdgeTypeSchema = z.enum([
   "calls",
   "implements",
   "uses-material",
+  "uses-texture",
   "uses-skeleton",
   "overrides-parameter",
   "placed-in-level",

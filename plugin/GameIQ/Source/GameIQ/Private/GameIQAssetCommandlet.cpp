@@ -9,9 +9,11 @@
 #include "AssetRegistry/IAssetRegistry.h"
 #include "Dom/JsonObject.h"
 #include "Engine/DataTable.h"
+#include "Engine/EngineTypes.h"
 #include "Engine/Level.h"
 #include "Engine/SkeletalMesh.h"
 #include "Engine/StaticMesh.h"
+#include "Engine/Texture.h"
 #include "Engine/Texture2D.h"
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
@@ -116,15 +118,52 @@ namespace
 			*Name, RowStruct ? *RowStruct->GetName() : TEXT("none"), RowNames.Num()));
 	}
 
-	void RecipeMaterialInstance(FOut& O, const UMaterialInstance* MI, const FString& Id, const FString& Name)
+	void RecipeMaterial(FOut& O, const UMaterialInterface* Mat, const FString& Id, const FString& Name)
 	{
-		if (MI->Parent)
+		FString Blend = FString::FromInt(static_cast<int32>(Mat->GetBlendMode()));
+		if (const UEnum* BlendEnum = StaticEnum<EBlendMode>())
 		{
-			O.Edges.Add(MakeShared<FJsonValueObject>(
-				GameIQ::MakeEdge(Id, AssetIdOf(MI->Parent), TEXT("references"), TEXT("parent"))));
+			Blend = BlendEnum->GetNameStringByValue(static_cast<int64>(Mat->GetBlendMode()));
 		}
-		AddSummary(O, Id, FString::Printf(TEXT("%s (MaterialInstance)\nParent: %s"),
-			*Name, MI->Parent ? *MI->Parent->GetName() : TEXT("none")));
+
+		TArray<UTexture*> Textures;
+		Mat->GetUsedTextures(Textures);
+		TArray<FString> TexNames;
+		for (const UTexture* Tex : Textures)
+		{
+			if (Tex && IsProjectObject(Tex))
+			{
+				TexNames.Add(Tex->GetName());
+				O.Edges.Add(MakeShared<FJsonValueObject>(
+					GameIQ::MakeEdge(Id, AssetIdOf(Tex), TEXT("uses-texture"))));
+			}
+		}
+
+		FString ParentLine;
+		const bool bIsInstance = Mat->IsA<UMaterialInstance>();
+		if (const UMaterialInstance* MI = Cast<UMaterialInstance>(Mat))
+		{
+			if (MI->Parent)
+			{
+				O.Edges.Add(MakeShared<FJsonValueObject>(
+					GameIQ::MakeEdge(Id, AssetIdOf(MI->Parent), TEXT("references"), TEXT("parent"))));
+				ParentLine = FString::Printf(TEXT("Parent: %s\n"), *MI->Parent->GetName());
+			}
+			// Overridden texture parameters are serialized (readable headless, unlike GetUsedTextures).
+			for (const FTextureParameterValue& TP : MI->TextureParameterValues)
+			{
+				if (TP.ParameterValue && IsProjectObject(TP.ParameterValue))
+				{
+					TexNames.Add(FString::Printf(TEXT("%s=%s"), *TP.ParameterInfo.Name.ToString(), *TP.ParameterValue->GetName()));
+					O.Edges.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEdge(
+						Id, AssetIdOf(TP.ParameterValue), TEXT("uses-texture"), TP.ParameterInfo.Name.ToString())));
+				}
+			}
+		}
+
+		AddSummary(O, Id, FString::Printf(TEXT("%s (%s)\n%sBlend: %s, TwoSided: %s, Textures: %d\n%s"),
+			*Name, bIsInstance ? TEXT("MaterialInstance") : TEXT("Material"), *ParentLine, *Blend,
+			Mat->IsTwoSided() ? TEXT("yes") : TEXT("no"), TexNames.Num(), *FString::Join(TexNames, TEXT(", "))));
 	}
 
 	void RecipeLevel(FOut& O, UWorld* World, const FString& Id, const FString& Name)
@@ -188,7 +227,7 @@ UGameIQAssetsCommandlet::UGameIQAssetsCommandlet()
 	IsServer = false;
 	IsEditor = true;
 	LogToConsole = true;
-	ShowErrorCount = true;
+	ShowErrorCount = false; // benign engine load warnings shouldn't inflate the error count
 }
 
 int32 UGameIQAssetsCommandlet::Main(const FString& Params)
@@ -234,7 +273,7 @@ int32 UGameIQAssetsCommandlet::Main(const FString& Params)
 		else if (const UTexture2D* Tex = Cast<UTexture2D>(Asset)) { RecipeTexture(O, Tex, Id, Name); }
 		else if (const USkeleton* Skel = Cast<USkeleton>(Asset)) { RecipeSkeleton(O, Skel, Id, Name); }
 		else if (const UDataTable* DT = Cast<UDataTable>(Asset)) { RecipeDataTable(O, DT, Id, Name); }
-		else if (const UMaterialInstance* MI = Cast<UMaterialInstance>(Asset)) { RecipeMaterialInstance(O, MI, Id, Name); }
+		else if (const UMaterialInterface* Mat = Cast<UMaterialInterface>(Asset)) { RecipeMaterial(O, Mat, Id, Name); }
 		else if (UWorld* World = Cast<UWorld>(Asset)) { RecipeLevel(O, World, Id, Name); }
 		else
 		{

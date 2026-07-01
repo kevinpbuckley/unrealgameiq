@@ -46,6 +46,7 @@ const SEVERITY: Record<EdgeType, number> = {
   calls: 8,
   "uses-skeleton": 8,
   "uses-material": 7,
+  "uses-texture": 5,
   "overrides-parameter": 6,
   "casts-to": 6,
   "placed-in-level": 5,

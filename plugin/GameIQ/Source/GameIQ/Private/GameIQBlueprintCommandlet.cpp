@@ -187,7 +187,7 @@ UGameIQBlueprintsCommandlet::UGameIQBlueprintsCommandlet()
 	IsServer = false;
 	IsEditor = true;
 	LogToConsole = true;
-	ShowErrorCount = true;
+	ShowErrorCount = false; // benign engine load warnings shouldn't inflate the error count
 }
 
 int32 UGameIQBlueprintsCommandlet::Main(const FString& Params)
