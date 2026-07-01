@@ -94,11 +94,14 @@ if ($Build) {
 }
 
 # --- 4. run extraction commandlets (editor must be closed) ---
-# Root cause of the old "did not write" failures: a prior commandlet's child processes
-# (esp. ShaderCompileWorker) outlive the parent and keep the project's AssetRegistry/DDC
-# locked, so the next launch can't write. taskkill returns before children fully die, so we
-# kill + SETTLE before EVERY attempt. Commandlets also exit non-zero on teardown, so we trust
-# the output file's freshness, not the exit code.
+# KNOWN ISSUE (not fully solved): commandlets intermittently exit before writing their
+# output — most often the first run(s) after a rebuild. Suspected lock/timing contention
+# (lingering ShaderCompileWorker children, DDC/AssetRegistry cache state); it is NOT
+# reliably fixed by kill+settle alone. Mitigations here: kill+settle before each attempt,
+# retry, NEVER delete the last-good output (trust file freshness, not the non-zero exit
+# code), and write each attempt's full UE log to $extractDir\logs so a failure is
+# diagnosable. A clean warm re-run usually succeeds. Root cause still needs a captured
+# cold-run log — see the logs this writes.
 if ($Extract) {
     $cmdExe = Join-Path $enginePath "Engine\Binaries\Win64\UnrealEditor-Cmd.exe"
     $extractDir = Join-Path $projectRoot ".gameiq\extract"
@@ -116,14 +119,18 @@ if ($Extract) {
         $outFile = Join-Path $extractDir $expected[$run]
         # Don't delete the last-good output — a transient failure shouldn't destroy it.
         # Success = the file exists AND was (re)written after we started this attempt.
+        $logDir = Join-Path $extractDir "logs"
+        New-Item -ItemType Directory -Force -Path $logDir | Out-Null
         foreach ($attempt in 1..3) {
-            Clear-UEProcesses  # clean slate before each attempt — the actual fix for the flakiness
+            Clear-UEProcesses  # settle before each attempt (mitigation, not a guaranteed fix)
             $startTime = Get-Date
-            Write-Host "Running commandlet: $run (attempt $attempt)" -ForegroundColor Yellow
-            # -unattended is required: without it the commandlet can block on a modal dialog and hang.
-            & $cmdExe $projectPath -run=$run -unattended -nopause -nosplash -stdout | Out-Null
+            $logFile = Join-Path $logDir "$run-attempt$attempt.log"
+            Write-Host "Running commandlet: $run (attempt $attempt) -> $logFile" -ForegroundColor Yellow
+            # -unattended: without it the commandlet can block on a modal dialog and hang.
+            # -abslog writes the full UE log to a file so a failing run is diagnosable afterwards.
+            & $cmdExe $projectPath -run=$run -unattended -nopause -nosplash -abslog="$logFile" 2>&1 | Out-Null
             if ((Test-Path $outFile) -and ((Get-Item $outFile).LastWriteTime -ge $startTime)) { break }
-            Write-Host "  $($expected[$run]) not freshly written; retrying..." -ForegroundColor DarkYellow
+            Write-Host "  $($expected[$run]) not freshly written; retrying (see $logFile)..." -ForegroundColor DarkYellow
         }
         if ((Test-Path $outFile) -and ((Get-Item $outFile).LastWriteTime -ge $startTime)) {
             Write-Host "  wrote $($expected[$run])" -ForegroundColor Green
