@@ -108,7 +108,7 @@ if ($Extract) {
         $stale | ForEach-Object { taskkill /F /PID $_.Id /T 2>$null | Out-Null }
         Start-Sleep 2
     }
-    $expected = [ordered]@{ "GameIQExport" = "registry.json"; "GameIQBlueprints" = "blueprints.json" }
+    $expected = [ordered]@{ "GameIQExport" = "registry.json"; "GameIQBlueprints" = "blueprints.json"; "GameIQAssets" = "assets.json" }
     foreach ($run in $expected.Keys) {
         $outFile = Join-Path $extractDir $expected[$run]
         # Don't delete the last-good output — a transient failure shouldn't destroy it.

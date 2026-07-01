@@ -12,13 +12,17 @@ Everything here emits the **ExtractorOutput** JSON contract (`packages/shared`) 
 | Producer | Tier | Editor? | Output |
 |---|---|---|---|
 | `GameIQExport` commandlet (C++) | 0 — identity + dependency/referencer graph | headless | `registry.json` |
-| `GameIQBlueprints` commandlet (C++) | 2 — Blueprint graphs → pseudocode + `calls` edges | headless (loads assets) | `blueprints.json` |
-| `gameiq_export.py` (Python) | 1 — typed per-asset summaries | in-editor | `assets.json` |
+| `GameIQAssets` commandlet (C++) | 1 — typed asset summaries + semantic edges + level actor inventory | headless (loads assets) | `assets.json` |
+| `GameIQBlueprints` commandlet (C++) | 2 — Blueprint graphs → pseudocode, plus variables/components/interfaces | headless (loads assets) | `blueprints.json` |
 | in-editor bridge *(planned)* | 1/2 live | live | pushed to index |
+| `gameiq_export.py` (Python) *(legacy/optional)* | 1 — subset of the above, in-editor | in-editor | `assets.json` |
 
-`GameIQExport` is fast and loads no assets. `GameIQBlueprints` loads each Blueprint and
-walks its event/function graphs (K2 nodes + exec pins) into greppable pseudocode — the
-"my agent read my Blueprint" pass. The Python pass fills in per-asset Tier 1 detail.
+`GameIQExport` is fast and loads no assets. `GameIQAssets` loads each non-Blueprint asset
+for a typed recipe (meshes → LODs/tris/materials, textures → dimensions, skeletons → bones,
+data tables → row struct, levels → actor inventory + per-class counts) and emits semantic
+edges (`uses-material`, `uses-skeleton`, `placed-in-level`). `GameIQBlueprints` walks each
+Blueprint's graphs into pseudocode and extracts its variables, components, and interfaces —
+the "my agent read my Blueprint" pass.
 
 ## Usage
 
@@ -31,13 +35,11 @@ Easiest — the deploy script does copy + enable + build + extract + index:
 Or step by step:
 
 ```bash
-# Tier 0 (fast, no asset loading) and Tier 2 (loads assets), both headless:
-UnrealEditor-Cmd <Project>.uproject -run=GameIQExport
-UnrealEditor-Cmd <Project>.uproject -run=GameIQBlueprints
+# Tier 0/1/2, all headless (editor closed):
+UnrealEditor-Cmd <Project>.uproject -run=GameIQExport      # registry.json
+UnrealEditor-Cmd <Project>.uproject -run=GameIQAssets      # assets.json
+UnrealEditor-Cmd <Project>.uproject -run=GameIQBlueprints  # blueprints.json
 # optional: -out=<dir>   (default <ProjectDir>/.gameiq/extract)
-
-# Tier 1, in-editor (or headless via the python commandlet):
-UnrealEditor-Cmd <Project>.uproject -run=pythonscript -script="gameiq_export.py"
 
 # then, from the project root:
 gameiq index --project .
