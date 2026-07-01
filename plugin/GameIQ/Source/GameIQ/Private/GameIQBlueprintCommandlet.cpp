@@ -11,6 +11,8 @@
 #include "EdGraph/EdGraphPin.h"
 #include "EdGraphSchema_K2.h"
 #include "Engine/Blueprint.h"
+#include "Engine/SCS_Node.h"
+#include "Engine/SimpleConstructionScript.h"
 #include "GameIQJson.h"
 #include "HAL/FileManager.h"
 #include "K2Node_CallFunction.h"
@@ -40,6 +42,26 @@ namespace
 	bool IsExecPin(const UEdGraphPin* Pin)
 	{
 		return Pin && Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec;
+	}
+
+	/** Human-readable type for a Blueprint variable/pin, e.g. `float`, `HealthComponent`, `Array<Actor>`. */
+	FString PinTypeToString(const FEdGraphPinType& T)
+	{
+		FString Base = T.PinCategory.ToString();
+		if (const UObject* Sub = T.PinSubCategoryObject.Get()) { Base = Sub->GetName(); }
+		switch (T.ContainerType)
+		{
+			case EPinContainerType::Array: return FString::Printf(TEXT("Array<%s>"), *Base);
+			case EPinContainerType::Set:   return FString::Printf(TEXT("Set<%s>"), *Base);
+			case EPinContainerType::Map:   return FString::Printf(TEXT("Map<%s>"), *Base);
+			default:                       return Base;
+		}
+	}
+
+	/** If a pin type references a UClass (object/class/interface pins), return its reflection name. */
+	const UClass* PinTypeClass(const FEdGraphPinType& T)
+	{
+		return Cast<UClass>(T.PinSubCategoryObject.Get());
 	}
 
 	/** A readable value for an input data pin: the upstream node it pulls from, or a literal default. */
@@ -240,6 +262,78 @@ int32 UGameIQBlueprintsCommandlet::Main(const FString& Params)
 					BpId, FString::Printf(TEXT("cpp:%s"), *Owner->GetName()), TEXT("calls"), Fn->GetName())));
 			}
 		}
+
+		// --- Blueprint structure beyond graphs: variables, components, interfaces ---
+		const FString ParentName = BP->ParentClass ? BP->ParentClass->GetName() : FString();
+		TArray<FString> VarLines, CompLines, IfaceLines;
+
+		for (const FBPVariableDescription& Var : BP->NewVariables)
+		{
+			const FString VarName = Var.VarName.ToString();
+			const FString TypeStr = PinTypeToString(Var.VarType);
+			TSharedRef<FJsonObject> D = MakeShared<FJsonObject>();
+			D->SetStringField(TEXT("type"), TypeStr);
+			D->SetStringField(TEXT("category"), Var.Category.ToString());
+			if (!Var.DefaultValue.IsEmpty()) { D->SetStringField(TEXT("default"), Var.DefaultValue); }
+			Entities.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEntity(
+				FString::Printf(TEXT("%s::var::%s"), *BpId, *VarName), TEXT("bp-variable"), VarName,
+				Package, TEXT("asset"), BpId, FString::Printf(TEXT("%s %s"), *TypeStr, *VarName), D)));
+			VarLines.Add(FString::Printf(TEXT("%s: %s"), *VarName, *TypeStr));
+			if (const UClass* C = PinTypeClass(Var.VarType))
+			{
+				Edges.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEdge(
+					BpId, FString::Printf(TEXT("cpp:%s"), *C->GetName()), TEXT("references"), VarName)));
+			}
+		}
+
+		if (BP->SimpleConstructionScript)
+		{
+			for (const USCS_Node* Node : BP->SimpleConstructionScript->GetAllNodes())
+			{
+				if (!Node) { continue; }
+				const FString CompName = Node->GetVariableName().ToString();
+				const UClass* CompClass = Node->ComponentClass;
+				const FString ClassName = CompClass ? CompClass->GetName() : TEXT("Component");
+				TSharedRef<FJsonObject> D = MakeShared<FJsonObject>();
+				D->SetStringField(TEXT("componentClass"), ClassName);
+				if (!Node->ParentComponentOrVariableName.IsNone())
+				{
+					D->SetStringField(TEXT("attachParent"), Node->ParentComponentOrVariableName.ToString());
+				}
+				Entities.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEntity(
+					FString::Printf(TEXT("%s::comp::%s"), *BpId, *CompName), TEXT("bp-component"), CompName,
+					Package, TEXT("asset"), BpId, FString::Printf(TEXT("%s %s"), *ClassName, *CompName), D)));
+				CompLines.Add(FString::Printf(TEXT("%s: %s"), *CompName, *ClassName));
+				if (CompClass)
+				{
+					Edges.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEdge(
+						BpId, FString::Printf(TEXT("cpp:%s"), *ClassName), TEXT("references"), CompName)));
+				}
+			}
+		}
+
+		for (const FBPInterfaceDescription& Iface : BP->ImplementedInterfaces)
+		{
+			const UClass* IfClass = Iface.Interface.Get();
+			if (!IfClass) { continue; }
+			IfaceLines.Add(IfClass->GetName());
+			Edges.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEdge(
+				BpId, FString::Printf(TEXT("cpp:%s"), *IfClass->GetName()), TEXT("implements"), FString())));
+		}
+
+		// One structural summary chunk on the blueprint entity — makes its shape searchable
+		// ("which blueprint has an Ammo variable / a SphereComponent / implements Interactable?").
+		{
+			FString S = Data.AssetName.ToString();
+			if (!ParentName.IsEmpty()) { S += FString::Printf(TEXT(" (parent: %s)"), *ParentName); }
+			S += TEXT("\n");
+			if (VarLines.Num() > 0)   { S += TEXT("Variables: ")  + FString::Join(VarLines, TEXT(", "))  + TEXT("\n"); }
+			if (CompLines.Num() > 0)  { S += TEXT("Components: ") + FString::Join(CompLines, TEXT(", ")) + TEXT("\n"); }
+			if (IfaceLines.Num() > 0) { S += TEXT("Implements: ") + FString::Join(IfaceLines, TEXT(", ")) + TEXT("\n"); }
+			Chunks.Add(MakeShared<FJsonValueObject>(GameIQ::MakeChunk(
+				FString::Printf(TEXT("%s#structure"), *BpId), BpId, TEXT("recipe-summary"), S)));
+		}
+
 		++Rendered;
 	}
 
@@ -250,7 +344,7 @@ int32 UGameIQBlueprintsCommandlet::Main(const FString& Params)
 	}
 
 	UE_LOG(LogGameIQBlueprints, Display,
-		TEXT("Game IQ: rendered %d Blueprints — %d graph entities, %d call edges, %d pseudocode chunks to %s"),
+		TEXT("Game IQ: rendered %d Blueprints — %d entities (graphs/vars/components), %d edges, %d chunks to %s"),
 		Rendered, Entities.Num(), Edges.Num(), Chunks.Num(), *FPaths::Combine(OutDir, TEXT("blueprints.json")));
 	return 0;
 }

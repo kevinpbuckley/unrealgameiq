@@ -63,6 +63,26 @@ const MIGRATIONS: string[] = [
     text
   );
   `,
+  // 2 — producer-scoped ingest: tag every row with its producer so re-ingesting a
+  // producer replaces only its own rows (no cross-producer clobbering of chunks/edges).
+  `
+  ALTER TABLE entities ADD COLUMN producer TEXT;
+  ALTER TABLE edges    ADD COLUMN producer TEXT;
+  ALTER TABLE chunks   ADD COLUMN producer TEXT;
+  CREATE INDEX idx_entities_producer ON entities(producer);
+  CREATE INDEX idx_edges_producer    ON edges(producer);
+  CREATE INDEX idx_chunks_producer   ON chunks(producer);
+
+  DROP TABLE chunks_fts;
+  CREATE VIRTUAL TABLE chunks_fts USING fts5(
+    chunk_id UNINDEXED,
+    entity_id UNINDEXED,
+    producer UNINDEXED,
+    text
+  );
+  INSERT INTO chunks_fts(chunk_id, entity_id, producer, text)
+    SELECT id, entity_id, producer, text FROM chunks;
+  `,
 ];
 
 export interface SearchHit {
@@ -168,15 +188,23 @@ export class Store {
     this.db.exec(`DELETE FROM entities; DELETE FROM edges; DELETE FROM chunks; DELETE FROM chunks_fts;`);
   }
 
-  upsertEntity(e: Entity): void {
+  /** Remove every row contributed by one producer (producer-scoped replace). */
+  deleteByProducer(producer: string): void {
+    this.db.prepare(`DELETE FROM chunks_fts WHERE producer = ?`).run(producer);
+    this.db.prepare(`DELETE FROM chunks WHERE producer = ?`).run(producer);
+    this.db.prepare(`DELETE FROM edges WHERE producer = ?`).run(producer);
+    this.db.prepare(`DELETE FROM entities WHERE producer = ?`).run(producer);
+  }
+
+  upsertEntity(e: Entity, producer: string): void {
     this.db
       .prepare(
-        `INSERT INTO entities (id, kind, name, path, parent, source, summary, detail)
-         VALUES (@id, @kind, @name, @path, @parent, @source, @summary, @detail)
+        `INSERT INTO entities (id, kind, name, path, parent, source, summary, detail, producer)
+         VALUES (@id, @kind, @name, @path, @parent, @source, @summary, @detail, @producer)
          ON CONFLICT(id) DO UPDATE SET
            kind=excluded.kind, name=excluded.name, path=excluded.path,
            parent=excluded.parent, source=excluded.source,
-           summary=excluded.summary, detail=excluded.detail`,
+           summary=excluded.summary, detail=excluded.detail, producer=excluded.producer`,
       )
       .run({
         id: e.id,
@@ -187,38 +215,30 @@ export class Store {
         source: e.source,
         summary: e.summary ?? null,
         detail: e.detail ? JSON.stringify(e.detail) : null,
+        producer,
       });
   }
 
-  /** Remove an entity's *outgoing* edges (owned by it); inbound edges belong to other entities. */
-  deleteOutgoingEdges(entityId: string): void {
-    this.db.prepare(`DELETE FROM edges WHERE src = ?`).run(entityId);
-  }
-
-  insertEdge(edge: Edge): void {
+  insertEdge(edge: Edge, producer: string): void {
     this.db
       .prepare(
-        `INSERT INTO edges (src, dst, type, attrs) VALUES (?, ?, ?, ?)
-         ON CONFLICT(src, dst, type) DO UPDATE SET attrs = excluded.attrs`,
+        `INSERT INTO edges (src, dst, type, attrs, producer) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(src, dst, type) DO UPDATE SET attrs = excluded.attrs, producer = excluded.producer`,
       )
-      .run(edge.src, edge.dst, edge.type, edge.attrs ? JSON.stringify(edge.attrs) : null);
+      .run(edge.src, edge.dst, edge.type, edge.attrs ? JSON.stringify(edge.attrs) : null, producer);
   }
 
-  deleteChunksForEntity(entityId: string): void {
-    this.db.prepare(`DELETE FROM chunks WHERE entity_id = ?`).run(entityId);
-    this.db.prepare(`DELETE FROM chunks_fts WHERE entity_id = ?`).run(entityId);
-  }
-
-  insertChunk(c: Chunk): void {
+  insertChunk(c: Chunk, producer: string): void {
     this.db
-      .prepare(`INSERT INTO chunks (id, entity_id, kind, text) VALUES (?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET entity_id=excluded.entity_id, kind=excluded.kind, text=excluded.text`)
-      .run(c.id, c.entityId, c.kind, c.text);
+      .prepare(`INSERT INTO chunks (id, entity_id, kind, text, producer) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET entity_id=excluded.entity_id, kind=excluded.kind,
+                  text=excluded.text, producer=excluded.producer`)
+      .run(c.id, c.entityId, c.kind, c.text, producer);
     // keep FTS in sync (delete any prior row for this chunk id, then insert)
     this.db.prepare(`DELETE FROM chunks_fts WHERE chunk_id = ?`).run(c.id);
     this.db
-      .prepare(`INSERT INTO chunks_fts (chunk_id, entity_id, text) VALUES (?, ?, ?)`)
-      .run(c.id, c.entityId, c.text);
+      .prepare(`INSERT INTO chunks_fts (chunk_id, entity_id, producer, text) VALUES (?, ?, ?, ?)`)
+      .run(c.id, c.entityId, producer, c.text);
   }
 
   // ---- reads (used by query engine) ---------------------------------------
@@ -253,7 +273,7 @@ export class Store {
       .prepare(
         `SELECT f.chunk_id AS chunkId, f.entity_id AS entityId, c.kind AS kind,
                 bm25(chunks_fts) AS score,
-                snippet(chunks_fts, 2, '[', ']', ' … ', 12) AS snippet
+                snippet(chunks_fts, 3, '[', ']', ' … ', 12) AS snippet
          FROM chunks_fts f
          JOIN chunks c ON c.id = f.chunk_id
          WHERE chunks_fts MATCH ?

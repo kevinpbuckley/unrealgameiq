@@ -30,16 +30,15 @@ export function ingest(store: Store, output: ExtractorOutput, mode: IngestMode):
     if (mode === "replace") {
       store.clearAll();
     } else {
-      // incremental: clear each present entity's owned edges+chunks before re-inserting
-      for (const e of output.entities) {
-        store.deleteOutgoingEdges(e.id);
-        store.deleteChunksForEntity(e.id);
-      }
+      // producer-scoped replace: drop only THIS producer's prior rows, then re-insert.
+      // Keeps other producers' contributions (e.g. the registry owns a blueprint entity
+      // while the blueprints producer adds a structure chunk to it) intact.
+      store.deleteByProducer(output.producer);
     }
 
-    for (const e of output.entities) store.upsertEntity(e);
-    for (const edge of output.edges) store.insertEdge(edge);
-    for (const c of output.chunks) store.insertChunk(c);
+    for (const e of output.entities) store.upsertEntity(e, output.producer);
+    for (const edge of output.edges) store.insertEdge(edge, output.producer);
+    for (const c of output.chunks) store.insertChunk(c, output.producer);
 
     store.setMeta("projectName", output.project.name);
     store.setMeta("projectRoot", output.project.root);
