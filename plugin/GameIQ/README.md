@@ -12,19 +12,28 @@ Everything here emits the **ExtractorOutput** JSON contract (`packages/shared`) 
 | Producer | Tier | Editor? | Output |
 |---|---|---|---|
 | `GameIQExport` commandlet (C++) | 0 — identity + dependency/referencer graph | headless | `registry.json` |
+| `GameIQBlueprints` commandlet (C++) | 2 — Blueprint graphs → pseudocode + `calls` edges | headless (loads assets) | `blueprints.json` |
 | `gameiq_export.py` (Python) | 1 — typed per-asset summaries | in-editor | `assets.json` |
-| in-editor bridge *(planned)* | 1/2 live + Tier 2 pseudocode via `ExportNodesToText` | live | pushed to index |
+| in-editor bridge *(planned)* | 1/2 live | live | pushed to index |
 
-The C++ commandlet is fast and loads no assets. The Python pass fills in per-asset
-detail. **Tier 2** (Blueprint/material logic → pseudocode) is deliberately a C++
-`FEdGraphUtilities::ExportNodesToText` job (design §5.1), not Python — tracked for the
-in-editor bridge.
+`GameIQExport` is fast and loads no assets. `GameIQBlueprints` loads each Blueprint and
+walks its event/function graphs (K2 nodes + exec pins) into greppable pseudocode — the
+"my agent read my Blueprint" pass. The Python pass fills in per-asset Tier 1 detail.
 
 ## Usage
 
+Easiest — the deploy script does copy + enable + build + extract + index:
+
+```powershell
+./scripts/deploy.ps1 -Project <ProjectRoot> -All
+```
+
+Or step by step:
+
 ```bash
-# Tier 0, headless — no interactive editor:
+# Tier 0 (fast, no asset loading) and Tier 2 (loads assets), both headless:
 UnrealEditor-Cmd <Project>.uproject -run=GameIQExport
+UnrealEditor-Cmd <Project>.uproject -run=GameIQBlueprints
 # optional: -out=<dir>   (default <ProjectDir>/.gameiq/extract)
 
 # Tier 1, in-editor (or headless via the python commandlet):
@@ -34,7 +43,8 @@ UnrealEditor-Cmd <Project>.uproject -run=pythonscript -script="gameiq_export.py"
 gameiq index --project .
 ```
 
-`gameiq index` automatically ingests any `*.json` under `.gameiq/extract/`.
+`gameiq index` automatically ingests any `*.json` under `.gameiq/extract/`. Run the
+commandlets with the editor **closed** (they load the project themselves).
 
 ## Build
 

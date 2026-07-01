@@ -5,55 +5,22 @@
 #include "AssetRegistry/AssetData.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/IAssetRegistry.h"
-#include "Dom/JsonObject.h"
+#include "GameIQJson.h"
 #include "HAL/FileManager.h"
-#include "Misc/App.h"
-#include "Misc/DateTime.h"
-#include "Misc/FileHelper.h"
 #include "Misc/Parse.h"
 #include "Misc/Paths.h"
 #include "Modules/ModuleManager.h"
-#include "Serialization/JsonSerializer.h"
-#include "Serialization/JsonWriter.h"
-#include "UObject/TopLevelAssetPath.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogGameIQExport, Log, All);
 
 namespace
 {
-	constexpr int32 GameIQSchemaVersion = 1; // keep in lockstep with packages/shared SCHEMA_VERSION
-	const TCHAR* GameIQProducer = TEXT("gameiq-ue-registry@0.1.0");
+	const TCHAR* RegistryProducer = TEXT("gameiq-ue-registry@0.1.0");
 
 	/** Only project content (skip /Engine, /Script, etc.) — Game IQ indexes *your* game. */
 	bool IsProjectPackage(const FString& PackageName)
 	{
 		return PackageName.StartsWith(TEXT("/Game"));
-	}
-
-	TSharedRef<FJsonObject> MakeEntity(
-		const FString& Id, const FString& Kind, const FString& Name, const FString& Path,
-		const FString& Source, const TSharedPtr<FJsonObject>& Detail)
-	{
-		TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
-		O->SetStringField(TEXT("id"), Id);
-		O->SetStringField(TEXT("kind"), Kind);
-		O->SetStringField(TEXT("name"), Name);
-		O->SetStringField(TEXT("path"), Path);
-		O->SetStringField(TEXT("source"), Source);
-		if (Detail.IsValid())
-		{
-			O->SetObjectField(TEXT("detail"), Detail);
-		}
-		return O;
-	}
-
-	TSharedRef<FJsonObject> MakeEdge(const FString& Src, const FString& Dst, const FString& Type)
-	{
-		TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
-		O->SetStringField(TEXT("src"), Src);
-		O->SetStringField(TEXT("dst"), Dst);
-		O->SetStringField(TEXT("type"), Type);
-		return O;
 	}
 
 	/** Pull the prefix-less native parent class name from a Blueprint's registry tags, if present. */
@@ -108,6 +75,7 @@ int32 UGameIQExportCommandlet::Main(const FString& Params)
 
 	TArray<TSharedPtr<FJsonValue>> Entities;
 	TArray<TSharedPtr<FJsonValue>> Edges;
+	const TArray<TSharedPtr<FJsonValue>> NoChunks;
 
 	int32 Considered = 0;
 	for (const FAssetData& Data : Assets)
@@ -128,8 +96,8 @@ int32 UGameIQExportCommandlet::Main(const FString& Params)
 		Detail->SetStringField(TEXT("assetClass"), ClassName);
 		Detail->SetStringField(TEXT("objectPath"), Data.GetObjectPathString());
 
-		Entities.Add(MakeShared<FJsonValueObject>(
-			MakeEntity(Id, Kind, Data.AssetName.ToString(), Package, TEXT("asset"), Detail)));
+		Entities.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEntity(
+			Id, Kind, Data.AssetName.ToString(), Package, TEXT("asset"), FString(), FString(), Detail)));
 
 		// Tier 0 dependency graph (generic, from the registry — answers "what uses X?")
 		TArray<FName> Deps;
@@ -140,7 +108,7 @@ int32 UGameIQExportCommandlet::Main(const FString& Params)
 			if (IsProjectPackage(DepName))
 			{
 				Edges.Add(MakeShared<FJsonValueObject>(
-					MakeEdge(Id, FString::Printf(TEXT("asset:%s"), *DepName), TEXT("depends-on"))));
+					GameIQ::MakeEdge(Id, FString::Printf(TEXT("asset:%s"), *DepName), TEXT("depends-on"))));
 			}
 		}
 
@@ -149,36 +117,18 @@ int32 UGameIQExportCommandlet::Main(const FString& Params)
 		if (bIsBlueprint && TryGetNativeParentClassName(Data, ParentClassName))
 		{
 			Edges.Add(MakeShared<FJsonValueObject>(
-				MakeEdge(Id, FString::Printf(TEXT("cpp:%s"), *ParentClassName), TEXT("inherits"))));
+				GameIQ::MakeEdge(Id, FString::Printf(TEXT("cpp:%s"), *ParentClassName), TEXT("inherits"))));
 		}
 	}
 
-	TSharedRef<FJsonObject> Project = MakeShared<FJsonObject>();
-	Project->SetStringField(TEXT("name"), FApp::GetProjectName());
-	Project->SetStringField(TEXT("root"), FPaths::ConvertRelativePathToFull(FPaths::ProjectDir()));
-
-	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
-	Root->SetNumberField(TEXT("schemaVersion"), GameIQSchemaVersion);
-	Root->SetStringField(TEXT("generatedAtIso"), FDateTime::UtcNow().ToIso8601());
-	Root->SetStringField(TEXT("producer"), GameIQProducer);
-	Root->SetObjectField(TEXT("project"), Project);
-	Root->SetArrayField(TEXT("entities"), Entities);
-	Root->SetArrayField(TEXT("edges"), Edges);
-	Root->SetArrayField(TEXT("chunks"), TArray<TSharedPtr<FJsonValue>>());
-
-	FString Out;
-	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Out);
-	FJsonSerializer::Serialize(Root, Writer);
-
-	const FString OutFile = FPaths::Combine(OutDir, TEXT("registry.json"));
-	if (!FFileHelper::SaveStringToFile(Out, *OutFile))
+	if (!GameIQ::WriteOutput(OutDir, TEXT("registry.json"), RegistryProducer, Entities, Edges, NoChunks))
 	{
-		UE_LOG(LogGameIQExport, Error, TEXT("Failed to write %s"), *OutFile);
+		UE_LOG(LogGameIQExport, Error, TEXT("Failed to write registry.json to %s"), *OutDir);
 		return 1;
 	}
 
 	UE_LOG(LogGameIQExport, Display,
 		TEXT("Game IQ: wrote %d entities and %d edges (%d project assets) to %s"),
-		Entities.Num(), Edges.Num(), Considered, *OutFile);
+		Entities.Num(), Edges.Num(), Considered, *FPaths::Combine(OutDir, TEXT("registry.json")));
 	return 0;
 }
