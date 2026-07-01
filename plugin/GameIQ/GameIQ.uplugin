@@ -10,7 +10,7 @@
   "DocsURL": "",
   "MarketplaceURL": "",
   "SupportURL": "",
-  "CanContainContent": true,
+  "CanContainContent": false,
   "IsBetaVersion": true,
   "IsExperimentalVersion": false,
   "Installed": false,
@@ -22,12 +22,6 @@
       "Type": "Editor",
       "LoadingPhase": "Default",
       "TargetAllowList": ["Editor"]
-    }
-  ],
-  "Plugins": [
-    {
-      "Name": "PythonScriptPlugin",
-      "Enabled": true
     }
   ]
 }

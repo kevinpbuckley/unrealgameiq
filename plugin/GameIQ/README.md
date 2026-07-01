@@ -15,7 +15,6 @@ Everything here emits the **ExtractorOutput** JSON contract (`packages/shared`) 
 | `GameIQAssets` commandlet (C++) | 1 — typed asset summaries + semantic edges + level actor inventory | headless (loads assets) | `assets.json` |
 | `GameIQBlueprints` commandlet (C++) | 2 — Blueprint graphs → pseudocode, plus variables/components/interfaces | headless (loads assets) | `blueprints.json` |
 | in-editor bridge *(planned)* | 1/2 live | live | pushed to index |
-| `gameiq_export.py` (Python) *(legacy/optional)* | 1 — subset of the above, in-editor | in-editor | `assets.json` |
 
 `GameIQExport` is fast and loads no assets. `GameIQAssets` loads each non-Blueprint asset
 for a typed recipe (meshes → LODs/tris/materials, textures → dimensions, skeletons → bones,
@@ -51,6 +50,11 @@ commandlets with the editor **closed** (they load the project themselves).
 ## Build
 
 This is a source plugin: it compiles with your project (a C++ project, or one UBT
-converts). Requires UE 5.x with the **Python Editor Script Plugin** enabled. Ids use
-prefix-less reflection names (`PlayerCharacter`, not `APlayerCharacter`) so edges line
-up with the core's C++ extractor — keep that convention if you extend the recipes.
+converts). No engine plugin dependencies. Ids use prefix-less reflection names
+(`PlayerCharacter`, not `APlayerCharacter`) so edges line up with the core's C++
+extractor — keep that convention if you extend the recipes.
+
+> **Python?** An earlier Python Tier 1 extractor was removed — `GameIQAssets` (C++)
+> supersedes it. Python remains a candidate *later* for the live in-editor bridge and
+> user-pluggable recipes (design §5.1/§10), not for the batch extraction the commandlets
+> already own.
