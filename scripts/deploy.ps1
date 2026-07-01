@@ -128,7 +128,10 @@ if ($Extract) {
             Write-Host "Running commandlet: $run (attempt $attempt) -> $logFile" -ForegroundColor Yellow
             # -unattended: without it the commandlet can block on a modal dialog and hang.
             # -abslog writes the full UE log to a file so a failing run is diagnosable afterwards.
-            & $cmdExe $projectPath -run=$run -unattended -nopause -nosplash -abslog="$logFile" 2>&1 | Out-Null
+            # NB: quote "-run=$run" — an unquoted -run=$run does NOT expand the variable in
+            # PowerShell native-arg passing, so UE received the literal "$run" and reported
+            # "$runCommandlet ... could not find the class". This was the real "flakiness".
+            & $cmdExe $projectPath "-run=$run" -unattended -nopause -nosplash -abslog="$logFile" 2>&1 | Out-Null
             if ((Test-Path $outFile) -and ((Get-Item $outFile).LastWriteTime -ge $startTime)) { break }
             Write-Host "  $($expected[$run]) not freshly written; retrying (see $logFile)..." -ForegroundColor DarkYellow
         }
