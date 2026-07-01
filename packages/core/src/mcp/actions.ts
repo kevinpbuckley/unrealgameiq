@@ -1,4 +1,4 @@
-import type { EntityKind } from "@gameiq/shared";
+import type { EdgeType, EntityKind } from "@gameiq/shared";
 import type { Direction, QueryEngine } from "../query/query.js";
 
 /** Parsed arguments for the single multi-action `game_iq` tool (design §6.1: few tools, rich params). */
@@ -9,6 +9,7 @@ export interface GameIqArgs {
   id?: string;
   direction?: Direction;
   depth?: number;
+  edgeType?: string;
   facet?: "overview" | "kinds" | "edges" | "unused" | "largest-deps";
   limit?: number;
 }
@@ -26,7 +27,12 @@ export function runAction(engine: QueryEngine, args: GameIqArgs): unknown {
     }
     case "references": {
       if (!args.id) throw new Error("references requires `id`");
-      return engine.references(args.id, args.direction ?? "both", args.depth ?? 1);
+      return engine.references(
+        args.id,
+        args.direction ?? "both",
+        args.depth ?? 1,
+        args.edgeType as EdgeType | undefined,
+      );
     }
     case "impact": {
       if (!args.id) throw new Error("impact requires `id`");

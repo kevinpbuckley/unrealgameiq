@@ -255,6 +255,14 @@ export class Store {
     return rows.map(rowToEntity);
   }
 
+  /** Child entities (those whose parent is `id`) — e.g. a blueprint's variables/components/functions. */
+  childrenOf(id: string, limit = 500): Entity[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM entities WHERE parent = ? LIMIT ?`)
+      .all(id, limit) as EntityRow[];
+    return rows.map(rowToEntity);
+  }
+
   /** Outgoing edges (this entity depends on / uses dst). */
   outgoingEdges(id: string): Edge[] {
     const rows = this.db.prepare(`SELECT * FROM edges WHERE src = ?`).all(id) as EdgeRow[];

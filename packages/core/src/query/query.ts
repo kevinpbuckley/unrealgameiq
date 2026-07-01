@@ -21,6 +21,7 @@ export interface EntityDetail {
   entity: Entity;
   outgoing: Edge[];
   incoming: Edge[];
+  children: Entity[];
   chunks: Array<{ id: string; kind: string; text: string }>;
 }
 
@@ -101,12 +102,17 @@ export class QueryEngine {
       entity,
       outgoing: this.store.outgoingEdges(id),
       incoming: this.store.incomingEdges(id),
+      children: this.store.childrenOf(id),
       chunks,
     };
   }
 
-  /** BFS over the edge graph from `id`, up to `depth` hops. */
-  references(id: string, direction: Direction, depth = 1): RefResult[] {
+  /**
+   * BFS over the edge graph from `id`, up to `depth` hops. Optionally restrict to one
+   * edge type — e.g. references(skeletonId, "in", 1, "uses-skeleton") answers
+   * "which meshes use this skeleton?".
+   */
+  references(id: string, direction: Direction, depth = 1, edgeType?: EdgeType): RefResult[] {
     if (!this.store.getEntity(id)) return [];
     const results: RefResult[] = [];
     const seen = new Set<string>([id]);
@@ -119,6 +125,7 @@ export class QueryEngine {
         for (const node of frontier) {
           const edges = dir === "out" ? this.store.outgoingEdges(node) : this.store.incomingEdges(node);
           for (const e of edges) {
+            if (edgeType && e.type !== edgeType) continue;
             const other = dir === "out" ? e.dst : e.src;
             if (seen.has(other)) continue;
             seen.add(other);
