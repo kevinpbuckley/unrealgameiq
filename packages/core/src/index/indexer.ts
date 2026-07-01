@@ -1,10 +1,10 @@
-import { readFileSync } from "node:fs";
 import { parseExtractorOutput, type ExtractorOutput } from "@gameiq/shared";
 import { ingest, type IngestSummary } from "../ingest/ingest.js";
 import { extractCpp } from "../extract/cpp.js";
 import { extractConfig } from "../extract/config.js";
 import { findCommandletOutputs, gameiqPaths, projectInfo } from "../extract/project.js";
 import { Store } from "../store/store.js";
+import { readJsonFile } from "../util/readJson.js";
 
 export interface IndexOptions {
   projectRoot: string;
@@ -41,7 +41,7 @@ export function indexProject(opts: IndexOptions): IndexResult {
 
   const jsonPaths = [...findCommandletOutputs(opts.projectRoot), ...(opts.extractorJson ?? [])];
   for (const p of jsonPaths) {
-    outputs.push(parseExtractorOutput(JSON.parse(readFileSync(p, "utf8"))));
+    outputs.push(parseExtractorOutput(readJsonFile(p)));
   }
 
   const store = new Store(dbPath);

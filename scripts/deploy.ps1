@@ -99,18 +99,35 @@ if ($Build) {
 if ($Extract) {
     $cmdExe = Join-Path $enginePath "Engine\Binaries\Win64\UnrealEditor-Cmd.exe"
     $extractDir = Join-Path $projectRoot ".gameiq\extract"
+
+    # Clear lingering UE processes first — a leftover editor / ShaderCompileWorker holds
+    # locks that make the commandlet exit before writing. This was the main flakiness source.
+    $stale = Get-Process | Where-Object { $_.ProcessName -like "UnrealEditor*" -or $_.ProcessName -like "ShaderCompileWorker*" }
+    if ($stale) {
+        Write-Host "Clearing $($stale.Count) lingering UE process(es) before extraction..." -ForegroundColor DarkYellow
+        $stale | ForEach-Object { taskkill /F /PID $_.Id /T 2>$null | Out-Null }
+        Start-Sleep 2
+    }
     $expected = [ordered]@{ "GameIQExport" = "registry.json"; "GameIQBlueprints" = "blueprints.json" }
     foreach ($run in $expected.Keys) {
         $outFile = Join-Path $extractDir $expected[$run]
-        if (Test-Path $outFile) { Remove-Item $outFile -Force }
-        foreach ($attempt in 1..2) {
+        # Don't delete the last-good output — a transient failure shouldn't destroy it.
+        # Success = the file exists AND was (re)written after we started this attempt.
+        # The first run right after a rebuild often fails to write (shader/DDC cold-start);
+        # warm runs succeed, so retry a few times before giving up.
+        foreach ($attempt in 1..3) {
+            $startTime = Get-Date
             Write-Host "Running commandlet: $run (attempt $attempt)" -ForegroundColor Yellow
-            & $cmdExe $projectPath -run=$run -nopause -nosplash -stdout | Out-Null
-            if (Test-Path $outFile) { break }
-            Write-Host "  $($expected[$run]) not written; retrying..." -ForegroundColor DarkYellow
+            # -unattended is required: without it the commandlet can block on a modal dialog and hang.
+            & $cmdExe $projectPath -run=$run -unattended -nopause -nosplash -stdout | Out-Null
+            if ((Test-Path $outFile) -and ((Get-Item $outFile).LastWriteTime -ge $startTime)) { break }
+            Write-Host "  $($expected[$run]) not freshly written; retrying..." -ForegroundColor DarkYellow
         }
-        if (Test-Path $outFile) { Write-Host "  wrote $($expected[$run])" -ForegroundColor Green }
-        else { Write-Host "  WARNING: $run did not produce $($expected[$run])" -ForegroundColor Red }
+        if ((Test-Path $outFile) -and ((Get-Item $outFile).LastWriteTime -ge $startTime)) {
+            Write-Host "  wrote $($expected[$run])" -ForegroundColor Green
+        } else {
+            Write-Host "  WARNING: $run did not freshly write $($expected[$run]) (keeping any prior copy)" -ForegroundColor Red
+        }
     }
 }
 

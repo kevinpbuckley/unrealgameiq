@@ -88,6 +88,9 @@ namespace GameIQ
 		FString Out;
 		TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Out);
 		FJsonSerializer::Serialize(Root, Writer);
-		return FFileHelper::SaveStringToFile(Out, *FPaths::Combine(OutDir, FileName));
+		// Force UTF-8 without BOM: pseudocode contains non-ASCII (→, …) which would
+		// otherwise make SaveStringToFile emit UTF-16+BOM and break JSON parsers.
+		return FFileHelper::SaveStringToFile(
+			Out, *FPaths::Combine(OutDir, FileName), FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
 	}
 }
