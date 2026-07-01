@@ -94,28 +94,30 @@ if ($Build) {
 }
 
 # --- 4. run extraction commandlets (editor must be closed) ---
-# Commandlets exit non-zero on teardown / per-asset load errors (ShowErrorCount),
-# so we don't trust the exit code — we verify the output file was written, and retry once.
+# Root cause of the old "did not write" failures: a prior commandlet's child processes
+# (esp. ShaderCompileWorker) outlive the parent and keep the project's AssetRegistry/DDC
+# locked, so the next launch can't write. taskkill returns before children fully die, so we
+# kill + SETTLE before EVERY attempt. Commandlets also exit non-zero on teardown, so we trust
+# the output file's freshness, not the exit code.
 if ($Extract) {
     $cmdExe = Join-Path $enginePath "Engine\Binaries\Win64\UnrealEditor-Cmd.exe"
     $extractDir = Join-Path $projectRoot ".gameiq\extract"
 
-    # Clear lingering UE processes first — a leftover editor / ShaderCompileWorker holds
-    # locks that make the commandlet exit before writing. This was the main flakiness source.
-    $stale = Get-Process | Where-Object { $_.ProcessName -like "UnrealEditor*" -or $_.ProcessName -like "ShaderCompileWorker*" }
-    if ($stale) {
-        Write-Host "Clearing $($stale.Count) lingering UE process(es) before extraction..." -ForegroundColor DarkYellow
-        $stale | ForEach-Object { taskkill /F /PID $_.Id /T 2>$null | Out-Null }
-        Start-Sleep 2
+    function Clear-UEProcesses {
+        $stale = Get-Process | Where-Object { $_.ProcessName -like "UnrealEditor*" -or $_.ProcessName -like "ShaderCompileWorker*" }
+        if ($stale) {
+            $stale | ForEach-Object { taskkill /F /PID $_.Id /T 2>$null | Out-Null }
+            Start-Sleep 5  # let child processes fully die and release locks before the next launch
+        }
     }
+
     $expected = [ordered]@{ "GameIQExport" = "registry.json"; "GameIQBlueprints" = "blueprints.json"; "GameIQAssets" = "assets.json" }
     foreach ($run in $expected.Keys) {
         $outFile = Join-Path $extractDir $expected[$run]
         # Don't delete the last-good output — a transient failure shouldn't destroy it.
         # Success = the file exists AND was (re)written after we started this attempt.
-        # The first run right after a rebuild often fails to write (shader/DDC cold-start);
-        # warm runs succeed, so retry a few times before giving up.
         foreach ($attempt in 1..3) {
+            Clear-UEProcesses  # clean slate before each attempt — the actual fix for the flakiness
             $startTime = Get-Date
             Write-Host "Running commandlet: $run (attempt $attempt)" -ForegroundColor Yellow
             # -unattended is required: without it the commandlet can block on a modal dialog and hang.
@@ -129,6 +131,7 @@ if ($Extract) {
             Write-Host "  WARNING: $run did not freshly write $($expected[$run]) (keeping any prior copy)" -ForegroundColor Red
         }
     }
+    Clear-UEProcesses  # leave no stragglers holding locks for the next run
 }
 
 # --- 5. build the index ---

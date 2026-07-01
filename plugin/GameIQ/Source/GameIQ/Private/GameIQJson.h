@@ -21,6 +21,12 @@ namespace GameIQ
 {
 	inline constexpr int32 SchemaVersion = 1; // lockstep with packages/shared SCHEMA_VERSION
 
+	/** Collapse a string to a single trimmed line (shared by the commandlets). */
+	inline FString OneLine(const FString& In)
+	{
+		return In.Replace(TEXT("\r"), TEXT(" ")).Replace(TEXT("\n"), TEXT(" ")).TrimStartAndEnd();
+	}
+
 	inline TSharedRef<FJsonObject> MakeEntity(
 		const FString& Id, const FString& Kind, const FString& Name, const FString& Path,
 		const FString& Source, const FString& Parent, const FString& Summary,

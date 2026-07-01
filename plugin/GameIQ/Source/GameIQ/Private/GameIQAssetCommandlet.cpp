@@ -24,7 +24,10 @@
 #include "Misc/Parse.h"
 #include "Misc/Paths.h"
 #include "Modules/ModuleManager.h"
+#include "UObject/Field.h"
 #include "UObject/Package.h"
+#include "UObject/PropertyPortFlags.h"
+#include "UObject/UnrealType.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogGameIQAssets, Log, All);
 
@@ -56,6 +59,51 @@ namespace
 	{
 		O.Chunks.Add(MakeShared<FJsonValueObject>(
 			GameIQ::MakeChunk(FString::Printf(TEXT("%s#summary"), *AssetId), AssetId, TEXT("recipe-summary"), Text)));
+	}
+
+	/**
+	 * Generic fallback for any asset without a bespoke recipe (design §5.1 "reflection export
+	 * is the foundation"). Reflects the asset's top-level UPROPERTYs into a bounded property
+	 * bag via ExportTextItem_Direct, and turns object-reference properties into `references`
+	 * edges — so Niagara systems, sounds, physics assets, data assets, etc. are never invisible.
+	 */
+	FString GenericReflectionSummary(FOut& O, const UObject* Asset, const FString& Id)
+	{
+		TArray<FString> Lines;
+		int32 Count = 0;
+		for (TFieldIterator<FProperty> It(Asset->GetClass()); It && Count < 40; ++It)
+		{
+			const FProperty* Prop = *It;
+			if (Prop->HasAnyPropertyFlags(CPF_Transient | CPF_Deprecated)) { continue; }
+
+			if (const FObjectPropertyBase* ObjProp = CastField<FObjectPropertyBase>(Prop))
+			{
+				UObject* Ref = ObjProp->GetObjectPropertyValue(ObjProp->ContainerPtrToValuePtr<void>(Asset));
+				if (Ref && IsProjectObject(Ref))
+				{
+					Lines.Add(FString::Printf(TEXT("%s=%s"), *Prop->GetName(), *Ref->GetName()));
+					O.Edges.Add(MakeShared<FJsonValueObject>(
+						GameIQ::MakeEdge(Id, AssetIdOf(Ref), TEXT("references"), Prop->GetName())));
+					++Count;
+				}
+				continue;
+			}
+
+			if (Prop->IsA<FNumericProperty>() || Prop->IsA<FBoolProperty>() || Prop->IsA<FNameProperty>() ||
+				Prop->IsA<FStrProperty>() || Prop->IsA<FEnumProperty>() || Prop->IsA<FByteProperty>())
+			{
+				FString Value;
+				Prop->ExportTextItem_Direct(Value, Prop->ContainerPtrToValuePtr<void>(Asset), nullptr,
+					const_cast<UObject*>(Asset), PPF_None);
+				Value = GameIQ::OneLine(Value);
+				if (Value.Len() > 0 && Value.Len() < 60)
+				{
+					Lines.Add(FString::Printf(TEXT("%s=%s"), *Prop->GetName(), *Value));
+					++Count;
+				}
+			}
+		}
+		return FString::Join(Lines, TEXT(", "));
 	}
 
 	void RecipeStaticMesh(FOut& O, const UStaticMesh* Mesh, const FString& Id, const FString& Name)
@@ -216,8 +264,12 @@ namespace
 		{
 			CountLines.Add(FString::Printf(TEXT("%s x%d"), *P.Key, P.Value));
 		}
-		AddSummary(O, Id, FString::Printf(TEXT("%s (Level)\nActors: %d (%d classes)\n%s"),
-			*Name, Level->Actors.Num(), ClassCounts.Num(), *FString::Join(CountLines, TEXT(", "))));
+		// Full per-class counts are always reported; per-actor entities are capped (design §12 Q7).
+		const FString CapNote = Level->Actors.Num() > MaxActorEntitiesPerLevel
+			? FString::Printf(TEXT(" (%d listed as entities, all counted below)"), MaxActorEntitiesPerLevel)
+			: FString();
+		AddSummary(O, Id, FString::Printf(TEXT("%s (Level)\nActors: %d in %d classes%s\n%s"),
+			*Name, Level->Actors.Num(), ClassCounts.Num(), *CapNote, *FString::Join(CountLines, TEXT(", "))));
 	}
 }
 
@@ -277,8 +329,12 @@ int32 UGameIQAssetsCommandlet::Main(const FString& Params)
 		else if (UWorld* World = Cast<UWorld>(Asset)) { RecipeLevel(O, World, Id, Name); }
 		else
 		{
-			// Generic fallback — no asset is invisible (design §5.1).
-			AddSummary(O, Id, FString::Printf(TEXT("%s (%s)"), *Name, *Data.AssetClassPath.GetAssetName().ToString()));
+			// Generic reflection fallback — no asset is invisible (design §5.1).
+			const FString Props = GenericReflectionSummary(O, Asset, Id);
+			const FString ClassName = Data.AssetClassPath.GetAssetName().ToString();
+			AddSummary(O, Id, Props.IsEmpty()
+				? FString::Printf(TEXT("%s (%s)"), *Name, *ClassName)
+				: FString::Printf(TEXT("%s (%s)\n%s"), *Name, *ClassName, *Props));
 		}
 	}
 

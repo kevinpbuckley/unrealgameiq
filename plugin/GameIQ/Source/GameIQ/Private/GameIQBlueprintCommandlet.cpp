@@ -29,14 +29,9 @@ namespace
 	const TCHAR* BlueprintProducer = TEXT("gameiq-ue-bp@0.1.0");
 	constexpr int32 MaxNodesPerGraph = 400; // guard against pathological graphs
 
-	FString OneLine(const FString& In)
-	{
-		return In.Replace(TEXT("\r"), TEXT(" ")).Replace(TEXT("\n"), TEXT(" ")).TrimStartAndEnd();
-	}
-
 	FString NodeTitle(const UEdGraphNode* Node)
 	{
-		return OneLine(Node->GetNodeTitle(ENodeTitleType::ListView).ToString());
+		return GameIQ::OneLine(Node->GetNodeTitle(ENodeTitleType::ListView).ToString());
 	}
 
 	bool IsExecPin(const UEdGraphPin* Pin)
@@ -64,13 +59,31 @@ namespace
 		return Cast<UClass>(T.PinSubCategoryObject.Get());
 	}
 
-	/** A readable value for an input data pin: the upstream node it pulls from, or a literal default. */
-	FString InputPinValue(const UEdGraphPin* Pin)
+	/** A node with no exec pins is a pure/data-only node — safe to inline into a caller's args. */
+	bool IsPureNode(const UEdGraphNode* Node)
+	{
+		for (const UEdGraphPin* Pin : Node->Pins)
+		{
+			if (IsExecPin(Pin)) { return false; }
+		}
+		return true;
+	}
+
+	FString NodeSignatureRec(const UEdGraphNode* Node, int32 Depth);
+
+	/** A readable value for an input data pin: the upstream node (pure ones inlined) or a literal default. */
+	FString InputPinValue(const UEdGraphPin* Pin, int32 Depth)
 	{
 		if (Pin->LinkedTo.Num() > 0)
 		{
 			const UEdGraphPin* Src = Pin->LinkedTo[0];
-			if (Src && Src->GetOwningNode()) { return NodeTitle(Src->GetOwningNode()); }
+			const UEdGraphNode* SrcNode = Src ? Src->GetOwningNode() : nullptr;
+			if (SrcNode)
+			{
+				// Inline pure data chains so `Set X(Value=A * B)` reads through, not just `Multiply`.
+				if (Depth < 3 && IsPureNode(SrcNode)) { return NodeSignatureRec(SrcNode, Depth + 1); }
+				return NodeTitle(SrcNode);
+			}
 		}
 		if (Pin->DefaultObject) { return Pin->DefaultObject->GetName(); }
 		if (!Pin->DefaultValue.IsEmpty()) { return Pin->DefaultValue; }
@@ -79,22 +92,24 @@ namespace
 	}
 
 	/** Node title plus its meaningful data inputs, e.g. `Set Actor Location(NewLocation=Get Center)`. */
-	FString NodeSignature(const UEdGraphNode* Node)
+	FString NodeSignatureRec(const UEdGraphNode* Node, int32 Depth)
 	{
 		TArray<FString> Args;
 		for (const UEdGraphPin* Pin : Node->Pins)
 		{
 			if (!Pin || Pin->Direction != EGPD_Input || IsExecPin(Pin)) { continue; }
 			if (Pin->bHidden) { continue; }
-			const FString Value = InputPinValue(Pin);
+			const FString Value = InputPinValue(Pin, Depth);
 			if (!Value.IsEmpty())
 			{
-				Args.Add(FString::Printf(TEXT("%s=%s"), *Pin->PinName.ToString(), *OneLine(Value)));
+				Args.Add(FString::Printf(TEXT("%s=%s"), *Pin->PinName.ToString(), *GameIQ::OneLine(Value)));
 			}
 		}
 		const FString Title = NodeTitle(Node);
 		return Args.Num() > 0 ? FString::Printf(TEXT("%s(%s)"), *Title, *FString::Join(Args, TEXT(", "))) : Title;
 	}
+
+	FString NodeSignature(const UEdGraphNode* Node) { return NodeSignatureRec(Node, 0); }
 
 	int32 ExecOutPinCount(const UEdGraphNode* Node)
 	{
