@@ -21,6 +21,8 @@ public class GameIQ : ModuleRules
 			"Json",              // emit the ExtractorOutput contract as JSON
 			"Projects",          // plugin/project paths
 			"DeveloperSettings", // Project Settings entry (UGameIQSettings)
+			"EnhancedInput",     // Tier 1 recipe: InputMappingContext key->action mappings (default UE5 input)
+			"InputCore",         // FKey for input mappings
 		});
 
 		// Editor-only machinery for the live in-editor bridge and Tier 2 graph export

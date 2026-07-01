@@ -32,7 +32,7 @@ export function createMcpServer(engine: QueryEngine): McpServer {
     {
       action: z.enum(["search", "get_entity", "references", "impact", "explain", "project_stats"]),
       query: z.string().optional().describe("search/explain text"),
-      kind: z.string().optional().describe("filter search to an entity kind, e.g. blueprint, cpp-class"),
+      kind: z.string().optional().describe("filter search/references to an entity kind, e.g. blueprint, level-actor"),
       id: z.string().optional().describe("entity id for get_entity/references/impact"),
       direction: z.enum(["in", "out", "both"]).optional(),
       depth: z.number().int().min(1).max(8).optional(),

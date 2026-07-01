@@ -4,6 +4,13 @@
 
 #include "Animation/Skeleton.h"
 #include "AssetRegistry/ARFilter.h"
+#include "Components/LightComponent.h"
+#include "Components/StaticMeshComponent.h"
+#include "EnhancedActionKeyMapping.h"
+#include "Engine/Light.h"
+#include "Engine/StaticMeshActor.h"
+#include "InputAction.h"
+#include "InputMappingContext.h"
 #include "AssetRegistry/AssetData.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/IAssetRegistry.h"
@@ -214,6 +221,68 @@ namespace
 			Mat->IsTwoSided() ? TEXT("yes") : TEXT("no"), TexNames.Num(), *FString::Join(TexNames, TEXT(", "))));
 	}
 
+	/** InputMappingContext — the key→action bindings (Enhanced Input). */
+	void RecipeInputMappingContext(FOut& O, const UInputMappingContext* IMC, const FString& Id, const FString& Name)
+	{
+		TArray<FString> Lines;
+		for (const FEnhancedActionKeyMapping& M : IMC->GetMappings())
+		{
+			const FString ActionName = M.Action ? M.Action->GetName() : TEXT("<none>");
+			Lines.Add(FString::Printf(TEXT("%s <- %s"), *ActionName, *M.Key.ToString()));
+			if (M.Action)
+			{
+				O.Edges.Add(MakeShared<FJsonValueObject>(
+					GameIQ::MakeEdge(Id, AssetIdOf(M.Action), TEXT("references"), TEXT("maps"))));
+			}
+		}
+		AddSummary(O, Id, FString::Printf(TEXT("%s (InputMappingContext)\nMappings (%d):\n%s"),
+			*Name, IMC->GetMappings().Num(), *FString::Join(Lines, TEXT("\n"))));
+	}
+
+	/** InputAction — the value type of a mappable action. */
+	void RecipeInputAction(FOut& O, const UInputAction* IA, const FString& Id, const FString& Name)
+	{
+		const UEnum* ValueEnum = StaticEnum<EInputActionValueType>();
+		const FString ValueType = ValueEnum
+			? ValueEnum->GetNameStringByValue(static_cast<int64>(IA->ValueType))
+			: FString::FromInt(static_cast<int32>(IA->ValueType));
+		AddSummary(O, Id, FString::Printf(TEXT("%s (InputAction)\nValueType: %s"), *Name, *ValueType));
+	}
+
+	/** Type-specific one-line detail for a placed actor (lights, static meshes), for the searchable chunk. */
+	FString ActorDetail(FOut& O, const AActor* Actor, const FString& ActorId, TSharedRef<FJsonObject>& OutJson)
+	{
+		if (const ALight* Light = Cast<ALight>(Actor))
+		{
+			if (const ULightComponent* LC = Light->GetLightComponent())
+			{
+				const FColor Color = LC->LightColor;
+				const FString Mob = StaticEnum<EComponentMobility::Type>()
+					? StaticEnum<EComponentMobility::Type>()->GetNameStringByValue(static_cast<int64>(LC->Mobility))
+					: FString();
+				OutJson->SetNumberField(TEXT("intensity"), LC->Intensity);
+				OutJson->SetStringField(TEXT("color"), FString::Printf(TEXT("%d,%d,%d"), Color.R, Color.G, Color.B));
+				OutJson->SetStringField(TEXT("mobility"), Mob);
+				return FString::Printf(TEXT("intensity=%.0f color=%d,%d,%d mobility=%s"),
+					LC->Intensity, Color.R, Color.G, Color.B, *Mob);
+			}
+		}
+		if (const AStaticMeshActor* SMA = Cast<AStaticMeshActor>(Actor))
+		{
+			if (const UStaticMeshComponent* SMC = SMA->GetStaticMeshComponent())
+			{
+				if (const UStaticMesh* Mesh = SMC->GetStaticMesh())
+				{
+					OutJson->SetStringField(TEXT("mesh"), Mesh->GetName());
+					O.Edges.Add(MakeShared<FJsonValueObject>(
+						GameIQ::MakeEdge(ActorId, AssetIdOf(Mesh), TEXT("references"), TEXT("mesh"))));
+					return FString::Printf(TEXT("mesh=%s"), *Mesh->GetName());
+				}
+			}
+		}
+		return FString();
+	}
+
 	void RecipeLevel(FOut& O, UWorld* World, const FString& Id, const FString& Name)
 	{
 		ULevel* Level = World->PersistentLevel;
@@ -244,16 +313,23 @@ namespace
 
 			if (Listed < MaxActorEntitiesPerLevel)
 			{
-				const FString ActorName = Actor->GetName();
-				const FString ActorId = FString::Printf(TEXT("%s::actor::%s"), *Id, *ActorName);
+				const FString ActorLabel = Actor->GetActorNameOrLabel();
+				const FString ActorId = FString::Printf(TEXT("%s::actor::%s"), *Id, *Actor->GetName());
 				TSharedRef<FJsonObject> D = MakeShared<FJsonObject>();
 				D->SetStringField(TEXT("class"), ClassName);
 				D->SetStringField(TEXT("location"), Actor->GetActorLocation().ToString());
+				const FString Detail = ActorDetail(O, Actor, ActorId, D);
+
 				O.Entities.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEntity(
-					ActorId, TEXT("level-actor"), ActorName, Name, TEXT("asset"), Id,
-					FString::Printf(TEXT("%s (%s)"), *ActorName, *ClassName), D)));
+					ActorId, TEXT("level-actor"), ActorLabel, Name, TEXT("asset"), Id,
+					FString::Printf(TEXT("%s (%s)"), *ActorLabel, *ClassName), D)));
 				O.Edges.Add(MakeShared<FJsonValueObject>(
 					GameIQ::MakeEdge(ActorId, Id, TEXT("placed-in-level"))));
+				// Per-actor chunk so placed actors are searchable by class/name ("find the DirectionalLights").
+				O.Chunks.Add(MakeShared<FJsonValueObject>(GameIQ::MakeChunk(
+					FString::Printf(TEXT("%s#actor"), *ActorId), ActorId, TEXT("recipe-summary"),
+					FString::Printf(TEXT("%s (%s) in %s%s"), *ActorLabel, *ClassName, *Name,
+						Detail.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" — %s"), *Detail)))));
 				++Listed;
 			}
 		}
@@ -326,6 +402,8 @@ int32 UGameIQAssetsCommandlet::Main(const FString& Params)
 		else if (const USkeleton* Skel = Cast<USkeleton>(Asset)) { RecipeSkeleton(O, Skel, Id, Name); }
 		else if (const UDataTable* DT = Cast<UDataTable>(Asset)) { RecipeDataTable(O, DT, Id, Name); }
 		else if (const UMaterialInterface* Mat = Cast<UMaterialInterface>(Asset)) { RecipeMaterial(O, Mat, Id, Name); }
+		else if (const UInputMappingContext* IMC = Cast<UInputMappingContext>(Asset)) { RecipeInputMappingContext(O, IMC, Id, Name); }
+		else if (const UInputAction* IA = Cast<UInputAction>(Asset)) { RecipeInputAction(O, IA, Id, Name); }
 		else if (UWorld* World = Cast<UWorld>(Asset)) { RecipeLevel(O, World, Id, Name); }
 		else
 		{

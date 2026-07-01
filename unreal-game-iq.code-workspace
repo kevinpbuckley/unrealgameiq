@@ -1,0 +1,20 @@
+{
+	"folders": [
+		{
+			"name": "unreal-game-iq",
+			"path": "."
+		},
+		{
+			"name": "UnrealGameIQ-Dot-Com",
+			"path": "../UnrealGameIQ-Dot-Com"
+		},
+		{
+			"name": "UE5-8",
+			"path": "../UE5-8"
+		},
+		{
+			"path": "../ThirdPerson58"
+		}
+	],
+	"settings": {}
+}

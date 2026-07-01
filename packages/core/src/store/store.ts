@@ -263,6 +263,22 @@ export class Store {
     return rows.map(rowToEntity);
   }
 
+  countChildren(id: string): number {
+    return (this.db.prepare(`SELECT COUNT(*) n FROM entities WHERE parent = ?`).get(id) as { n: number }).n;
+  }
+
+  countOutgoing(id: string): number {
+    return (this.db.prepare(`SELECT COUNT(*) n FROM edges WHERE src = ?`).get(id) as { n: number }).n;
+  }
+
+  countIncoming(id: string): number {
+    return (this.db.prepare(`SELECT COUNT(*) n FROM edges WHERE dst = ?`).get(id) as { n: number }).n;
+  }
+
+  countChunks(id: string): number {
+    return (this.db.prepare(`SELECT COUNT(*) n FROM chunks WHERE entity_id = ?`).get(id) as { n: number }).n;
+  }
+
   /** Outgoing edges (this entity depends on / uses dst). */
   outgoingEdges(id: string): Edge[] {
     const rows = this.db.prepare(`SELECT * FROM edges WHERE src = ?`).all(id) as EdgeRow[];

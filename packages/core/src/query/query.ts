@@ -23,6 +23,9 @@ export interface EntityDetail {
   incoming: Edge[];
   children: Entity[];
   chunks: Array<{ id: string; kind: string; text: string }>;
+  /** Full counts (arrays above are capped to keep responses usable over MCP). */
+  counts: { outgoing: number; incoming: number; children: number; chunks: number };
+  truncated: boolean;
 }
 
 export interface RefResult {
@@ -93,18 +96,32 @@ export class QueryEngine {
     };
   }
 
-  getEntity(id: string): EntityDetail | undefined {
+  /**
+   * Full detail for one entity, with arrays capped so a big entity (e.g. a level with
+   * hundreds of actors) stays usable over MCP. Full counts are always reported; use
+   * `references`/`search` to page beyond the caps.
+   */
+  getEntity(id: string, cap = 50): EntityDetail | undefined {
     const entity = this.store.getEntity(id);
     if (!entity) return undefined;
     const chunks = this.store.db
-      .prepare(`SELECT id, kind, text FROM chunks WHERE entity_id = ?`)
-      .all(id) as Array<{ id: string; kind: string; text: string }>;
+      .prepare(`SELECT id, kind, text FROM chunks WHERE entity_id = ? LIMIT ?`)
+      .all(id, cap) as Array<{ id: string; kind: string; text: string }>;
+    const counts = {
+      outgoing: this.store.countOutgoing(id),
+      incoming: this.store.countIncoming(id),
+      children: this.store.countChildren(id),
+      chunks: this.store.countChunks(id),
+    };
     return {
       entity,
-      outgoing: this.store.outgoingEdges(id),
-      incoming: this.store.incomingEdges(id),
-      children: this.store.childrenOf(id),
+      outgoing: this.store.outgoingEdges(id).slice(0, cap),
+      incoming: this.store.incomingEdges(id).slice(0, cap),
+      children: this.store.childrenOf(id, cap),
       chunks,
+      counts,
+      truncated:
+        counts.outgoing > cap || counts.incoming > cap || counts.children > cap || counts.chunks > cap,
     };
   }
 
@@ -113,7 +130,14 @@ export class QueryEngine {
    * edge type — e.g. references(skeletonId, "in", 1, "uses-skeleton") answers
    * "which meshes use this skeleton?".
    */
-  references(id: string, direction: Direction, depth = 1, edgeType?: EdgeType): RefResult[] {
+  references(
+    id: string,
+    direction: Direction,
+    depth = 1,
+    edgeType?: EdgeType,
+    kind?: EntityKind,
+    limit = 200,
+  ): RefResult[] {
     if (!this.store.getEntity(id)) return [];
     const results: RefResult[] = [];
     const seen = new Set<string>([id]);
@@ -132,8 +156,10 @@ export class QueryEngine {
             seen.add(other);
             const entity = this.store.getEntity(other);
             if (!entity) continue; // edge to an entity we haven't extracted; skip in results
+            next.push(other); // still traverse through it even if filtered from results
+            if (kind && entity.kind !== kind) continue;
             results.push({ entity, viaType: e.type, depth: d, direction: dir });
-            next.push(other);
+            if (results.length >= limit) return results;
           }
         }
         frontier = next;

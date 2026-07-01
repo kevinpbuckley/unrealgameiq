@@ -32,6 +32,7 @@ export function runAction(engine: QueryEngine, args: GameIqArgs): unknown {
         args.direction ?? "both",
         args.depth ?? 1,
         args.edgeType as EdgeType | undefined,
+        args.kind as EntityKind | undefined,
       );
     }
     case "impact": {
