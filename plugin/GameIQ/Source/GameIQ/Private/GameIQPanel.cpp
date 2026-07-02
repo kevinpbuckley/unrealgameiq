@@ -3,15 +3,17 @@
 #include "GameIQPanel.h"
 
 #include "Dom/JsonObject.h"
-#include "GameIQBuildCommandlet.h"
+#include "Framework/Notifications/NotificationManager.h"
 #include "GameIQQuery.h"
 #include "HAL/FileManager.h"
+#include "HAL/PlatformProcess.h"
+#include "Misc/App.h"
 #include "Misc/Paths.h"
-#include "Misc/ScopedSlowTask.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "Styling/AppStyle.h"
 #include "Styling/CoreStyle.h"
+#include "Widgets/Notifications/SNotificationList.h"
 #include "Widgets/Input/SButton.h"
 #include "Widgets/Layout/SBorder.h"
 #include "Widgets/Layout/SScrollBox.h"
@@ -165,21 +167,83 @@ FReply SGameIQPanel::OnRefreshClicked()
 	return FReply::Handled();
 }
 
-FReply SGameIQPanel::OnRebuildClicked()
+namespace
 {
-	bBuilding = true;
+	void Notify(const FText& Text, SNotificationItem::ECompletionState State)
 	{
-		FScopedSlowTask Task(1.0f, LOCTEXT("Rebuilding", "Rebuilding the Game IQ index — extracting and ingesting…"));
-		Task.MakeDialog();
-		Task.EnterProgressFrame(1.0f);
-		if (UGameIQBuildCommandlet* Build = NewObject<UGameIQBuildCommandlet>())
+		FNotificationInfo Info(Text);
+		Info.ExpireDuration = 4.0f;
+		if (TSharedPtr<SNotificationItem> Item = FSlateNotificationManager::Get().AddNotification(Info))
 		{
-			Build->Main(FString());
+			Item->SetCompletionState(State);
 		}
 	}
-	bBuilding = false;
-	Refresh();
+}
+
+FReply SGameIQPanel::OnRebuildClicked()
+{
+	if (bBuilding) { return FReply::Handled(); }
+
+	// Run the full build as a *separate* headless commandlet process — never in-process. Loading every
+	// asset fresh inside the live editor trips engine ensures (e.g. Blueprint SimpleConstructionScript
+	// parent fix-up); a clean commandlet process doesn't, and the rollback-journal index tolerates the
+	// editor reading it concurrently.
+	const FString Exe = FPlatformProcess::GenerateApplicationPath(TEXT("UnrealEditor-Cmd"), FApp::GetBuildConfiguration());
+	const FString Project = FPaths::ConvertRelativePathToFull(FPaths::GetProjectFilePath());
+	if (!FPaths::FileExists(Exe) || Project.IsEmpty())
+	{
+		Notify(LOCTEXT("NoCmd", "Game IQ: couldn't find UnrealEditor-Cmd to run the rebuild."), SNotificationItem::CS_Fail);
+		return FReply::Handled();
+	}
+
+	const FString Args = FString::Printf(TEXT("\"%s\" -run=GameIQBuild -unattended -nopause -nosplash"), *Project);
+	RebuildProc = FPlatformProcess::CreateProc(*Exe, *Args, /*bLaunchDetached=*/false,
+		/*bLaunchHidden=*/true, /*bLaunchReallyHidden=*/true, nullptr, 0, nullptr, nullptr);
+	if (!RebuildProc.IsValid())
+	{
+		Notify(LOCTEXT("SpawnFail", "Game IQ: failed to start the rebuild process."), SNotificationItem::CS_Fail);
+		return FReply::Handled();
+	}
+
+	bBuilding = true;
+	Notify(LOCTEXT("Started", "Game IQ: rebuilding the index in the background…"), SNotificationItem::CS_Pending);
+	PollHandle = FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateSP(this, &SGameIQPanel::PollRebuild), 1.0f);
 	return FReply::Handled();
+}
+
+bool SGameIQPanel::PollRebuild(float /*DeltaTime*/)
+{
+	if (RebuildProc.IsValid() && FPlatformProcess::IsProcRunning(RebuildProc))
+	{
+		return true; // keep polling
+	}
+
+	int32 ReturnCode = 0;
+	if (RebuildProc.IsValid())
+	{
+		FPlatformProcess::GetProcReturnCode(RebuildProc, &ReturnCode);
+		FPlatformProcess::CloseProc(RebuildProc);
+		RebuildProc.Reset();
+	}
+	bBuilding = false;
+	PollHandle.Reset();
+	Refresh();
+	Notify(LOCTEXT("Done", "Game IQ: index rebuild complete."), SNotificationItem::CS_Success);
+	return false; // stop ticker
+}
+
+SGameIQPanel::~SGameIQPanel()
+{
+	if (PollHandle.IsValid())
+	{
+		FTSTicker::GetCoreTicker().RemoveTicker(PollHandle);
+		PollHandle.Reset();
+	}
+	if (RebuildProc.IsValid())
+	{
+		FPlatformProcess::CloseProc(RebuildProc); // don't kill the build; just release our handle
+		RebuildProc.Reset();
+	}
 }
 
 #undef LOCTEXT_NAMESPACE

@@ -3,6 +3,8 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Containers/Ticker.h"
+#include "HAL/PlatformProcess.h"
 #include "Widgets/SCompoundWidget.h"
 
 /**
@@ -16,12 +18,17 @@ public:
 	SLATE_END_ARGS()
 
 	void Construct(const FArguments& InArgs);
+	virtual ~SGameIQPanel() override;
 
 private:
 	FReply OnRebuildClicked();
 	FReply OnRefreshClicked();
 	void Refresh();
+	/** Poll the background rebuild process; refresh stats and stop when it exits. */
+	bool PollRebuild(float DeltaTime);
 
 	FText StatsText;
 	bool bBuilding = false;
+	FProcHandle RebuildProc;
+	FTSTicker::FDelegateHandle PollHandle;
 };
