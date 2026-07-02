@@ -25,6 +25,7 @@ public class GameIQ : ModuleRules
 			"InputCore",         // FKey for input mappings
 			"SQLiteCore",        // in-editor toolset reads the .gameiq/index.db (FTS5) natively, no Node
 			"ToolsetRegistry",   // UE 5.8 native AI toolset registry — exposes GameIQ queries on Epic's MCP endpoint
+			"ImageWrapper",      // read image dimensions (png/jpg/…) for the docs image extractor (issue #7)
 		});
 
 		// Editor-only machinery for the live in-editor bridge and Tier 2 graph export

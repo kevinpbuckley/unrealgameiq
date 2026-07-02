@@ -27,10 +27,23 @@ namespace GameIQ
 		return In.Replace(TEXT("\r"), TEXT(" ")).Replace(TEXT("\n"), TEXT(" ")).TrimStartAndEnd();
 	}
 
+	/**
+	 * Provenance/authority of an indexed fact (issue #3). Code/BP/asset/config are extracted from
+	 * the source of truth and self-freshen — `extracted-fact`. Design/documentation is what a human
+	 * *said*, and drifts from the build — `stated-intent`. The two must never be confused: a stale
+	 * design doc must not read as ground truth. Ingest defaults a missing authority to extracted-fact,
+	 * so only the docs producers opt into stated-intent.
+	 */
+	namespace Authority
+	{
+		inline const TCHAR* ExtractedFact = TEXT("extracted-fact");
+		inline const TCHAR* StatedIntent = TEXT("stated-intent");
+	}
+
 	inline TSharedRef<FJsonObject> MakeEntity(
 		const FString& Id, const FString& Kind, const FString& Name, const FString& Path,
 		const FString& Source, const FString& Parent, const FString& Summary,
-		const TSharedPtr<FJsonObject>& Detail)
+		const TSharedPtr<FJsonObject>& Detail, const FString& AuthorityTag = FString())
 	{
 		TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
 		O->SetStringField(TEXT("id"), Id);
@@ -41,6 +54,7 @@ namespace GameIQ
 		if (!Parent.IsEmpty()) { O->SetStringField(TEXT("parent"), Parent); }
 		if (!Summary.IsEmpty()) { O->SetStringField(TEXT("summary"), Summary); }
 		if (Detail.IsValid()) { O->SetObjectField(TEXT("detail"), Detail); }
+		if (!AuthorityTag.IsEmpty()) { O->SetStringField(TEXT("authority"), AuthorityTag); }
 		return O;
 	}
 

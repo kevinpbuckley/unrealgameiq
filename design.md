@@ -128,24 +128,22 @@ Three tiers, cheapest first:
 2. **Hybrid retrieval** — FTS5 + vector search over `chunks`, fused and reranked. Powers "find anything about reloading."
 3. **Synthesis (`ask`)** — retrieval feeds an LLM that composes an answer **with citations** (entity ids → asset paths / `file:line`). Every claim must trace to an entity; uncited claims are dropped. When invoked via MCP, the *calling agent* is the synthesizer — Game IQ returns assembled, cited context. Game IQ only needs its own LLM (bring-your-own-key Claude) for the human-facing CLI/UI `ask`.
 
-### 5.4 Design-intent ingestion (read-only)
+### 5.4 Design-intent ingestion (read-only) — **built**
 
-Beyond the project's own files, Game IQ ingests **external design documents** — Game Design Doc, Level Design Docs, brand/style guidelines — as a first-class knowledge source. **Scope is ingestion, not management: Game IQ reads and indexes these docs; it is never a place to author, edit, or store them.** They stay in whatever the team already uses (Google Drive, Notion, Confluence, local markdown); Game IQ pulls, chunks, and embeds them into the same store.
+Beyond the project's own files, Game IQ ingests **documentation** — GDDs, level design, brand/style guidelines, art bibles, narrative, UX, audio, production, QA, legal, marketing, and more — as a first-class knowledge source. **Scope is ingestion, not management: Game IQ reads and indexes these docs; it is never a place to author, edit, or store them.** They stay in whatever the team already uses; Game IQ pulls, classifies, chunks, and indexes them into the same store.
 
-Two phases, deliberately:
+This shipped as a set of C++ commandlets wired into `GameIQBuild` (issues #2–#8):
 
-- **Phase 1 — ingest as chunks; let the agent connect (the near-term plan).** Doc sections land as ordinary `chunks` (FTS5 + embeddings), retrievable side-by-side with Blueprint pseudocode, C++ signatures, and asset summaries. There is **no explicit doc→code edge graph** — when an agent asks "is the stamina system implemented?", hybrid retrieval surfaces both the GDD section and the relevant code/assets in one bundle, and the **agent does the intent→implementation reasoning itself**, exactly as it already reasons over mixed context. Cheap, ships early, and sidesteps the hard linking problem entirely.
-- **Phase 2 — explicit links + conformance (later).** Once Phase 1 proves useful, add typed edges (`GDD§"Damage" —describes→ UHealthComponent`, `BrandGuide —constrains→ M_UI_Button`) to power deterministic **intent-vs-implementation conformance / drift** queries that don't rely on the agent connecting the dots each time:
-  - "Brand guide primary color is `#1B9AAA` — which materials/widgets violate it?"
-  - "GDD describes a stamina system — is any of it implemented, or still just a doc?"
-  - "Combat changed since the milestone (the §5.2 semantic diffs) — does the GDD still match?"
+- **Phase 1 — in-repo document extractor (`GameIQDocs`).** Walks markdown / plain-text / HTML / RTF docs, splits each on headings into `doc-section` child entities (one FTS chunk each), and classifies every doc by `docType` via path/filename heuristics with a `gameiq.config.json` `docTypes` override. UTF-8 is decoded even without a BOM. DOCX/PDF are detected and reported as needing a converter (issue #5), never silently emptied.
+- **Provenance (issue #3).** A first-class `authority` column: doc content is `stated-intent`, everything extracted from the build (code/BP/asset/config) is `extracted-fact`. Every query result carries it, and the toolset descriptions tell agents design text is intent to verify — a stale GDD can never read as ground truth. `ProjectStats("authority")` and `ProjectStats("doc-types")` report the split.
+- **Phase 2 — intent→implementation links (`GameIQLink`) + `Coverage`/`Drift`.** Runs after ingest; matches each doc section to the implementation it names (verbatim entity id = *explicit*, distinctive name/asset token = *inferred*, ambiguity-capped) and writes `describes` edges. Powers two toolset actions: `Coverage` ("which design has an implementation and which doesn't" — e.g. a *Planned Features* doc shows as unimplemented) and `Drift` ("the doc says `intensity = 10` but the DirectionalLight is `6`").
+- **Phase 3 — images (`GameIQImages`).** Concept art / level maps / brand assets become `image` entities with path + dimensions + filename/path tags + an optional `<image>.caption.txt` sidecar (the vision-caption hook) — **no pixels in the DB**; the MCP response hands back the file path for a vision agent to open. `GameIQLink` links them (`illustrates`): `BP_Rifle.png`→`BP_Rifle`, `NewMap.png`→the level, brand/logo images→the brand-guidelines doc.
+- **Phase 4 — external connectors (`GameIQConnectors`).** v0 ingests a **local export** of an external system (Confluence/Notion/Drive all export to markdown/HTML) via `gameiq.config.json` `externalDocs: [{source, path}]`, with namespaced ids and `source`-tagged provenance so external docs join search/coverage/drift. Live API sync (auth + incremental pull) remains future work in issue #8.
 
-Two rules hold across both phases:
+Two rules hold throughout:
 
-- **Local-first holds (§9).** Docs are pulled and indexed *locally*; game content is never pushed to a doc service. A cloud doc source is a *read* source, not an exfiltration path.
-- **Provenance is tagged.** Every entity/chunk records its `source` (code / asset / config / doc). Code is fact; a doc is *intent*. An answer never presents "the GDD says…" as ground truth — even in Phase 1, where the agent is doing the connecting, the provenance tag keeps the two sides distinct.
-
-Connectors are pluggable in the same spirit as recipes (§5.1): start with local markdown + Google Drive, add Notion/Confluence as demand shows. **v0.3+** — the chunk model already accommodates Phase 1; Phase 2 reuses the existing entity/edge machinery once the core technical index is proven.
+- **Local-first holds (§9).** Docs are pulled and indexed *locally*; game content is never pushed to a doc service. Connector credentials are never written to the index.
+- **Provenance is tagged.** Code is fact; a doc is *intent*. An answer never presents "the GDD says…" as ground truth — the `authority` tag keeps the two sides distinct even when they surface in one result set.
 
 ### 5.5 Scoping the index (config)
 

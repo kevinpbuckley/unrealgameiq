@@ -83,6 +83,10 @@ namespace
 		E->SetStringField(TEXT("source"), ColStr(Stmt, TEXT("source")));
 		E->SetField(TEXT("summary"), NullOrString(ColStr(Stmt, TEXT("summary"))));
 		E->SetField(TEXT("detail"), ParseJsonColumn(ColStr(Stmt, TEXT("detail"))));
+		// Provenance (issue #3): always present so an agent reading only the JSON can tell stated
+		// design intent from extracted ground truth. Residual NULLs (pre-migration rows) read as fact.
+		const FString AuthorityTag = ColStr(Stmt, TEXT("authority"));
+		E->SetStringField(TEXT("authority"), AuthorityTag.IsEmpty() ? TEXT("extracted-fact") : AuthorityTag);
 		return E;
 	}
 
@@ -214,7 +218,7 @@ namespace
 			{ TEXT("uses-skeleton"), 8 }, { TEXT("uses-material"), 7 }, { TEXT("uses-texture"), 5 },
 			{ TEXT("overrides-parameter"), 6 }, { TEXT("casts-to"), 6 }, { TEXT("placed-in-level"), 5 },
 			{ TEXT("plays-on"), 4 }, { TEXT("depends-on"), 4 }, { TEXT("references"), 3 },
-			{ TEXT("describes"), 2 }, { TEXT("constrains"), 2 },
+			{ TEXT("describes"), 2 }, { TEXT("constrains"), 2 }, { TEXT("illustrates"), 2 },
 		};
 		const int32* Found = Severity.Find(Type);
 		return Found ? *Found : 1;
@@ -608,6 +612,22 @@ FString GameIQQuery::ProjectStats(const FString& Facet)
 			{ TEXT("id"), TEXT("name"), TEXT("kind") }, { TEXT("outDeps") })));
 	}
 
+	if (F == TEXT("authority"))
+	{
+		return Envelope(Db, MakeShared<FJsonValueArray>(SelectRows(Db,
+			TEXT("SELECT COALESCE(authority,'extracted-fact') AS authority, COUNT(*) AS count "
+			     "FROM entities GROUP BY authority ORDER BY count DESC"),
+			{ TEXT("authority") }, { TEXT("count") })));
+	}
+	if (F == TEXT("doc-types"))
+	{
+		// docType lives in each document's detail JSON; count via json_extract (SQLiteCore has JSON1).
+		return Envelope(Db, MakeShared<FJsonValueArray>(SelectRows(Db,
+			TEXT("SELECT json_extract(detail,'$.docType') AS docType, COUNT(*) AS count "
+			     "FROM entities WHERE kind='document' GROUP BY docType ORDER BY count DESC"),
+			{ TEXT("docType") }, { TEXT("count") })));
+	}
+
 	// overview (default)
 	int32 Total = 0;
 	{
@@ -629,4 +649,228 @@ FString GameIQQuery::ProjectStats(const FString& Facet)
 	Overview->SetField(TEXT("lastIngestAtIso"), NullOrString(MetaValue(Db, TEXT("lastIngestAtIso"))));
 	Overview->SetField(TEXT("lastGeneratedAtIso"), NullOrString(MetaValue(Db, TEXT("lastGeneratedAtIso"))));
 	return Envelope(Db, MakeShared<FJsonValueObject>(Overview));
+}
+
+namespace
+{
+	/** Parse a stored detail JSON string into an object (or null). */
+	TSharedPtr<FJsonObject> ParseDetail(const FString& Raw)
+	{
+		if (Raw.IsEmpty()) { return nullptr; }
+		TSharedPtr<FJsonObject> Obj;
+		const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Raw);
+		return (FJsonSerializer::Deserialize(Reader, Obj) && Obj.IsValid()) ? Obj : nullptr;
+	}
+
+	/** A scalar JSON value → display string; empty for objects/arrays/null. */
+	FString ScalarToString(const TSharedPtr<FJsonValue>& V)
+	{
+		if (!V.IsValid()) { return FString(); }
+		switch (V->Type)
+		{
+		case EJson::String: return V->AsString();
+		case EJson::Boolean: return V->AsBool() ? TEXT("true") : TEXT("false");
+		case EJson::Number:
+		{
+			const double D = V->AsNumber();
+			if (FMath::IsNearlyEqual(D, FMath::RoundToDouble(D))) { return FString::Printf(TEXT("%lld"), (int64)FMath::RoundToDouble(D)); }
+			return FString::Printf(TEXT("%g"), D);
+		}
+		default: return FString();
+		}
+	}
+
+	/** Flatten a detail object's top-level scalar fields to key→string. */
+	TMap<FString, FString> FlattenScalars(const TSharedPtr<FJsonObject>& Obj)
+	{
+		TMap<FString, FString> Out;
+		if (Obj.IsValid())
+		{
+			for (const auto& Pair : Obj->Values)
+			{
+				const FString S = ScalarToString(Pair.Value);
+				if (!S.IsEmpty()) { Out.Add(FString(Pair.Key), S); }
+			}
+		}
+		return Out;
+	}
+
+	/** If `Text` states `Key <=|:> value`, return the stated value (else empty). Case-insensitive key. */
+	FString StatedValueFor(const FString& Text, const FString& Key)
+	{
+		if (Key.Len() < 3) { return FString(); }
+		const FString Lower = Text.ToLower();
+		const FString KeyLower = Key.ToLower();
+		int32 From = 0;
+		while (true)
+		{
+			const int32 At = Lower.Find(KeyLower, ESearchCase::CaseSensitive, ESearchDir::FromStart, From);
+			if (At == INDEX_NONE) { return FString(); }
+			int32 i = At + Key.Len();
+			while (i < Text.Len() && (Text[i] == TEXT(' ') || Text[i] == TEXT('\t'))) { ++i; }
+			if (i < Text.Len() && (Text[i] == TEXT('=') || Text[i] == TEXT(':')))
+			{
+				++i;
+				while (i < Text.Len() && (Text[i] == TEXT(' ') || Text[i] == TEXT('\t'))) { ++i; }
+				FString Val;
+				while (i < Text.Len())
+				{
+					const TCHAR C = Text[i];
+					if (FChar::IsAlnum(C) || C == TEXT('.') || C == TEXT('_') || C == TEXT('#') || C == TEXT('-')) { Val.AppendChar(C); ++i; }
+					else { break; }
+				}
+				if (Val.Len() > 0) { return Val; }
+			}
+			From = At + Key.Len();
+		}
+	}
+
+	bool ValuesDiffer(const FString& A, const FString& B)
+	{
+		if (A.IsNumeric() && B.IsNumeric())
+		{
+			return !FMath::IsNearlyEqual(FCString::Atod(*A), FCString::Atod(*B), 1e-6);
+		}
+		return !A.Equals(B, ESearchCase::IgnoreCase);
+	}
+}
+
+FString GameIQQuery::Coverage(const FString& DocType, int32 Limit)
+{
+	FSQLiteDatabase Db;
+	FString OpenErr;
+	if (!OpenIndex(Db, OpenErr)) { return ErrorJson(OpenErr); }
+	ON_SCOPE_EXIT { Db.Close(); };
+
+	// Document id → title.
+	TMap<FString, FString> DocTitle;
+	{
+		FSQLitePreparedStatement Stmt = Db.PrepareStatement(TEXT("SELECT id, name FROM entities WHERE kind='document'"));
+		if (Stmt.IsValid())
+		{
+			while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+			{
+				DocTitle.Add(ColStr(Stmt, TEXT("id")), ColStr(Stmt, TEXT("name")));
+			}
+		}
+	}
+
+	struct FDocCov { FString Title; FString DocType; int32 Total = 0; int32 Linked = 0; TArray<FString> Unlinked; };
+	TMap<FString, FDocCov> Docs;
+	int32 SecTotal = 0, SecLinked = 0;
+
+	FSQLitePreparedStatement Stmt = Db.PrepareStatement(
+		TEXT("SELECT e.id AS id, e.name AS name, e.parent AS parent, e.detail AS detail, "
+		     "(SELECT COUNT(*) FROM edges x WHERE x.src = e.id AND x.type='describes') AS links "
+		     "FROM entities e WHERE e.kind='doc-section'"));
+	if (Stmt.IsValid())
+	{
+		while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+		{
+			const FString Parent = ColStr(Stmt, TEXT("parent"));
+			const FString Name = ColStr(Stmt, TEXT("name"));
+			const TSharedPtr<FJsonObject> D = ParseDetail(ColStr(Stmt, TEXT("detail")));
+			const FString ThisType = D.IsValid() ? D->GetStringField(TEXT("docType")) : FString();
+			if (!DocType.IsEmpty() && ThisType != DocType) { continue; }
+
+			int32 Links = 0; Stmt.GetColumnValueByName(TEXT("links"), Links);
+			FDocCov& Cov = Docs.FindOrAdd(Parent);
+			if (Cov.Title.IsEmpty()) { Cov.Title = DocTitle.FindRef(Parent); Cov.DocType = ThisType; }
+			++Cov.Total; ++SecTotal;
+			if (Links > 0) { ++Cov.Linked; ++SecLinked; }
+			else { Cov.Unlinked.Add(Name); }
+		}
+	}
+
+	TArray<TSharedPtr<FJsonValue>> DocRows;
+	for (const TPair<FString, FDocCov>& P : Docs)
+	{
+		if (DocRows.Num() >= Limit) { break; }
+		TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+		R->SetStringField(TEXT("doc"), P.Key);
+		R->SetStringField(TEXT("title"), P.Value.Title);
+		R->SetStringField(TEXT("docType"), P.Value.DocType);
+		R->SetNumberField(TEXT("sections"), P.Value.Total);
+		R->SetNumberField(TEXT("implemented"), P.Value.Linked);
+		TArray<TSharedPtr<FJsonValue>> Un;
+		for (const FString& N : P.Value.Unlinked) { Un.Add(MakeShared<FJsonValueString>(N)); }
+		R->SetArrayField(TEXT("unimplemented"), Un);
+		DocRows.Add(MakeShared<FJsonValueObject>(R));
+	}
+
+	TSharedRef<FJsonObject> Summary = MakeShared<FJsonObject>();
+	Summary->SetNumberField(TEXT("documents"), Docs.Num());
+	Summary->SetNumberField(TEXT("sections"), SecTotal);
+	Summary->SetNumberField(TEXT("sectionsImplemented"), SecLinked);
+	Summary->SetNumberField(TEXT("sectionsWithoutImplementation"), SecTotal - SecLinked);
+
+	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetField(TEXT("filterDocType"), NullOrString(DocType));
+	Payload->SetObjectField(TEXT("summary"), Summary);
+	Payload->SetArrayField(TEXT("docs"), DocRows);
+	Payload->SetStringField(TEXT("note"),
+		TEXT("Coverage compares stated design intent (documents) against extracted implementation via "
+		     "'describes' links. 'unimplemented' sections have no matching implementation in the index."));
+	return Envelope(Db, MakeShared<FJsonValueObject>(Payload));
+}
+
+FString GameIQQuery::Drift(int32 Limit)
+{
+	FSQLiteDatabase Db;
+	FString OpenErr;
+	if (!OpenIndex(Db, OpenErr)) { return ErrorJson(OpenErr); }
+	ON_SCOPE_EXIT { Db.Close(); };
+
+	TArray<TSharedPtr<FJsonValue>> Rows;
+
+	// Each describes edge: does the doc's stated key=value contradict the entity's extracted value?
+	FSQLitePreparedStatement Edge = Db.PrepareStatement(TEXT("SELECT src, dst FROM edges WHERE type='describes'"));
+	if (Edge.IsValid())
+	{
+		while (Edge.Step() == ESQLitePreparedStatementStepResult::Row && Rows.Num() < Limit)
+		{
+			const FString Src = ColStr(Edge, TEXT("src"));
+			const FString Dst = ColStr(Edge, TEXT("dst"));
+
+			// section text
+			FString Text;
+			{
+				FSQLitePreparedStatement T = Db.PrepareStatement(
+					TEXT("SELECT text FROM chunks WHERE entity_id = ? AND kind='doc-section' LIMIT 1"));
+				if (T.IsValid()) { T.SetBindingValueByIndex(1, Src); if (T.Step() == ESQLitePreparedStatementStepResult::Row) { T.GetColumnValueByName(TEXT("text"), Text); } }
+			}
+			if (Text.IsEmpty()) { continue; }
+
+			// target entity name + detail
+			FString TargetName, DetailRaw;
+			{
+				FSQLitePreparedStatement E = Db.PrepareStatement(TEXT("SELECT name, detail FROM entities WHERE id = ? LIMIT 1"));
+				if (E.IsValid()) { E.SetBindingValueByIndex(1, Dst); if (E.Step() == ESQLitePreparedStatementStepResult::Row) { E.GetColumnValueByName(TEXT("name"), TargetName); E.GetColumnValueByName(TEXT("detail"), DetailRaw); } }
+			}
+			const TMap<FString, FString> Facts = FlattenScalars(ParseDetail(DetailRaw));
+			for (const TPair<FString, FString>& Fact : Facts)
+			{
+				const FString Stated = StatedValueFor(Text, Fact.Key);
+				if (!Stated.IsEmpty() && ValuesDiffer(Stated, Fact.Value))
+				{
+					TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+					R->SetStringField(TEXT("docSection"), Src);
+					R->SetStringField(TEXT("entity"), Dst);
+					R->SetStringField(TEXT("entityName"), TargetName);
+					R->SetStringField(TEXT("property"), Fact.Key);
+					R->SetStringField(TEXT("statedInDoc"), Stated);
+					R->SetStringField(TEXT("actualInIndex"), Fact.Value);
+					Rows.Add(MakeShared<FJsonValueObject>(R));
+					if (Rows.Num() >= Limit) { break; }
+				}
+			}
+		}
+	}
+
+	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetArrayField(TEXT("drift"), Rows);
+	Payload->SetStringField(TEXT("note"),
+		TEXT("Drift = a doc section states 'property = value' that contradicts the value extracted from "
+		     "the implementation it describes. Stated intent is not ground truth; verify before acting."));
+	return Envelope(Db, MakeShared<FJsonValueObject>(Payload));
 }

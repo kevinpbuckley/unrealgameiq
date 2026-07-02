@@ -3,6 +3,7 @@
 #include "GameIQStore.h"
 
 #include "Dom/JsonObject.h"
+#include "GameIQJson.h"
 #include "HAL/FileManager.h"
 #include "Misc/DateTime.h"
 #include "Misc/Paths.h"
@@ -38,7 +39,14 @@ namespace
 		"CREATE VIRTUAL TABLE chunks_fts USING fts5(chunk_id UNINDEXED, entity_id UNINDEXED, producer UNINDEXED, text);"
 		"INSERT INTO chunks_fts(chunk_id, entity_id, producer, text) SELECT id, entity_id, producer, text FROM chunks;");
 
-	constexpr int32 SchemaMigrations = 2; // == store.ts MIGRATIONS.length
+	// Provenance/authority (issue #3): every entity is either extracted ground truth or stated design
+	// intent. NULL after the ALTER; ingest re-inserts every row with a concrete value, and the query
+	// layer COALESCEs any residual NULL to 'extracted-fact'.
+	const TCHAR* Migration3 = TEXT(
+		"ALTER TABLE entities ADD COLUMN authority TEXT;"
+		"CREATE INDEX idx_entities_authority ON entities(authority);");
+
+	constexpr int32 SchemaMigrations = 3; // C++ store schema version (TS store retired)
 
 	FString StoreDbPath()
 	{
@@ -101,6 +109,7 @@ void FGameIQStore::EnsureSchema()
 	Db.GetUserVersion(Version);
 	if (Version < 1) { Db.Execute(Migration1); }
 	if (Version < 2) { Db.Execute(Migration2); }
+	if (Version < 3) { Db.Execute(Migration3); }
 	if (Version < SchemaMigrations) { Db.SetUserVersion(SchemaMigrations); }
 }
 
@@ -117,11 +126,11 @@ void FGameIQStore::SetMeta(const FString& Key, const FString& Value)
 void FGameIQStore::UpsertEntity(const FJsonObject& E, const FString& Producer)
 {
 	FSQLitePreparedStatement Stmt = Db.PrepareStatement(
-		TEXT("INSERT INTO entities (id, kind, name, path, parent, source, summary, detail, producer) "
-		     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+		TEXT("INSERT INTO entities (id, kind, name, path, parent, source, summary, detail, producer, authority) "
+		     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
 		     "ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, name=excluded.name, path=excluded.path, "
 		     "parent=excluded.parent, source=excluded.source, summary=excluded.summary, "
-		     "detail=excluded.detail, producer=excluded.producer"));
+		     "detail=excluded.detail, producer=excluded.producer, authority=excluded.authority"));
 	if (!Stmt.IsValid()) { return; }
 	Stmt.SetBindingValueByIndex(1, E.GetStringField(TEXT("id")));
 	Stmt.SetBindingValueByIndex(2, E.GetStringField(TEXT("kind")));
@@ -138,6 +147,13 @@ void FGameIQStore::UpsertEntity(const FJsonObject& E, const FString& Producer)
 	if (!Detail.IsEmpty()) { Stmt.SetBindingValueByIndex(8, Detail); }
 	else { Stmt.SetBindingValueByIndex(8); }
 	Stmt.SetBindingValueByIndex(9, Producer);
+	// Provenance: a producer omits `authority` for extracted ground truth; docs set 'stated-intent'.
+	FString AuthorityTag;
+	if (!(E.TryGetStringField(TEXT("authority"), AuthorityTag) && !AuthorityTag.IsEmpty()))
+	{
+		AuthorityTag = GameIQ::Authority::ExtractedFact;
+	}
+	Stmt.SetBindingValueByIndex(10, AuthorityTag);
 	Stmt.Execute();
 }
 

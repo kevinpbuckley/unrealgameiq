@@ -50,8 +50,20 @@ public:
 	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "GameIQ")
 	static FString Explain(const FString& Topic);
 
-	/** Project-wide stats. `Facet` is "overview", "kinds", "edges", "unused", or "largest-deps".
-	 *  Returns a JSON string. */
+	/** Project-wide stats. `Facet` is "overview", "kinds", "edges", "unused", "largest-deps",
+	 *  "authority" (extracted-fact vs stated-intent), or "doc-types". Returns a JSON string. */
 	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "GameIQ")
 	static FString ProjectStats(const FString& Facet = TEXT("overview"));
+
+	/** Design → implementation coverage: which documentation (stated design intent) is backed by a real
+	 *  implementation in the index and which isn't. Optional `DocType` (e.g. "game-design",
+	 *  "level-design") restricts the report. Design docs are stated intent, not ground truth. */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "GameIQ")
+	static FString Coverage(const FString& DocType = TEXT(""));
+
+	/** Design ↔ build drift: doc sections stating a `property = value` that contradicts the value
+	 *  extracted from the implementation they describe (e.g. GDD says speed 2000, Blueprint sets 1500).
+	 *  Returns a JSON string. */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "GameIQ")
+	static FString Drift();
 };

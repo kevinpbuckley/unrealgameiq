@@ -32,4 +32,12 @@ namespace GameIQQuery
 
 	/** Project-wide stats. Facet: "overview" | "kinds" | "edges" | "unused" | "largest-deps". */
 	FString ProjectStats(const FString& Facet);
+
+	/** Design/implementation coverage (issue #6): which documentation (stated intent) links to a real
+	 *  implementation and which doesn't. Optional `DocType` restricts to one kind of doc. */
+	FString Coverage(const FString& DocType = TEXT(""), int32 Limit = 500);
+
+	/** Design/build drift (issue #6): where a doc section states a `key = value` that contradicts the
+	 *  extracted value on the implementation entity it describes. */
+	FString Drift(int32 Limit = 200);
 }

@@ -34,3 +34,13 @@ FString UGameIQService::ProjectStats(const FString& Facet)
 {
 	return GameIQQuery::ProjectStats(Facet);
 }
+
+FString UGameIQService::Coverage(const FString& DocType)
+{
+	return GameIQQuery::Coverage(DocType);
+}
+
+FString UGameIQService::Drift()
+{
+	return GameIQQuery::Drift();
+}
