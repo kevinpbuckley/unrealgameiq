@@ -5,6 +5,8 @@
 #include "Animation/Skeleton.h"
 #include "AssetRegistry/ARFilter.h"
 #include "Components/LightComponent.h"
+#include "Components/PointLightComponent.h"
+#include "Components/SpotLightComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "EnhancedActionKeyMapping.h"
 #include "Engine/Light.h"
@@ -249,6 +251,19 @@ namespace
 		AddSummary(O, Id, FString::Printf(TEXT("%s (InputAction)\nValueType: %s"), *Name, *ValueType));
 	}
 
+	/** "DirectionalLight" → "Directional Light" so FTS (whole-word tokens) matches a search for "light". */
+	FString SplitCamel(const FString& In)
+	{
+		FString Out;
+		for (int32 i = 0; i < In.Len(); ++i)
+		{
+			const TCHAR C = In[i];
+			if (i > 0 && FChar::IsUpper(C) && !FChar::IsUpper(In[i - 1])) { Out.AppendChar(TEXT(' ')); }
+			Out.AppendChar(C);
+		}
+		return Out;
+	}
+
 	/** Type-specific one-line detail for a placed actor (lights, static meshes), for the searchable chunk. */
 	FString ActorDetail(FOut& O, const AActor* Actor, const FString& ActorId, TSharedRef<FJsonObject>& OutJson)
 	{
@@ -263,8 +278,24 @@ namespace
 				OutJson->SetNumberField(TEXT("intensity"), LC->Intensity);
 				OutJson->SetStringField(TEXT("color"), FString::Printf(TEXT("%d,%d,%d"), Color.R, Color.G, Color.B));
 				OutJson->SetStringField(TEXT("mobility"), Mob);
-				return FString::Printf(TEXT("intensity=%.0f color=%d,%d,%d mobility=%s"),
-					LC->Intensity, Color.R, Color.G, Color.B, *Mob);
+				OutJson->SetBoolField(TEXT("castShadows"), LC->CastShadows != 0);
+				OutJson->SetBoolField(TEXT("visible"), LC->GetVisibleFlag());
+
+				FString Extra;
+				if (const UPointLightComponent* PLC = Cast<UPointLightComponent>(LC))
+				{
+					OutJson->SetNumberField(TEXT("attenuationRadius"), PLC->AttenuationRadius);
+					Extra += FString::Printf(TEXT(" radius=%.0f"), PLC->AttenuationRadius);
+					if (const USpotLightComponent* SLC = Cast<USpotLightComponent>(LC))
+					{
+						OutJson->SetNumberField(TEXT("outerConeAngle"), SLC->OuterConeAngle);
+						Extra += FString::Printf(TEXT(" cone=%.0f"), SLC->OuterConeAngle);
+					}
+				}
+				return FString::Printf(TEXT("intensity=%.0f color=%d,%d,%d mobility=%s shadows=%s visible=%s%s"),
+					LC->Intensity, Color.R, Color.G, Color.B, *Mob,
+					LC->CastShadows ? TEXT("yes") : TEXT("no"),
+					LC->GetVisibleFlag() ? TEXT("yes") : TEXT("no"), *Extra);
 			}
 		}
 		if (const AStaticMeshActor* SMA = Cast<AStaticMeshActor>(Actor))
@@ -290,11 +321,22 @@ namespace
 
 		TMap<FString, int32> ClassCounts;
 		int32 Listed = 0;
-		for (const AActor* Actor : Level->Actors)
+		int32 Total = 0;
+
+		// Emit one placed actor: a `level-actor` entity (with typed light/mesh detail), a
+		// `placed-in-level` edge, a searchable chunk, and a level→class "places" edge.
+		auto ExtractActor = [&](const AActor* Actor)
 		{
-			if (!Actor) { continue; }
+			if (!Actor) { return; }
+			++Total;
 			const FString ClassName = Actor->GetClass()->GetName();
 			ClassCounts.FindOrAdd(ClassName)++;
+
+			// World Partition / editor-generated infrastructure is counted (in the summary) but not worth a
+			// per-actor entity — it's derived, not authored, and would bury real actors under the cap.
+			static const TSet<FString> DerivedInfra = {
+				TEXT("WorldPartitionHLOD"), TEXT("WorldPartitionMiniMap"), TEXT("HLODActor") };
+			if (DerivedInfra.Contains(ClassName)) { return; }
 
 			// Link the level to the class it places: BP asset, or native C++ class.
 			if (const UClass* Cls = Actor->GetClass())
@@ -325,12 +367,40 @@ namespace
 					FString::Printf(TEXT("%s (%s)"), *ActorLabel, *ClassName), D)));
 				O.Edges.Add(MakeShared<FJsonValueObject>(
 					GameIQ::MakeEdge(ActorId, Id, TEXT("placed-in-level"))));
-				// Per-actor chunk so placed actors are searchable by class/name ("find the DirectionalLights").
+				// Per-actor chunk so placed actors are searchable by class/name. Include the camelCase-split
+				// class ("Directional Light") so a plain search for "light" / "mesh" / "camera" matches the
+				// compound class token (FTS indexes whole words).
 				O.Chunks.Add(MakeShared<FJsonValueObject>(GameIQ::MakeChunk(
 					FString::Printf(TEXT("%s#actor"), *ActorId), ActorId, TEXT("recipe-summary"),
-					FString::Printf(TEXT("%s (%s) in %s%s"), *ActorLabel, *ClassName, *Name,
+					FString::Printf(TEXT("%s (%s / %s) in %s%s"), *ActorLabel, *ClassName, *SplitCamel(ClassName), *Name,
 						Detail.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" — %s"), *Detail)))));
 				++Listed;
+			}
+		};
+
+		for (const AActor* Actor : Level->Actors) { ExtractActor(Actor); }
+
+		// World Partition levels keep their real actors (lights, meshes, …) as One-File-Per-Actor
+		// packages under __ExternalActors__, which are NOT in Level->Actors — so a naive walk sees
+		// only WorldSettings/Brush/WorldDataLayers. Pull those packages from the Asset Registry and
+		// extract each the same way, so a WP level's lights/actors become real, linked level-actor
+		// entities with full detail instead of orphaned generic assets. (§12.12)
+		int32 External = 0;
+		{
+			const FString LevelPackage = World->GetPackage()->GetName();
+			const FString ExtPath = ULevel::GetExternalActorsPath(LevelPackage);
+			if (!ExtPath.IsEmpty())
+			{
+				FAssetRegistryModule& ARM = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+				FARFilter Filter;
+				Filter.PackagePaths.Add(FName(*ExtPath));
+				Filter.bRecursivePaths = true;
+				TArray<FAssetData> ExtAssets;
+				ARM.Get().GetAssets(Filter, ExtAssets);
+				for (const FAssetData& AD : ExtAssets)
+				{
+					if (AActor* Actor = Cast<AActor>(AD.GetAsset())) { ExtractActor(Actor); ++External; }
+				}
 			}
 		}
 
@@ -341,11 +411,13 @@ namespace
 			CountLines.Add(FString::Printf(TEXT("%s x%d"), *P.Key, P.Value));
 		}
 		// Full per-class counts are always reported; per-actor entities are capped (design §12 Q7).
-		const FString CapNote = Level->Actors.Num() > MaxActorEntitiesPerLevel
+		const FString WpNote = External > 0
+			? FString::Printf(TEXT(" (World Partition: %d external actors resolved)"), External) : FString();
+		const FString CapNote = Total > MaxActorEntitiesPerLevel
 			? FString::Printf(TEXT(" (%d listed as entities, all counted below)"), MaxActorEntitiesPerLevel)
 			: FString();
-		AddSummary(O, Id, FString::Printf(TEXT("%s (Level)\nActors: %d in %d classes%s\n%s"),
-			*Name, Level->Actors.Num(), ClassCounts.Num(), *CapNote, *FString::Join(CountLines, TEXT(", "))));
+		AddSummary(O, Id, FString::Printf(TEXT("%s (Level)\nActors: %d in %d classes%s%s\n%s"),
+			*Name, Total, ClassCounts.Num(), *WpNote, *CapNote, *FString::Join(CountLines, TEXT(", "))));
 	}
 }
 
@@ -417,6 +489,11 @@ int32 UGameIQAssetsCommandlet::Main(const FString& Params)
 	{
 		// Blueprints are handled by the GameIQBlueprints (Tier 2) commandlet.
 		if (Data.AssetClassPath.GetAssetName().ToString().EndsWith(TEXT("Blueprint"))) { continue; }
+
+		// World Partition external actors (One-File-Per-Actor) are resolved by RecipeLevel into typed,
+		// level-linked actor entities — skip them here so they aren't also emitted as orphaned generic
+		// assets (which surfaced only misleading top-level property diffs, no light detail).
+		if (Data.PackageName.ToString().Contains(TEXT("/__ExternalActors__/"))) { continue; }
 
 		UObject* Asset = Data.GetAsset();
 		if (!Asset || !IsProjectObject(Asset)) { continue; }
