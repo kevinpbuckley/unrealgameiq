@@ -3,6 +3,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { QueryEngine } from "../query/query.js";
 import type { Store } from "../store/store.js";
+import { drainIncremental } from "../index/incremental.js";
 import { runAction, type GameIqArgs } from "./actions.js";
 
 /**
@@ -23,7 +24,7 @@ const DESCRIPTION = [
   "`project_stats` (counts/hygiene; optional `facet`=overview|kinds|edges|unused|largest-deps).",
 ].join(" ");
 
-export function createMcpServer(engine: QueryEngine): McpServer {
+export function createMcpServer(engine: QueryEngine, beforeQuery?: () => void): McpServer {
   const server = new McpServer({ name: "unreal-game-iq", version: "0.1.0" });
 
   server.tool(
@@ -42,6 +43,7 @@ export function createMcpServer(engine: QueryEngine): McpServer {
     },
     async (args) => {
       try {
+        beforeQuery?.(); // apply any pending save-hook deltas so the agent sees a fresh index
         const result = runAction(engine, args as GameIqArgs);
         const ageNote = engine.indexAgeNote();
         return {
@@ -59,10 +61,17 @@ export function createMcpServer(engine: QueryEngine): McpServer {
   return server;
 }
 
-/** Open a query engine over `store`, wire it to a stdio MCP server, and serve. */
-export async function runStdio(store: Store): Promise<void> {
+/**
+ * Open a query engine over `store`, wire it to a stdio MCP server, and serve. Before each
+ * query the server drains any pending incremental deltas (from the in-editor save hook) in
+ * `<projectRoot>/.gameiq/extract/incremental/`, so an agent always reads a fresh index
+ * without a separate watcher process.
+ */
+export async function runStdio(store: Store, projectRoot: string): Promise<void> {
   const engine = new QueryEngine(store);
-  const server = createMcpServer(engine);
+  const server = createMcpServer(engine, () => {
+    drainIncremental(projectRoot, store);
+  });
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }

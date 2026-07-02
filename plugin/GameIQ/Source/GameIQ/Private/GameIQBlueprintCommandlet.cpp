@@ -196,6 +196,119 @@ namespace
 	}
 }
 
+void GameIQBlueprint::ExtractBlueprint(
+	UBlueprint* BP,
+	TArray<TSharedPtr<FJsonValue>>& Entities,
+	TArray<TSharedPtr<FJsonValue>>& Edges,
+	TArray<TSharedPtr<FJsonValue>>& Chunks)
+{
+	if (!BP) { return; }
+	const FString Package = BP->GetOutermost()->GetName();
+	const FString AssetName = BP->GetName();
+	const FString BpId = FString::Printf(TEXT("asset:%s"), *Package);
+
+	// Gather graphs: event graphs (ubergraph pages) + function graphs.
+	TArray<UEdGraph*> Graphs;
+	Graphs.Append(BP->UbergraphPages);
+	Graphs.Append(BP->FunctionGraphs);
+
+	for (const UEdGraph* Graph : Graphs)
+	{
+		if (!Graph) { continue; }
+		const FString GraphName = Graph->GetName();
+		const FString Pseudo = RenderGraph(Graph);
+		if (Pseudo.IsEmpty()) { continue; }
+
+		const FString FnId = FString::Printf(TEXT("%s::%s"), *BpId, *GraphName);
+		Entities.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEntity(
+			FnId, TEXT("bp-function"), GraphName, Package, TEXT("asset"), BpId,
+			FString::Printf(TEXT("%s graph of %s"), *GraphName, *AssetName), nullptr)));
+
+		Chunks.Add(MakeShared<FJsonValueObject>(GameIQ::MakeChunk(
+			FString::Printf(TEXT("%s#pseudo"), *FnId), FnId, TEXT("bp-pseudocode"),
+			FString::Printf(TEXT("%s :: %s\n%s"), *AssetName, *GraphName, *Pseudo))));
+
+		for (const UEdGraphNode* Node : Graph->Nodes)
+		{
+			const UK2Node_CallFunction* Call = Cast<UK2Node_CallFunction>(Node);
+			if (!Call) { continue; }
+			const UFunction* Fn = Call->GetTargetFunction();
+			if (!Fn) { continue; }
+			const UClass* Owner = Fn->GetOwnerClass();
+			if (!Owner) { continue; }
+			Edges.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEdge(
+				BpId, FString::Printf(TEXT("cpp:%s"), *Owner->GetName()), TEXT("calls"), Fn->GetName())));
+		}
+	}
+
+	// --- Blueprint structure beyond graphs: variables, components, interfaces ---
+	const FString ParentName = BP->ParentClass ? BP->ParentClass->GetName() : FString();
+	TArray<FString> VarLines, CompLines, IfaceLines;
+
+	for (const FBPVariableDescription& Var : BP->NewVariables)
+	{
+		const FString VarName = Var.VarName.ToString();
+		const FString TypeStr = PinTypeToString(Var.VarType);
+		TSharedRef<FJsonObject> D = MakeShared<FJsonObject>();
+		D->SetStringField(TEXT("type"), TypeStr);
+		D->SetStringField(TEXT("category"), Var.Category.ToString());
+		if (!Var.DefaultValue.IsEmpty()) { D->SetStringField(TEXT("default"), Var.DefaultValue); }
+		Entities.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEntity(
+			FString::Printf(TEXT("%s::var::%s"), *BpId, *VarName), TEXT("bp-variable"), VarName,
+			Package, TEXT("asset"), BpId, FString::Printf(TEXT("%s %s"), *TypeStr, *VarName), D)));
+		VarLines.Add(FString::Printf(TEXT("%s: %s"), *VarName, *TypeStr));
+		if (const UClass* C = PinTypeClass(Var.VarType))
+		{
+			Edges.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEdge(
+				BpId, FString::Printf(TEXT("cpp:%s"), *C->GetName()), TEXT("references"), VarName)));
+		}
+	}
+
+	if (BP->SimpleConstructionScript)
+	{
+		for (const USCS_Node* Node : BP->SimpleConstructionScript->GetAllNodes())
+		{
+			if (!Node) { continue; }
+			const FString CompName = Node->GetVariableName().ToString();
+			const UClass* CompClass = Node->ComponentClass;
+			const FString ClassName = CompClass ? CompClass->GetName() : TEXT("Component");
+			TSharedRef<FJsonObject> D = MakeShared<FJsonObject>();
+			D->SetStringField(TEXT("componentClass"), ClassName);
+			if (!Node->ParentComponentOrVariableName.IsNone())
+			{
+				D->SetStringField(TEXT("attachParent"), Node->ParentComponentOrVariableName.ToString());
+			}
+			Entities.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEntity(
+				FString::Printf(TEXT("%s::comp::%s"), *BpId, *CompName), TEXT("bp-component"), CompName,
+				Package, TEXT("asset"), BpId, FString::Printf(TEXT("%s %s"), *ClassName, *CompName), D)));
+			CompLines.Add(FString::Printf(TEXT("%s: %s"), *CompName, *ClassName));
+			if (CompClass)
+			{
+				Edges.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEdge(
+					BpId, FString::Printf(TEXT("cpp:%s"), *ClassName), TEXT("references"), CompName)));
+			}
+		}
+	}
+
+	for (const FBPInterfaceDescription& Iface : BP->ImplementedInterfaces)
+	{
+		const UClass* IfClass = Iface.Interface.Get();
+		if (!IfClass) { continue; }
+		IfaceLines.Add(IfClass->GetName());
+		Edges.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEdge(
+			BpId, FString::Printf(TEXT("cpp:%s"), *IfClass->GetName()), TEXT("implements"), FString())));
+	}
+
+	FString S = AssetName;
+	if (!ParentName.IsEmpty()) { S += FString::Printf(TEXT(" (parent: %s)"), *ParentName); }
+	S += TEXT("\n");
+	if (VarLines.Num() > 0)   { S += TEXT("Variables: ")  + FString::Join(VarLines, TEXT(", "))  + TEXT("\n"); }
+	if (CompLines.Num() > 0)  { S += TEXT("Components: ") + FString::Join(CompLines, TEXT(", ")) + TEXT("\n"); }
+	if (IfaceLines.Num() > 0) { S += TEXT("Implements: ") + FString::Join(IfaceLines, TEXT(", ")) + TEXT("\n"); }
+	Chunks.Add(MakeShared<FJsonValueObject>(GameIQ::MakeChunk(
+		FString::Printf(TEXT("%s#structure"), *BpId), BpId, TEXT("recipe-summary"), S)));
+}
+
 UGameIQBlueprintsCommandlet::UGameIQBlueprintsCommandlet()
 {
 	IsClient = false;
@@ -237,118 +350,7 @@ int32 UGameIQBlueprintsCommandlet::Main(const FString& Params)
 	{
 		UBlueprint* BP = Cast<UBlueprint>(Data.GetAsset());
 		if (!BP) { continue; }
-
-		const FString Package = Data.PackageName.ToString();
-		const FString BpId = FString::Printf(TEXT("asset:%s"), *Package);
-
-		// Gather graphs: event graphs (ubergraph pages) + function graphs.
-		TArray<UEdGraph*> Graphs;
-		Graphs.Append(BP->UbergraphPages);
-		Graphs.Append(BP->FunctionGraphs);
-
-		for (const UEdGraph* Graph : Graphs)
-		{
-			if (!Graph) { continue; }
-			const FString GraphName = Graph->GetName();
-			const FString Pseudo = RenderGraph(Graph);
-			if (Pseudo.IsEmpty()) { continue; }
-
-			// a bp-function entity per graph, parented to the blueprint
-			const FString FnId = FString::Printf(TEXT("%s::%s"), *BpId, *GraphName);
-			Entities.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEntity(
-				FnId, TEXT("bp-function"), GraphName, Package, TEXT("asset"), BpId,
-				FString::Printf(TEXT("%s graph of %s"), *GraphName, *Data.AssetName.ToString()), nullptr)));
-
-			Chunks.Add(MakeShared<FJsonValueObject>(GameIQ::MakeChunk(
-				FString::Printf(TEXT("%s#pseudo"), *FnId), FnId, TEXT("bp-pseudocode"),
-				FString::Printf(TEXT("%s :: %s\n%s"), *Data.AssetName.ToString(), *GraphName, *Pseudo))));
-
-			// calls edges into C++ (and other BPs) from CallFunction nodes
-			for (const UEdGraphNode* Node : Graph->Nodes)
-			{
-				const UK2Node_CallFunction* Call = Cast<UK2Node_CallFunction>(Node);
-				if (!Call) { continue; }
-				const UFunction* Fn = Call->GetTargetFunction();
-				if (!Fn) { continue; }
-				const UClass* Owner = Fn->GetOwnerClass();
-				if (!Owner) { continue; }
-				// Owner->GetName() is the prefix-less reflection name — matches the C++ extractor's cpp: ids.
-				Edges.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEdge(
-					BpId, FString::Printf(TEXT("cpp:%s"), *Owner->GetName()), TEXT("calls"), Fn->GetName())));
-			}
-		}
-
-		// --- Blueprint structure beyond graphs: variables, components, interfaces ---
-		const FString ParentName = BP->ParentClass ? BP->ParentClass->GetName() : FString();
-		TArray<FString> VarLines, CompLines, IfaceLines;
-
-		for (const FBPVariableDescription& Var : BP->NewVariables)
-		{
-			const FString VarName = Var.VarName.ToString();
-			const FString TypeStr = PinTypeToString(Var.VarType);
-			TSharedRef<FJsonObject> D = MakeShared<FJsonObject>();
-			D->SetStringField(TEXT("type"), TypeStr);
-			D->SetStringField(TEXT("category"), Var.Category.ToString());
-			if (!Var.DefaultValue.IsEmpty()) { D->SetStringField(TEXT("default"), Var.DefaultValue); }
-			Entities.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEntity(
-				FString::Printf(TEXT("%s::var::%s"), *BpId, *VarName), TEXT("bp-variable"), VarName,
-				Package, TEXT("asset"), BpId, FString::Printf(TEXT("%s %s"), *TypeStr, *VarName), D)));
-			VarLines.Add(FString::Printf(TEXT("%s: %s"), *VarName, *TypeStr));
-			if (const UClass* C = PinTypeClass(Var.VarType))
-			{
-				Edges.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEdge(
-					BpId, FString::Printf(TEXT("cpp:%s"), *C->GetName()), TEXT("references"), VarName)));
-			}
-		}
-
-		if (BP->SimpleConstructionScript)
-		{
-			for (const USCS_Node* Node : BP->SimpleConstructionScript->GetAllNodes())
-			{
-				if (!Node) { continue; }
-				const FString CompName = Node->GetVariableName().ToString();
-				const UClass* CompClass = Node->ComponentClass;
-				const FString ClassName = CompClass ? CompClass->GetName() : TEXT("Component");
-				TSharedRef<FJsonObject> D = MakeShared<FJsonObject>();
-				D->SetStringField(TEXT("componentClass"), ClassName);
-				if (!Node->ParentComponentOrVariableName.IsNone())
-				{
-					D->SetStringField(TEXT("attachParent"), Node->ParentComponentOrVariableName.ToString());
-				}
-				Entities.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEntity(
-					FString::Printf(TEXT("%s::comp::%s"), *BpId, *CompName), TEXT("bp-component"), CompName,
-					Package, TEXT("asset"), BpId, FString::Printf(TEXT("%s %s"), *ClassName, *CompName), D)));
-				CompLines.Add(FString::Printf(TEXT("%s: %s"), *CompName, *ClassName));
-				if (CompClass)
-				{
-					Edges.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEdge(
-						BpId, FString::Printf(TEXT("cpp:%s"), *ClassName), TEXT("references"), CompName)));
-				}
-			}
-		}
-
-		for (const FBPInterfaceDescription& Iface : BP->ImplementedInterfaces)
-		{
-			const UClass* IfClass = Iface.Interface.Get();
-			if (!IfClass) { continue; }
-			IfaceLines.Add(IfClass->GetName());
-			Edges.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEdge(
-				BpId, FString::Printf(TEXT("cpp:%s"), *IfClass->GetName()), TEXT("implements"), FString())));
-		}
-
-		// One structural summary chunk on the blueprint entity — makes its shape searchable
-		// ("which blueprint has an Ammo variable / a SphereComponent / implements Interactable?").
-		{
-			FString S = Data.AssetName.ToString();
-			if (!ParentName.IsEmpty()) { S += FString::Printf(TEXT(" (parent: %s)"), *ParentName); }
-			S += TEXT("\n");
-			if (VarLines.Num() > 0)   { S += TEXT("Variables: ")  + FString::Join(VarLines, TEXT(", "))  + TEXT("\n"); }
-			if (CompLines.Num() > 0)  { S += TEXT("Components: ") + FString::Join(CompLines, TEXT(", ")) + TEXT("\n"); }
-			if (IfaceLines.Num() > 0) { S += TEXT("Implements: ") + FString::Join(IfaceLines, TEXT(", ")) + TEXT("\n"); }
-			Chunks.Add(MakeShared<FJsonValueObject>(GameIQ::MakeChunk(
-				FString::Printf(TEXT("%s#structure"), *BpId), BpId, TEXT("recipe-summary"), S)));
-		}
-
+		GameIQBlueprint::ExtractBlueprint(BP, Entities, Edges, Chunks);
 		++Rendered;
 	}
 

@@ -99,4 +99,37 @@ namespace GameIQ
 		return FFileHelper::SaveStringToFile(
 			Out, *FPaths::Combine(OutDir, FileName), FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
 	}
+
+	/**
+	 * Write an incremental delta to OutFile (absolute). Like WriteOutput but with a `replaces`
+	 * array — the entity ids whose subtrees this delta fully replaces (patch ingest, §8).
+	 */
+	inline bool WriteDelta(
+		const FString& OutFile, const FString& Producer, const TArray<FString>& Replaces,
+		const TArray<TSharedPtr<FJsonValue>>& Entities,
+		const TArray<TSharedPtr<FJsonValue>>& Edges,
+		const TArray<TSharedPtr<FJsonValue>>& Chunks)
+	{
+		TSharedRef<FJsonObject> Project = MakeShared<FJsonObject>();
+		Project->SetStringField(TEXT("name"), FApp::GetProjectName());
+		Project->SetStringField(TEXT("root"), FPaths::ConvertRelativePathToFull(FPaths::ProjectDir()));
+
+		TArray<TSharedPtr<FJsonValue>> ReplacesJson;
+		for (const FString& R : Replaces) { ReplacesJson.Add(MakeShared<FJsonValueString>(R)); }
+
+		TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+		Root->SetNumberField(TEXT("schemaVersion"), SchemaVersion);
+		Root->SetStringField(TEXT("generatedAtIso"), FDateTime::UtcNow().ToIso8601());
+		Root->SetStringField(TEXT("producer"), Producer);
+		Root->SetObjectField(TEXT("project"), Project);
+		Root->SetArrayField(TEXT("entities"), Entities);
+		Root->SetArrayField(TEXT("edges"), Edges);
+		Root->SetArrayField(TEXT("chunks"), Chunks);
+		Root->SetArrayField(TEXT("replaces"), ReplacesJson);
+
+		FString Out;
+		TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Out);
+		FJsonSerializer::Serialize(Root, Writer);
+		return FFileHelper::SaveStringToFile(Out, *OutFile, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+	}
 }

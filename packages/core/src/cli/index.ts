@@ -116,7 +116,7 @@ program
   .action(async (opts: { project: string; db?: string }) => {
     const { store } = openEngine(opts.project, opts.db);
     process.stderr.write(`[gameiq] MCP server ready for ${resolve(opts.project)}\n`);
-    await runStdio(store);
+    await runStdio(store, resolve(opts.project));
   });
 
 program

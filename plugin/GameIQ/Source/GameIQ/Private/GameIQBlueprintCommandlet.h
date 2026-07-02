@@ -4,7 +4,21 @@
 
 #include "CoreMinimal.h"
 #include "Commandlets/Commandlet.h"
+#include "Dom/JsonValue.h"
 #include "GameIQBlueprintCommandlet.generated.h"
+
+class UBlueprint;
+
+/** Shared Tier 2 extraction so both the commandlet and the in-editor save hook use one recipe. */
+namespace GameIQBlueprint
+{
+	/** Append this Blueprint's entities/edges/chunks (graphs → pseudocode, variables, components, interfaces). */
+	void ExtractBlueprint(
+		UBlueprint* Blueprint,
+		TArray<TSharedPtr<FJsonValue>>& Entities,
+		TArray<TSharedPtr<FJsonValue>>& Edges,
+		TArray<TSharedPtr<FJsonValue>>& Chunks);
+}
 
 /**
  * Tier 2 extractor (design §5.1, the killer feature): loads every project

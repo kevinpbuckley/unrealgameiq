@@ -34,6 +34,7 @@ public class GameIQ : ModuleRules
 				"UnrealEd",
 				"BlueprintGraph",
 				"Kismet",
+				"EditorSubsystem", // in-editor save hook (incremental index updates)
 			});
 		}
 	}
