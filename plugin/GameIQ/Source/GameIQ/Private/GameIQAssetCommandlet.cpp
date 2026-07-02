@@ -349,6 +349,36 @@ namespace
 	}
 }
 
+void GameIQAsset::ExtractAsset(
+	UObject* Asset,
+	TArray<TSharedPtr<FJsonValue>>& Entities,
+	TArray<TSharedPtr<FJsonValue>>& Edges,
+	TArray<TSharedPtr<FJsonValue>>& Chunks)
+{
+	if (!Asset || !IsProjectObject(Asset)) { return; }
+	FOut O{ Entities, Edges, Chunks };
+	const FString Id = AssetIdOf(Asset);
+	const FString Name = Asset->GetName();
+
+	if (const UStaticMesh* SM = Cast<UStaticMesh>(Asset)) { RecipeStaticMesh(O, SM, Id, Name); }
+	else if (const USkeletalMesh* SK = Cast<USkeletalMesh>(Asset)) { RecipeSkeletalMesh(O, SK, Id, Name); }
+	else if (const UTexture2D* Tex = Cast<UTexture2D>(Asset)) { RecipeTexture(O, Tex, Id, Name); }
+	else if (const USkeleton* Skel = Cast<USkeleton>(Asset)) { RecipeSkeleton(O, Skel, Id, Name); }
+	else if (const UDataTable* DT = Cast<UDataTable>(Asset)) { RecipeDataTable(O, DT, Id, Name); }
+	else if (const UMaterialInterface* Mat = Cast<UMaterialInterface>(Asset)) { RecipeMaterial(O, Mat, Id, Name); }
+	else if (const UInputMappingContext* IMC = Cast<UInputMappingContext>(Asset)) { RecipeInputMappingContext(O, IMC, Id, Name); }
+	else if (const UInputAction* IA = Cast<UInputAction>(Asset)) { RecipeInputAction(O, IA, Id, Name); }
+	else if (UWorld* World = Cast<UWorld>(Asset)) { RecipeLevel(O, World, Id, Name); }
+	else
+	{
+		const FString Props = GenericReflectionSummary(O, Asset, Id);
+		const FString ClassName = Asset->GetClass()->GetName();
+		AddSummary(O, Id, Props.IsEmpty()
+			? FString::Printf(TEXT("%s (%s)"), *Name, *ClassName)
+			: FString::Printf(TEXT("%s (%s)\n%s"), *Name, *ClassName, *Props));
+	}
+}
+
 UGameIQAssetsCommandlet::UGameIQAssetsCommandlet()
 {
 	IsClient = false;
@@ -381,7 +411,6 @@ int32 UGameIQAssetsCommandlet::Main(const FString& Params)
 	TArray<TSharedPtr<FJsonValue>> Entities;
 	TArray<TSharedPtr<FJsonValue>> Edges;
 	TArray<TSharedPtr<FJsonValue>> Chunks;
-	FOut O{ Entities, Edges, Chunks };
 
 	int32 Considered = 0;
 	for (const FAssetData& Data : Assets)
@@ -392,28 +421,7 @@ int32 UGameIQAssetsCommandlet::Main(const FString& Params)
 		UObject* Asset = Data.GetAsset();
 		if (!Asset || !IsProjectObject(Asset)) { continue; }
 		++Considered;
-
-		const FString Id = AssetIdOf(Asset);
-		const FString Name = Data.AssetName.ToString();
-
-		if (const UStaticMesh* SM = Cast<UStaticMesh>(Asset)) { RecipeStaticMesh(O, SM, Id, Name); }
-		else if (const USkeletalMesh* SK = Cast<USkeletalMesh>(Asset)) { RecipeSkeletalMesh(O, SK, Id, Name); }
-		else if (const UTexture2D* Tex = Cast<UTexture2D>(Asset)) { RecipeTexture(O, Tex, Id, Name); }
-		else if (const USkeleton* Skel = Cast<USkeleton>(Asset)) { RecipeSkeleton(O, Skel, Id, Name); }
-		else if (const UDataTable* DT = Cast<UDataTable>(Asset)) { RecipeDataTable(O, DT, Id, Name); }
-		else if (const UMaterialInterface* Mat = Cast<UMaterialInterface>(Asset)) { RecipeMaterial(O, Mat, Id, Name); }
-		else if (const UInputMappingContext* IMC = Cast<UInputMappingContext>(Asset)) { RecipeInputMappingContext(O, IMC, Id, Name); }
-		else if (const UInputAction* IA = Cast<UInputAction>(Asset)) { RecipeInputAction(O, IA, Id, Name); }
-		else if (UWorld* World = Cast<UWorld>(Asset)) { RecipeLevel(O, World, Id, Name); }
-		else
-		{
-			// Generic reflection fallback — no asset is invisible (design §5.1).
-			const FString Props = GenericReflectionSummary(O, Asset, Id);
-			const FString ClassName = Data.AssetClassPath.GetAssetName().ToString();
-			AddSummary(O, Id, Props.IsEmpty()
-				? FString::Printf(TEXT("%s (%s)"), *Name, *ClassName)
-				: FString::Printf(TEXT("%s (%s)\n%s"), *Name, *ClassName, *Props));
-		}
+		GameIQAsset::ExtractAsset(Asset, Entities, Edges, Chunks);
 	}
 
 	if (!GameIQ::WriteOutput(OutDir, TEXT("assets.json"), AssetsProducer, Entities, Edges, Chunks))

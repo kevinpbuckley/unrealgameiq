@@ -8,14 +8,15 @@
 #include "GameIQSaveHook.generated.h"
 
 class UPackage;
+struct FAssetData;
 
 /**
- * Incremental index updates (design §8). While the editor is open, this editor subsystem
- * hooks package saves: when a Blueprint is saved, it extracts that Blueprint in-memory
- * (instant — it's already loaded) with the same recipe as the commandlet and writes a delta
- * to `<project>/.gameiq/extract/incremental/`. The running MCP server drains that delta
- * before its next query, so an agent always sees the just-saved state — no full rebuild,
- * no watcher process, no editor stall.
+ * Incremental index updates (design §8). While the editor is open this subsystem keeps the
+ * Game IQ index in step with edits: on save it extracts the changed asset in-memory (same
+ * recipe as the commandlets) and writes a delta to `<project>/.gameiq/extract/incremental/`;
+ * on delete/rename it writes a delta that removes the asset. The MCP server drains pending
+ * deltas before its next query, so an agent always sees the current project — no full rebuild,
+ * no watcher, no editor stall.
  */
 UCLASS()
 class UGameIQSaveHookSubsystem : public UEditorSubsystem
@@ -28,5 +29,17 @@ public:
 
 private:
 	void OnPackageSaved(const FString& PackageFilename, UPackage* Package, FObjectPostSaveContext Context);
+	void OnAssetRemoved(const FAssetData& AssetData);
+	void OnAssetRenamed(const FAssetData& AssetData, const FString& OldObjectPath);
+
+	/** Serialize a delta to a unique file in the incremental dir. */
+	void WriteDelta(
+		const TArray<FString>& Replaces,
+		const TArray<TSharedPtr<FJsonValue>>& Entities,
+		const TArray<TSharedPtr<FJsonValue>>& Edges,
+		const TArray<TSharedPtr<FJsonValue>>& Chunks);
+
 	FDelegateHandle SaveHandle;
+	FDelegateHandle RemovedHandle;
+	FDelegateHandle RenamedHandle;
 };

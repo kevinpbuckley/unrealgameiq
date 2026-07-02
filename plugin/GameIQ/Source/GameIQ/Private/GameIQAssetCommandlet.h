@@ -4,7 +4,19 @@
 
 #include "CoreMinimal.h"
 #include "Commandlets/Commandlet.h"
+#include "Dom/JsonValue.h"
 #include "GameIQAssetCommandlet.generated.h"
+
+/** Shared Tier 1 extraction so both the commandlet and the in-editor save hook use one recipe. */
+namespace GameIQAsset
+{
+	/** Append one non-Blueprint asset's recipe (chunks/edges/child entities) for the given loaded object. */
+	void ExtractAsset(
+		UObject* Asset,
+		TArray<TSharedPtr<FJsonValue>>& Entities,
+		TArray<TSharedPtr<FJsonValue>>& Edges,
+		TArray<TSharedPtr<FJsonValue>>& Chunks);
+}
 
 /**
  * Tier 1 extractor (design §5.1): typed per-asset summaries for the non-Blueprint

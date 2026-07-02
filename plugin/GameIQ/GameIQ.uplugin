@@ -23,5 +23,11 @@
       "LoadingPhase": "Default",
       "TargetAllowList": ["Editor"]
     }
+  ],
+  "Plugins": [
+    {
+      "Name": "EnhancedInput",
+      "Enabled": true
+    }
   ]
 }

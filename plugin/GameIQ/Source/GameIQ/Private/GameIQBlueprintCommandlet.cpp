@@ -21,6 +21,8 @@
 #include "Misc/Parse.h"
 #include "Misc/Paths.h"
 #include "Modules/ModuleManager.h"
+#include "UObject/PropertyPortFlags.h"
+#include "UObject/UnrealType.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogGameIQBlueprints, Log, All);
 
@@ -243,20 +245,41 @@ void GameIQBlueprint::ExtractBlueprint(
 
 	// --- Blueprint structure beyond graphs: variables, components, interfaces ---
 	const FString ParentName = BP->ParentClass ? BP->ParentClass->GetName() : FString();
+	// The class default object holds each variable's actual default value (reflects value edits).
+	const UObject* CDO = BP->GeneratedClass ? BP->GeneratedClass->GetDefaultObject() : nullptr;
 	TArray<FString> VarLines, CompLines, IfaceLines;
 
 	for (const FBPVariableDescription& Var : BP->NewVariables)
 	{
 		const FString VarName = Var.VarName.ToString();
 		const FString TypeStr = PinTypeToString(Var.VarType);
+
+		// Prefer the live default from the CDO; fall back to the authored default string.
+		FString DefaultVal = Var.DefaultValue;
+		if (CDO)
+		{
+			if (const FProperty* Prop = CDO->GetClass()->FindPropertyByName(Var.VarName))
+			{
+				FString V;
+				Prop->ExportTextItem_Direct(V, Prop->ContainerPtrToValuePtr<void>(CDO), nullptr,
+					const_cast<UObject*>(CDO), PPF_None);
+				if (!V.IsEmpty()) { DefaultVal = V; }
+			}
+		}
+
 		TSharedRef<FJsonObject> D = MakeShared<FJsonObject>();
 		D->SetStringField(TEXT("type"), TypeStr);
 		D->SetStringField(TEXT("category"), Var.Category.ToString());
-		if (!Var.DefaultValue.IsEmpty()) { D->SetStringField(TEXT("default"), Var.DefaultValue); }
+		if (!DefaultVal.IsEmpty()) { D->SetStringField(TEXT("default"), DefaultVal); }
+		const FString VarSummary = DefaultVal.IsEmpty()
+			? FString::Printf(TEXT("%s %s"), *TypeStr, *VarName)
+			: FString::Printf(TEXT("%s %s = %s"), *TypeStr, *VarName, *DefaultVal);
 		Entities.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEntity(
 			FString::Printf(TEXT("%s::var::%s"), *BpId, *VarName), TEXT("bp-variable"), VarName,
-			Package, TEXT("asset"), BpId, FString::Printf(TEXT("%s %s"), *TypeStr, *VarName), D)));
-		VarLines.Add(FString::Printf(TEXT("%s: %s"), *VarName, *TypeStr));
+			Package, TEXT("asset"), BpId, VarSummary, D)));
+		VarLines.Add(DefaultVal.IsEmpty()
+			? FString::Printf(TEXT("%s: %s"), *VarName, *TypeStr)
+			: FString::Printf(TEXT("%s: %s = %s"), *VarName, *TypeStr, *DefaultVal));
 		if (const UClass* C = PinTypeClass(Var.VarType))
 		{
 			Edges.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEdge(
