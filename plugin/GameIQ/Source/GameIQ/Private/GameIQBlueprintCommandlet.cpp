@@ -17,6 +17,7 @@
 #include "HAL/FileManager.h"
 #include "K2Node_CallFunction.h"
 #include "K2Node_Event.h"
+#include "K2Node_EventNodeInterface.h"
 #include "K2Node_FunctionEntry.h"
 #include "Misc/Parse.h"
 #include "Misc/Paths.h"
@@ -156,7 +157,15 @@ namespace
 		TArray<const UEdGraphNode*> Entries;
 		for (const UEdGraphNode* Node : Graph->Nodes)
 		{
-			if (Cast<const UK2Node_Event>(Node) || Cast<const UK2Node_FunctionEntry>(Node)) { Entries.Add(Node); }
+			// Event roots: classic events + function entries, plus anything implementing the event-node
+			// interface — Enhanced Input action events (UK2Node_EnhancedInputAction) and legacy
+			// InputAction/InputKey/InputTouch nodes. Without this, a character's IA_Move/IA_Jump → handler
+			// bindings render as nothing (they're not UK2Node_Event), so "how does input work" comes up empty.
+			if (Cast<const UK2Node_Event>(Node) || Cast<const UK2Node_FunctionEntry>(Node)
+				|| (Node && Node->GetClass()->ImplementsInterface(UK2Node_EventNodeInterface::StaticClass())))
+			{
+				Entries.Add(Node);
+			}
 		}
 		if (Entries.Num() == 0)
 		{
