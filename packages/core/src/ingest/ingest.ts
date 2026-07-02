@@ -54,3 +54,37 @@ export function ingest(store: Store, output: ExtractorOutput, mode: IngestMode):
     mode,
   };
 }
+
+/**
+ * Incremental ingest (design §8): apply a small delta for a few changed assets without
+ * touching the rest of the index. For each root in `output.replaces` (or every top-level
+ * entity if absent), the root's subtree + its owned edges/chunks are deleted, then the
+ * delta is inserted. Inbound edges are preserved. This is what the in-editor save hook
+ * feeds so the index tracks saves in real time.
+ */
+export function patchIngest(store: Store, output: ExtractorOutput): IngestSummary {
+  if (output.schemaVersion !== SCHEMA_VERSION) {
+    throw new Error(
+      `delta schemaVersion ${output.schemaVersion} != core SCHEMA_VERSION ${SCHEMA_VERSION} (producer: ${output.producer})`,
+    );
+  }
+  const roots =
+    output.replaces && output.replaces.length > 0
+      ? output.replaces
+      : output.entities.filter((e) => !e.parent).map((e) => e.id);
+
+  store.transaction(() => {
+    for (const root of roots) store.deleteSubtree(root);
+    for (const e of output.entities) store.upsertEntity(e, output.producer);
+    for (const edge of output.edges) store.insertEdge(edge, output.producer);
+    for (const c of output.chunks) store.insertChunk(c, output.producer);
+    store.setMeta("lastIngestAtIso", new Date().toISOString());
+  });
+
+  return {
+    entities: output.entities.length,
+    edges: output.edges.length,
+    chunks: output.chunks.length,
+    mode: "merge",
+  };
+}

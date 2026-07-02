@@ -26,9 +26,15 @@ export function projectInfo(root: string): ProjectInfo {
 }
 
 /** Canonical locations for Game IQ's per-project artifacts (design §5.2). */
-export function gameiqPaths(root: string): { dir: string; dbPath: string; extractDir: string } {
+export function gameiqPaths(root: string): {
+  dir: string;
+  dbPath: string;
+  extractDir: string;
+  incrementalDir: string;
+} {
   const dir = join(root, ".gameiq");
-  return { dir, dbPath: join(dir, "index.db"), extractDir: join(dir, "extract") };
+  const extractDir = join(dir, "extract");
+  return { dir, dbPath: join(dir, "index.db"), extractDir, incrementalDir: join(extractDir, "incremental") };
 }
 
 /** List extractor JSON files emitted by the UE commandlet / bridge under `.gameiq/extract/`. */

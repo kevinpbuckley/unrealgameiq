@@ -188,6 +188,41 @@ export class Store {
     this.db.exec(`DELETE FROM entities; DELETE FROM edges; DELETE FROM chunks; DELETE FROM chunks_fts;`);
   }
 
+  /**
+   * Delete an entity and its descendant subtree (children by `parent`), plus the chunks
+   * and *outgoing* edges those entities own. Inbound edges (other entities → this subtree)
+   * are preserved, so a re-extract of the changed asset keeps "who references it" intact.
+   */
+  deleteSubtree(rootId: string): void {
+    const ids = new Set<string>([rootId]);
+    let frontier = [rootId];
+    while (frontier.length) {
+      const next: string[] = [];
+      for (const p of frontier) {
+        const kids = this.db.prepare(`SELECT id FROM entities WHERE parent = ?`).all(p) as Array<{
+          id: string;
+        }>;
+        for (const k of kids) {
+          if (!ids.has(k.id)) {
+            ids.add(k.id);
+            next.push(k.id);
+          }
+        }
+      }
+      frontier = next;
+    }
+    const arr = [...ids];
+    // chunked IN() to stay well under SQLite's variable limit
+    for (let i = 0; i < arr.length; i += 400) {
+      const batch = arr.slice(i, i + 400);
+      const ph = batch.map(() => "?").join(",");
+      this.db.prepare(`DELETE FROM chunks_fts WHERE entity_id IN (${ph})`).run(...batch);
+      this.db.prepare(`DELETE FROM chunks WHERE entity_id IN (${ph})`).run(...batch);
+      this.db.prepare(`DELETE FROM edges WHERE src IN (${ph})`).run(...batch);
+      this.db.prepare(`DELETE FROM entities WHERE id IN (${ph})`).run(...batch);
+    }
+  }
+
   /** Remove every row contributed by one producer (producer-scoped replace). */
   deleteByProducer(producer: string): void {
     this.db.prepare(`DELETE FROM chunks_fts WHERE producer = ?`).run(producer);

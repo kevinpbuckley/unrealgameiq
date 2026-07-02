@@ -111,6 +111,13 @@ export const ExtractorOutputSchema = z.object({
   entities: z.array(EntitySchema),
   edges: z.array(EdgeSchema),
   chunks: z.array(ChunkSchema),
+  /**
+   * Incremental deltas only (patch ingest): the entity ids whose subtrees this output
+   * fully replaces (e.g. `["asset:/Game/BP_Player"]` after a save). Each listed root and
+   * all its descendants + their owned edges/chunks are deleted before this output is
+   * inserted; inbound edges from other entities are preserved. Absent → a full producer run.
+   */
+  replaces: z.array(z.string()).optional(),
 });
 export type ExtractorOutput = z.infer<typeof ExtractorOutputSchema>;
 

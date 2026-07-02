@@ -3,11 +3,15 @@ import { cpSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Command } from "commander";
+import { parseExtractorOutput } from "@gameiq/shared";
 import { indexProject } from "../index/indexer.js";
+import { drainIncremental } from "../index/incremental.js";
+import { patchIngest } from "../ingest/ingest.js";
 import { gameiqPaths, projectInfo } from "../extract/project.js";
 import { Store } from "../store/store.js";
 import { QueryEngine } from "../query/query.js";
 import { runStdio } from "../mcp/server.js";
+import { readJsonFile } from "../util/readJson.js";
 
 const moduleDir = dirname(fileURLToPath(import.meta.url));
 
@@ -62,6 +66,46 @@ program
       );
     }
     process.stdout.write(`  total entities: ${result.totalEntities}\n`);
+  });
+
+program
+  .command("drain")
+  .description("apply all pending incremental deltas from .gameiq/extract/incremental/, then exit (what the in-editor save hook spawns)")
+  .requiredOption("-p, --project <dir>", "path to the project root")
+  .option("--db <path>", "override index DB path")
+  .action((opts: { project: string; db?: string }) => {
+    const root = resolve(opts.project);
+    const dbPath = resolveDb(root, opts.db);
+    if (!existsSync(dbPath)) throw new Error(`no index at ${dbPath}. Run \`gameiq index\` first.`);
+    const store = new Store(dbPath);
+    try {
+      const r = drainIncremental(root, store);
+      if (r.files > 0) {
+        process.stdout.write(`Applied ${r.files} delta(s): ${r.entities} entities, ${r.edges} edges, ${r.chunks} chunks\n`);
+      }
+    } finally {
+      store.close();
+    }
+  });
+
+program
+  .command("patch")
+  .description("apply a single delta JSON to the index (one-shot incremental update)")
+  .argument("<file>", "delta ExtractorOutput JSON")
+  .requiredOption("-p, --project <dir>", "path to the project root")
+  .option("--db <path>", "override index DB path")
+  .action((file: string, opts: { project: string; db?: string }) => {
+    const dbPath = resolveDb(opts.project, opts.db);
+    if (!existsSync(dbPath)) throw new Error(`no index at ${dbPath}. Run \`gameiq index\` first.`);
+    const store = new Store(dbPath);
+    try {
+      const summary = patchIngest(store, parseExtractorOutput(readJsonFile(resolve(file))));
+      process.stdout.write(
+        `Patched: ${summary.entities} entities, ${summary.edges} edges, ${summary.chunks} chunks\n`,
+      );
+    } finally {
+      store.close();
+    }
   });
 
 program
