@@ -13,3 +13,24 @@ FString UGameIQService::GetEntity(const FString& Id)
 {
 	return GameIQQuery::GetEntity(Id, /*Cap=*/50);
 }
+
+FString UGameIQService::References(const FString& Id, const FString& Direction, int32 Depth,
+	const FString& EdgeType, const FString& Kind)
+{
+	return GameIQQuery::References(Id, Direction, Depth, EdgeType, Kind);
+}
+
+FString UGameIQService::Impact(const FString& Id)
+{
+	return GameIQQuery::Impact(Id);
+}
+
+FString UGameIQService::Explain(const FString& Topic)
+{
+	return GameIQQuery::Explain(Topic);
+}
+
+FString UGameIQService::ProjectStats(const FString& Facet)
+{
+	return GameIQQuery::ProjectStats(Facet);
+}

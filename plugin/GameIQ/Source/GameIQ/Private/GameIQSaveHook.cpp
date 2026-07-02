@@ -10,6 +10,7 @@
 #include "GameIQAssetCommandlet.h"
 #include "GameIQBlueprintCommandlet.h"
 #include "GameIQJson.h"
+#include "GameIQStore.h"
 #include "HAL/FileManager.h"
 #include "Misc/Guid.h"
 #include "Misc/Paths.h"
@@ -169,8 +170,12 @@ void UGameIQSaveHookSubsystem::WriteDelta(
 	const TArray<TSharedPtr<FJsonValue>>& Edges,
 	const TArray<TSharedPtr<FJsonValue>>& Chunks)
 {
-	const FString IncDir = FPaths::Combine(FPaths::ProjectDir(), TEXT(".gameiq"), TEXT("extract"), TEXT("incremental"));
-	IFileManager::Get().MakeDirectory(*IncDir, /*Tree=*/true);
-	const FString File = FPaths::Combine(IncDir, FGuid::NewGuid().ToString() + TEXT(".json"));
-	GameIQ::WriteDelta(File, TEXT("gameiq-bridge@0.1.0"), Replaces, Entities, Edges, Chunks);
+	// Write the patch straight into the SQLite index (design §8, Phase 3) — no JSON delta, no Node
+	// drain step. The toolset and the standalone stdio server both read the file we just updated.
+	FGameIQStore Store;
+	if (Store.Open())
+	{
+		Store.Patch(Replaces, Entities, Edges, Chunks, TEXT("gameiq-bridge@0.1.0"));
+		Store.Close();
+	}
 }

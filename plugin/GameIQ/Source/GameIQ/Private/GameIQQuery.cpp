@@ -22,9 +22,9 @@ namespace
 		return FPaths::Combine(Root, TEXT(".gameiq"), TEXT("index.db"));
 	}
 
-	/** Open the index read-only-in-spirit. ReadWrite (not Create) copes with WAL's shared-memory
-	 *  file better than a pure read-only handle while Node holds a writer; we only issue SELECTs.
-	 *  On failure, `OutError` explains why (missing file vs open failure) for the JSON response. */
+	/** Open the index read-only-in-spirit. The DB is a rollback-journal file (not WAL), so a
+	 *  read-only handle from UE's SQLite coexists with the Node writer. Falls back to read-write.
+	 *  On failure, `OutError` explains why for the JSON response. */
 	bool OpenIndex(FSQLiteDatabase& Db, FString& OutError)
 	{
 		const FString Path = IndexDbPath();
@@ -34,8 +34,6 @@ namespace
 			UE_LOG(LogGameIQQuery, Warning, TEXT("Game IQ: %s"), *OutError);
 			return false;
 		}
-		// The DB is WAL-mode and may be held by the Node MCP server; try read-only first (correct for
-		// our SELECT-only use), then read-write. Surface the sqlite error if both fail.
 		if (Db.Open(*Path, ESQLiteDatabaseOpenMode::ReadOnly)) { return true; }
 		const FString RoErr = Db.GetLastError();
 		if (Db.Open(*Path, ESQLiteDatabaseOpenMode::ReadWrite)) { return true; }
@@ -52,7 +50,6 @@ namespace
 		return V;
 	}
 
-	/** A JSON string column is stored as text; re-parse it to an object, or null / raw string on failure. */
 	TSharedPtr<FJsonValue> ParseJsonColumn(const FString& Raw)
 	{
 		if (Raw.IsEmpty())
@@ -102,22 +99,23 @@ namespace
 		return N;
 	}
 
+	FString MetaValue(FSQLiteDatabase& Db, const TCHAR* Key)
+	{
+		FSQLitePreparedStatement Stmt = Db.PrepareStatement(TEXT("SELECT value FROM meta WHERE key = ?"));
+		if (!Stmt.IsValid()) { return FString(); }
+		Stmt.SetBindingValueByIndex(1, FString(Key));
+		FString V;
+		if (Stmt.Step() == ESQLitePreparedStatementStepResult::Row) { Stmt.GetColumnValueByName(TEXT("value"), V); }
+		return V;
+	}
+
 	/** Index-age stamp (design §8), mirrored from the meta table so agents know staleness. */
 	TSharedRef<FJsonObject> IndexNote(FSQLiteDatabase& Db)
 	{
 		TSharedRef<FJsonObject> Note = MakeShared<FJsonObject>();
-		auto Meta = [&Db](const TCHAR* Key) -> FString
-		{
-			FSQLitePreparedStatement Stmt = Db.PrepareStatement(TEXT("SELECT value FROM meta WHERE key = ?"));
-			if (!Stmt.IsValid()) { return FString(); }
-			Stmt.SetBindingValueByIndex(1, FString(Key));
-			FString V;
-			if (Stmt.Step() == ESQLitePreparedStatementStepResult::Row) { Stmt.GetColumnValueByName(TEXT("value"), V); }
-			return V;
-		};
-		Note->SetField(TEXT("lastIngestAtIso"), NullOrString(Meta(TEXT("lastIngestAtIso"))));
-		Note->SetField(TEXT("lastGeneratedAtIso"), NullOrString(Meta(TEXT("lastGeneratedAtIso"))));
-		Note->SetField(TEXT("projectName"), NullOrString(Meta(TEXT("projectName"))));
+		Note->SetField(TEXT("lastIngestAtIso"), NullOrString(MetaValue(Db, TEXT("lastIngestAtIso"))));
+		Note->SetField(TEXT("lastGeneratedAtIso"), NullOrString(MetaValue(Db, TEXT("lastGeneratedAtIso"))));
+		Note->SetField(TEXT("projectName"), NullOrString(MetaValue(Db, TEXT("projectName"))));
 		return Note;
 	}
 
@@ -180,6 +178,177 @@ namespace
 		}
 		return nullptr;
 	}
+
+	bool EntityExists(FSQLiteDatabase& Db, const FString& Id)
+	{
+		FSQLitePreparedStatement Stmt = Db.PrepareStatement(TEXT("SELECT 1 FROM entities WHERE id = ?"));
+		if (!Stmt.IsValid()) { return false; }
+		Stmt.SetBindingValueByIndex(1, Id);
+		return Stmt.Step() == ESQLitePreparedStatementStepResult::Row;
+	}
+
+	struct FRawEdge { FString Src; FString Dst; FString Type; };
+
+	/** Raw edges for traversal (src/dst/type only). bOutgoing => WHERE src=Id, else WHERE dst=Id. */
+	TArray<FRawEdge> ReadRawEdges(FSQLiteDatabase& Db, const FString& Id, bool bOutgoing)
+	{
+		TArray<FRawEdge> Out;
+		const TCHAR* Sql = bOutgoing
+			? TEXT("SELECT src, dst, type FROM edges WHERE src = ?")
+			: TEXT("SELECT src, dst, type FROM edges WHERE dst = ?");
+		FSQLitePreparedStatement Stmt = Db.PrepareStatement(Sql);
+		if (!Stmt.IsValid()) { return Out; }
+		Stmt.SetBindingValueByIndex(1, Id);
+		while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+		{
+			Out.Add(FRawEdge{ ColStr(Stmt, TEXT("src")), ColStr(Stmt, TEXT("dst")), ColStr(Stmt, TEXT("type")) });
+		}
+		return Out;
+	}
+
+	/** Severity per edge type (mirror of query.ts SEVERITY): heavier = worse to break. */
+	int32 EdgeSeverity(const FString& Type)
+	{
+		static const TMap<FString, int32> Severity = {
+			{ TEXT("inherits"), 10 }, { TEXT("implements"), 9 }, { TEXT("calls"), 8 },
+			{ TEXT("uses-skeleton"), 8 }, { TEXT("uses-material"), 7 }, { TEXT("uses-texture"), 5 },
+			{ TEXT("overrides-parameter"), 6 }, { TEXT("casts-to"), 6 }, { TEXT("placed-in-level"), 5 },
+			{ TEXT("plays-on"), 4 }, { TEXT("depends-on"), 4 }, { TEXT("references"), 3 },
+			{ TEXT("describes"), 2 }, { TEXT("constrains"), 2 },
+		};
+		const int32* Found = Severity.Find(Type);
+		return Found ? *Found : 1;
+	}
+
+	// ---- structured builders (shared so `explain` can reuse search + references) --------------
+
+	struct FSearchHit { TSharedRef<FJsonObject> Entity; double Score; FString Snippet; FString ChunkKind; };
+
+	TArray<FSearchHit> BuildSearchHits(FSQLiteDatabase& Db, const FString& Query, const FString& Kind, int32 Limit)
+	{
+		TArray<FSearchHit> Ordered;
+		const FString Fts = BuildFtsQuery(Query);
+		if (Fts.IsEmpty()) { return Ordered; }
+
+		FSQLitePreparedStatement Stmt = Db.PrepareStatement(
+			TEXT("SELECT f.chunk_id AS chunkId, f.entity_id AS entityId, c.kind AS kind, "
+			     "bm25(chunks_fts) AS score, snippet(chunks_fts, 3, '[', ']', ' \xE2\x80\xA6 ', 12) AS snippet "
+			     "FROM chunks_fts f JOIN chunks c ON c.id = f.chunk_id "
+			     "WHERE chunks_fts MATCH ? ORDER BY score LIMIT ?"));
+		if (!Stmt.IsValid()) { return Ordered; }
+		Stmt.SetBindingValueByIndex(1, Fts);
+		Stmt.SetBindingValueByIndex(2, Limit * 5); // over-fetch so dedupe/kind-filter still fills the page
+
+		TMap<FString, int32> IndexByEntity; // entityId -> position in Ordered
+		while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+		{
+			const FString EntityId = ColStr(Stmt, TEXT("entityId"));
+			double Score = 0.0;
+			Stmt.GetColumnValueByName(TEXT("score"), Score);
+
+			if (const int32* Pos = IndexByEntity.Find(EntityId))
+			{
+				if (Ordered[*Pos].Score <= Score) { continue; } // keep best (lowest) bm25
+			}
+			TSharedPtr<FJsonObject> Entity = LoadEntity(Db, EntityId);
+			if (!Entity.IsValid()) { continue; }
+			if (!Kind.IsEmpty() && Entity->GetStringField(TEXT("kind")) != Kind) { continue; }
+
+			FSearchHit Hit{ Entity.ToSharedRef(), Score, ColStr(Stmt, TEXT("snippet")), ColStr(Stmt, TEXT("kind")) };
+			if (const int32* Pos = IndexByEntity.Find(EntityId)) { Ordered[*Pos] = Hit; }
+			else { IndexByEntity.Add(EntityId, Ordered.Num()); Ordered.Add(Hit); }
+		}
+
+		Ordered.Sort([](const FSearchHit& A, const FSearchHit& B) { return A.Score < B.Score; });
+		if (Ordered.Num() > Limit) { Ordered.SetNum(Limit); }
+		return Ordered;
+	}
+
+	TSharedRef<FJsonObject> SearchHitJson(const FSearchHit& H)
+	{
+		TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+		R->SetObjectField(TEXT("entity"), H.Entity);
+		R->SetNumberField(TEXT("score"), H.Score);
+		R->SetStringField(TEXT("snippet"), H.Snippet);
+		R->SetStringField(TEXT("matchedChunkKind"), H.ChunkKind);
+		return R;
+	}
+
+	struct FRefRow { TSharedRef<FJsonObject> Entity; FString ViaType; int32 Depth; FString Direction; };
+
+	TArray<FRefRow> BuildReferences(FSQLiteDatabase& Db, const FString& Id, const FString& Direction,
+		int32 Depth, const FString& EdgeType, const FString& Kind, int32 Limit)
+	{
+		TArray<FRefRow> Results;
+		if (!EntityExists(Db, Id)) { return Results; }
+
+		TArray<FString> Dirs;
+		if (Direction == TEXT("both")) { Dirs = { TEXT("in"), TEXT("out") }; }
+		else { Dirs = { Direction.IsEmpty() ? TEXT("both") : Direction }; }
+
+		TSet<FString> Seen;
+		Seen.Add(Id);
+		for (const FString& Dir : Dirs)
+		{
+			const bool bOut = Dir == TEXT("out");
+			TArray<FString> Frontier = { Id };
+			for (int32 D = 1; D <= Depth; ++D)
+			{
+				TArray<FString> Next;
+				for (const FString& Node : Frontier)
+				{
+					for (const FRawEdge& E : ReadRawEdges(Db, Node, bOut))
+					{
+						if (!EdgeType.IsEmpty() && E.Type != EdgeType) { continue; }
+						const FString Other = bOut ? E.Dst : E.Src;
+						if (Seen.Contains(Other)) { continue; }
+						Seen.Add(Other);
+						TSharedPtr<FJsonObject> Entity = LoadEntity(Db, Other);
+						if (!Entity.IsValid()) { continue; } // edge to an unextracted entity
+						Next.Add(Other); // still traverse through it even if filtered from results
+						if (!Kind.IsEmpty() && Entity->GetStringField(TEXT("kind")) != Kind) { continue; }
+						Results.Add(FRefRow{ Entity.ToSharedRef(), E.Type, D, Dir });
+						if (Results.Num() >= Limit) { return Results; }
+					}
+				}
+				Frontier = MoveTemp(Next);
+				if (Frontier.Num() == 0) { break; }
+			}
+		}
+		return Results;
+	}
+
+	TSharedRef<FJsonObject> RefRowJson(const FRefRow& R)
+	{
+		TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+		O->SetObjectField(TEXT("entity"), R.Entity);
+		O->SetStringField(TEXT("viaType"), R.ViaType);
+		O->SetNumberField(TEXT("depth"), R.Depth);
+		O->SetStringField(TEXT("direction"), R.Direction);
+		return O;
+	}
+
+	/** Rows of a simple SELECT as an array of objects with the given string columns. */
+	TArray<TSharedPtr<FJsonValue>> SelectRows(FSQLiteDatabase& Db, const TCHAR* Sql,
+		const TArray<FString>& StringCols, const TArray<FString>& IntCols)
+	{
+		TArray<TSharedPtr<FJsonValue>> Rows;
+		FSQLitePreparedStatement Stmt = Db.PrepareStatement(Sql);
+		if (!Stmt.IsValid()) { return Rows; }
+		while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+		{
+			TSharedRef<FJsonObject> Row = MakeShared<FJsonObject>();
+			for (const FString& C : StringCols) { Row->SetStringField(C, ColStr(Stmt, *C)); }
+			for (const FString& C : IntCols)
+			{
+				int32 N = 0;
+				Stmt.GetColumnValueByName(*C, N);
+				Row->SetNumberField(C, N);
+			}
+			Rows.Add(MakeShared<FJsonValueObject>(Row));
+		}
+		return Rows;
+	}
 }
 
 FString GameIQQuery::Search(const FString& Query, const FString& Kind, int32 Limit)
@@ -189,63 +358,11 @@ FString GameIQQuery::Search(const FString& Query, const FString& Kind, int32 Lim
 	if (!OpenIndex(Db, OpenErr)) { return ErrorJson(OpenErr); }
 	ON_SCOPE_EXIT { Db.Close(); }; // FSQLiteDatabase asserts if destroyed while open
 
-	const FString Fts = BuildFtsQuery(Query);
 	TArray<TSharedPtr<FJsonValue>> Results;
-	if (!Fts.IsEmpty())
+	for (const FSearchHit& H : BuildSearchHits(Db, Query, Kind, Limit))
 	{
-		// Best hit per entity, ranked by bm25 (lower is better) — mirrors QueryEngine.searchProject.
-		FSQLitePreparedStatement Stmt = Db.PrepareStatement(
-			TEXT("SELECT f.chunk_id AS chunkId, f.entity_id AS entityId, c.kind AS kind, "
-			     "bm25(chunks_fts) AS score, snippet(chunks_fts, 3, '[', ']', ' \xE2\x80\xA6 ', 12) AS snippet "
-			     "FROM chunks_fts f JOIN chunks c ON c.id = f.chunk_id "
-			     "WHERE chunks_fts MATCH ? ORDER BY score LIMIT ?"));
-		if (Stmt.IsValid())
-		{
-			Stmt.SetBindingValueByIndex(1, Fts);
-			Stmt.SetBindingValueByIndex(2, Limit * 5); // over-fetch so dedupe/kind-filter still fills the page
-
-			struct FHit { TSharedRef<FJsonObject> Entity; double Score; FString Snippet; FString ChunkKind; };
-			TMap<FString, FHit> BestByEntity;
-			TArray<FString> Order;
-
-			while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
-			{
-				const FString EntityId = ColStr(Stmt, TEXT("entityId"));
-				double Score = 0.0;
-				Stmt.GetColumnValueByName(TEXT("score"), Score);
-				const FString Snippet = ColStr(Stmt, TEXT("snippet"));
-				const FString ChunkKind = ColStr(Stmt, TEXT("kind"));
-
-				const FHit* Existing = BestByEntity.Find(EntityId);
-				if (Existing && Existing->Score <= Score) { continue; }
-
-				TSharedPtr<FJsonObject> Entity = LoadEntity(Db, EntityId);
-				if (!Entity.IsValid()) { continue; }
-				if (!Kind.IsEmpty() && Entity->GetStringField(TEXT("kind")) != Kind) { continue; }
-
-				if (!Existing) { Order.Add(EntityId); }
-				BestByEntity.Add(EntityId, FHit{ Entity.ToSharedRef(), Score, Snippet, ChunkKind });
-			}
-
-			Order.Sort([&BestByEntity](const FString& A, const FString& B)
-			{
-				return BestByEntity[A].Score < BestByEntity[B].Score;
-			});
-
-			for (const FString& EntityId : Order)
-			{
-				if (Results.Num() >= Limit) { break; }
-				const FHit& H = BestByEntity[EntityId];
-				TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
-				R->SetObjectField(TEXT("entity"), H.Entity);
-				R->SetNumberField(TEXT("score"), H.Score);
-				R->SetStringField(TEXT("snippet"), H.Snippet);
-				R->SetStringField(TEXT("matchedChunkKind"), H.ChunkKind);
-				Results.Add(MakeShared<FJsonValueObject>(R));
-			}
-		}
+		Results.Add(MakeShared<FJsonValueObject>(SearchHitJson(H)));
 	}
-
 	return Envelope(Db, MakeShared<FJsonValueArray>(Results));
 }
 
@@ -283,7 +400,7 @@ FString GameIQQuery::GetEntity(const FString& Id, int32 Cap)
 		}
 	}
 
-	// edges (capped) — helper to read src/dst/type/attrs for a bound column
+	// edges (capped) — full detail incl. attrs
 	auto ReadEdges = [&Db, &Id, Cap](const TCHAR* Sql) -> TArray<TSharedPtr<FJsonValue>>
 	{
 		TArray<TSharedPtr<FJsonValue>> Out;
@@ -344,4 +461,172 @@ FString GameIQQuery::GetEntity(const FString& Id, int32 Cap)
 		OutCount > Cap || InCount > Cap || ChildCount > Cap || ChunkCount > Cap);
 
 	return Envelope(Db, MakeShared<FJsonValueObject>(Detail));
+}
+
+FString GameIQQuery::References(const FString& Id, const FString& Direction, int32 Depth,
+	const FString& EdgeType, const FString& Kind, int32 Limit)
+{
+	FSQLiteDatabase Db;
+	FString OpenErr;
+	if (!OpenIndex(Db, OpenErr)) { return ErrorJson(OpenErr); }
+	ON_SCOPE_EXIT { Db.Close(); };
+
+	TArray<TSharedPtr<FJsonValue>> Results;
+	for (const FRefRow& R : BuildReferences(Db, Id, Direction, Depth <= 0 ? 1 : Depth, EdgeType, Kind, Limit <= 0 ? 200 : Limit))
+	{
+		Results.Add(MakeShared<FJsonValueObject>(RefRowJson(R)));
+	}
+	return Envelope(Db, MakeShared<FJsonValueArray>(Results));
+}
+
+FString GameIQQuery::Impact(const FString& Id, int32 MaxDepth)
+{
+	FSQLiteDatabase Db;
+	FString OpenErr;
+	if (!OpenIndex(Db, OpenErr)) { return ErrorJson(OpenErr); }
+	ON_SCOPE_EXIT { Db.Close(); };
+
+	TArray<TSharedPtr<FJsonValue>> Results;
+	if (EntityExists(Db, Id))
+	{
+		struct FImpact { TSharedRef<FJsonObject> Entity; FString ViaType; int32 Depth; double Severity; };
+		TMap<FString, FImpact> Best;
+		TArray<FString> Order;
+		TSet<FString> Seen;
+		Seen.Add(Id);
+		TArray<FString> Frontier = { Id };
+		const int32 Cap = MaxDepth <= 0 ? 4 : MaxDepth;
+		for (int32 D = 1; D <= Cap; ++D)
+		{
+			TArray<FString> Next;
+			for (const FString& Node : Frontier)
+			{
+				for (const FRawEdge& E : ReadRawEdges(Db, Node, /*bOutgoing=*/false))
+				{
+					const FString Dependent = E.Src;
+					if (Seen.Contains(Dependent)) { continue; }
+					Seen.Add(Dependent);
+					TSharedPtr<FJsonObject> Entity = LoadEntity(Db, Dependent);
+					if (!Entity.IsValid()) { continue; }
+					const double Severity = static_cast<double>(EdgeSeverity(E.Type)) / D; // closer + heavier = higher
+					if (!Best.Contains(Dependent)) { Order.Add(Dependent); }
+					Best.Add(Dependent, FImpact{ Entity.ToSharedRef(), E.Type, D, Severity });
+					Next.Add(Dependent);
+				}
+			}
+			Frontier = MoveTemp(Next);
+			if (Frontier.Num() == 0) { break; }
+		}
+		Order.Sort([&Best](const FString& A, const FString& B) { return Best[A].Severity > Best[B].Severity; });
+		for (const FString& Key : Order)
+		{
+			const FImpact& I = Best[Key];
+			TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+			O->SetObjectField(TEXT("entity"), I.Entity);
+			O->SetStringField(TEXT("viaType"), I.ViaType);
+			O->SetNumberField(TEXT("depth"), I.Depth);
+			O->SetNumberField(TEXT("severity"), I.Severity);
+			Results.Add(MakeShared<FJsonValueObject>(O));
+		}
+	}
+	return Envelope(Db, MakeShared<FJsonValueArray>(Results));
+}
+
+FString GameIQQuery::Explain(const FString& Topic, int32 Limit)
+{
+	FSQLiteDatabase Db;
+	FString OpenErr;
+	if (!OpenIndex(Db, OpenErr)) { return ErrorJson(OpenErr); }
+	ON_SCOPE_EXIT { Db.Close(); };
+
+	const int32 Seeds = Limit <= 0 ? 8 : Limit;
+	TArray<FSearchHit> Hits = BuildSearchHits(Db, Topic, FString(), Seeds);
+
+	TArray<TSharedPtr<FJsonValue>> SeedJson;
+	TSet<FString> SeedIds;
+	for (const FSearchHit& H : Hits)
+	{
+		SeedJson.Add(MakeShared<FJsonValueObject>(SearchHitJson(H)));
+		SeedIds.Add(H.Entity->GetStringField(TEXT("id")));
+	}
+
+	TArray<TSharedPtr<FJsonValue>> Related;
+	TSet<FString> RelatedSeen = SeedIds;
+	for (const FSearchHit& H : Hits)
+	{
+		const FString SeedId = H.Entity->GetStringField(TEXT("id"));
+		for (const FRefRow& R : BuildReferences(Db, SeedId, TEXT("both"), 1, FString(), FString(), 200))
+		{
+			const FString Rid = R.Entity->GetStringField(TEXT("id"));
+			if (RelatedSeen.Contains(Rid)) { continue; }
+			RelatedSeen.Add(Rid);
+			Related.Add(MakeShared<FJsonValueObject>(RefRowJson(R)));
+		}
+	}
+
+	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetStringField(TEXT("topic"), Topic);
+	Payload->SetArrayField(TEXT("seeds"), SeedJson);
+	Payload->SetArrayField(TEXT("related"), Related);
+	return Envelope(Db, MakeShared<FJsonValueObject>(Payload));
+}
+
+FString GameIQQuery::ProjectStats(const FString& Facet)
+{
+	FSQLiteDatabase Db;
+	FString OpenErr;
+	if (!OpenIndex(Db, OpenErr)) { return ErrorJson(OpenErr); }
+	ON_SCOPE_EXIT { Db.Close(); };
+
+	const FString F = Facet.IsEmpty() ? TEXT("overview") : Facet;
+
+	if (F == TEXT("kinds"))
+	{
+		return Envelope(Db, MakeShared<FJsonValueArray>(SelectRows(Db,
+			TEXT("SELECT kind, COUNT(*) AS count FROM entities GROUP BY kind ORDER BY count DESC"),
+			{ TEXT("kind") }, { TEXT("count") })));
+	}
+	if (F == TEXT("edges"))
+	{
+		return Envelope(Db, MakeShared<FJsonValueArray>(SelectRows(Db,
+			TEXT("SELECT type, COUNT(*) AS count FROM edges GROUP BY type ORDER BY count DESC"),
+			{ TEXT("type") }, { TEXT("count") })));
+	}
+	if (F == TEXT("unused"))
+	{
+		return Envelope(Db, MakeShared<FJsonValueArray>(SelectRows(Db,
+			TEXT("SELECT e.id AS id, e.kind AS kind, e.name AS name, e.path AS path FROM entities e "
+			     "WHERE e.kind IN ('asset','blueprint') "
+			     "AND NOT EXISTS (SELECT 1 FROM edges x WHERE x.dst = e.id) LIMIT 500"),
+			{ TEXT("id"), TEXT("kind"), TEXT("name"), TEXT("path") }, {})));
+	}
+	if (F == TEXT("largest-deps"))
+	{
+		return Envelope(Db, MakeShared<FJsonValueArray>(SelectRows(Db,
+			TEXT("SELECT e.id AS id, e.name AS name, e.kind AS kind, COUNT(x.dst) AS outDeps "
+			     "FROM entities e JOIN edges x ON x.src = e.id GROUP BY e.id ORDER BY outDeps DESC LIMIT 50"),
+			{ TEXT("id"), TEXT("name"), TEXT("kind") }, { TEXT("outDeps") })));
+	}
+
+	// overview (default)
+	int32 Total = 0;
+	{
+		FSQLitePreparedStatement Stmt = Db.PrepareStatement(TEXT("SELECT COUNT(*) AS n FROM entities"));
+		if (Stmt.IsValid() && Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+		{
+			Stmt.GetColumnValueByName(TEXT("n"), Total);
+		}
+	}
+	TSharedRef<FJsonObject> Overview = MakeShared<FJsonObject>();
+	Overview->SetNumberField(TEXT("totalEntities"), Total);
+	Overview->SetArrayField(TEXT("byKind"), SelectRows(Db,
+		TEXT("SELECT kind, COUNT(*) AS count FROM entities GROUP BY kind ORDER BY count DESC"),
+		{ TEXT("kind") }, { TEXT("count") }));
+	Overview->SetArrayField(TEXT("byEdgeType"), SelectRows(Db,
+		TEXT("SELECT type, COUNT(*) AS count FROM edges GROUP BY type ORDER BY count DESC"),
+		{ TEXT("type") }, { TEXT("count") }));
+	Overview->SetField(TEXT("projectName"), NullOrString(MetaValue(Db, TEXT("projectName"))));
+	Overview->SetField(TEXT("lastIngestAtIso"), NullOrString(MetaValue(Db, TEXT("lastIngestAtIso"))));
+	Overview->SetField(TEXT("lastGeneratedAtIso"), NullOrString(MetaValue(Db, TEXT("lastGeneratedAtIso"))));
+	return Envelope(Db, MakeShared<FJsonValueObject>(Overview));
 }

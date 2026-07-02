@@ -18,4 +18,18 @@ namespace GameIQQuery
 
 	/** Full detail for one entity id (entity + edges + children + chunks, arrays capped). */
 	FString GetEntity(const FString& Id, int32 Cap = 50);
+
+	/** BFS over the edge graph from `Id` up to `Depth` hops; optional edge-type / kind filters.
+	 *  Direction is "in" | "out" | "both". */
+	FString References(const FString& Id, const FString& Direction, int32 Depth = 1,
+		const FString& EdgeType = TEXT(""), const FString& Kind = TEXT(""), int32 Limit = 200);
+
+	/** "What could break if this changes" — transitive inbound refs ranked by edge severity. */
+	FString Impact(const FString& Id, int32 MaxDepth = 4);
+
+	/** Assembled bundle for a topic: top search hits + their immediate neighborhood. */
+	FString Explain(const FString& Topic, int32 Limit = 8);
+
+	/** Project-wide stats. Facet: "overview" | "kinds" | "edges" | "unused" | "largest-deps". */
+	FString ProjectStats(const FString& Facet);
 }

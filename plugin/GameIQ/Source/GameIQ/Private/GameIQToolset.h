@@ -32,4 +32,26 @@ public:
 	 *  with arrays capped and full counts reported. Returns a JSON string. */
 	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "GameIQ")
 	static FString GetEntity(const FString& Id);
+
+	/** Graph walk from an entity: who uses it / what it uses. `Direction` is "in", "out", or "both".
+	 *  `EdgeType` optionally restricts to one edge (e.g. "uses-skeleton", "calls"); `Kind` filters
+	 *  results to one entity kind. Returns a JSON string. */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "GameIQ")
+	static FString References(const FString& Id, const FString& Direction = TEXT("both"), int32 Depth = 1,
+		const FString& EdgeType = TEXT(""), const FString& Kind = TEXT(""));
+
+	/** "What could break if this changes" — transitive inbound dependents ranked by severity.
+	 *  Returns a JSON string. */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "GameIQ")
+	static FString Impact(const FString& Id);
+
+	/** Assemble a context bundle for a topic/system: top search hits plus their immediate graph
+	 *  neighborhood. Returns a JSON string. */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "GameIQ")
+	static FString Explain(const FString& Topic);
+
+	/** Project-wide stats. `Facet` is "overview", "kinds", "edges", "unused", or "largest-deps".
+	 *  Returns a JSON string. */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "GameIQ")
+	static FString ProjectStats(const FString& Facet = TEXT("overview"));
 };
