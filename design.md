@@ -92,10 +92,11 @@ Initial recipe set, covering the asset classes that dominate real questions:
 | Anim Blueprint | target skeleton, anim graph structure | state machines + transition rules as text |
 | Behavior Tree / Blackboard | composites, decorators, services, tasks, blackboard keys | tree as indented text |
 | Niagara System / Emitter | emitters, modules, exposed parameters | module stack summary |
-| Level / World | actor inventory (class, name, transform), per-actor property overrides, sublevels/data layers | — |
-| DataTable / CurveTable | row struct + full row data | — |
-| Sound Cue / MetaSound | graph nodes, wave refs, attenuation | graph summary |
-| Physics Asset, Input assets, GameplayTags, DataAssets | typed property summaries | — |
+| Level / World | actor inventory (label, class, transform); per-actor detail — lights: intensity/color/mobility, static-mesh actors: mesh; per-class counts; each actor a searchable chunk | — |
+| Input Mapping Context / Input Action | key→action mappings (`IA_Jump ← SpaceBar…`), action value types, `references`(via `maps`) edges | — |
+| DataTable / CurveTable | row struct + row count *(full row data: planned)* | — |
+| Sound Cue / MetaSound | *(generic reflection fallback today)* | graph summary *(planned)* |
+| Physics Asset, GameplayTags, DataAssets, everything else | typed **property bag via reflection fallback** (`ExportTextItem` over every UPROPERTY) + object-ref edges | — |
 
 **Reflection export is the foundation, not a fallback — no asset is invisible.** UE serializes any loaded UObject's `UPROPERTY`s to structured text with *zero per-type code* — via `FJsonObjectConverter` (UStruct→JSON), the lower-level `FProperty::ExportTextItem`, or the generic `ObjectExporterT3D`; for Levels/Actors, `LevelExporterT3D`/`ActorExporterT3D` (the editor's own copy/paste format) yield the actor inventory and per-asset overrides directly. This property-bag export runs for *every* asset class — plugin types, marketplace systems, new engine features — guaranteeing 100% coverage. A Tier 1 recipe is then a thin **curation** pass over that free baseline (pick the ~10 fields that matter, name the semantic edges), plus a small garnish of **computed** values that aren't stored as properties (tri counts, LOD screen sizes, texture dimensions, on-disk size — small accessor calls). Recipes are versioned and pluggable so users/plugins can register their own for custom asset types. *(All of this needs the UObject loaded — i.e. the commandlet/in-editor path; it does nothing for the editor-less path, which still relies on raw file parsing — see §11.)*
 
@@ -104,7 +105,7 @@ Alongside the asset framework, two non-asset extractors:
 - **C++ extractor.** Parses `Source/` for the reflection surface (UCLASS / USTRUCT / UFUNCTION / UPROPERTY / delegates) plus class hierarchy and file locations. MVP uses a lightweight header parse (the reflection macros make UE headers unusually regular); a clangd-index backend can come later for call graphs. Cross-links everywhere: a BP node calling a `UFUNCTION`, a mesh referencing a C++ component class, a DataTable using a USTRUCT row type — all become edges.
 - **Config/project extractor.** `.ini` files, `.uproject`/`.uplugin`, enabled plugins, maps list, input actions, GameplayTags. Small, but answers a disproportionate number of real questions.
 
-**Editor-optional is a core principle.** Tier 0, the C++ extractor, and config parsing run with no editor. Tier 1/2 recipes need editor machinery; we ship them as (a) a commandlet you can run headless (`-run=GameIQExport`), and (b) a live in-editor plugin/Python bridge for instant freshness while you work. A project that has never opened the editor on this machine still gets a useful (if shallower) index, with a file-parsing fallback tier (UAssetAPI-style, §11) as a later option.
+**Editor-optional is a core principle** — with a boundary the implementation makes precise. Truly editor-less today: the **C++ header parse** and **config/`.ini`/`.uproject` parse** (pure TypeScript, no UE). Everything that reads a binary `.uasset` — including Tier 0's Asset Registry graph — currently runs through the UE binary as a **headless commandlet** (no interactive editor, but not UE-free). As shipped there are **three commandlets**: `GameIQExport` (Tier 0 registry graph), `GameIQAssets` (Tier 1 typed recipes + level actor inventory), and `GameIQBlueprints` (Tier 2 pseudocode + variables/components/interfaces). The design's *editor-less* Tier 0 (parsing the on-disk Asset Registry / `.uasset` files without UE, UAssetAPI-style, §11) is a deferred fallback tier — until it lands, a machine that has never built the project gets only the C++/config layers. The live in-editor bridge (instant freshness, unsaved state) remains planned.
 
 ### 5.2 Knowledge base
 
@@ -115,7 +116,9 @@ Data model — deliberately boring:
 - **`entities`** — one row per thing: any asset (mesh, material, texture, skeleton, level…), Blueprint, BP function/variable, material parameter, socket, level actor, C++ class/function/property, config section, plugin, **design-doc section**. Columns: id, kind, name, path, parent, **`source` (code / asset / config / doc — fact vs. intent)**, summary, raw JSON detail (the recipe output).
 - **`edges`** — typed relations: generic `references`/`depends-on` from the registry, plus semantic types from recipes: `inherits`, `calls`, `implements`, `uses-material`, `uses-texture`, `uses-skeleton`, `overrides-parameter`, `placed-in-level`, `plays-on`, `casts-to`. Typed edges are what turn "what references X" into "which *meshes* use this *skeleton*."
 - **`chunks`** — text units for retrieval (BP pseudocode per function, recipe summaries per asset, C++ signatures + doc comments, config blocks, ingested design-doc sections) with **FTS5** full-text index and an **embedding vector** (small local model by default; pluggable).
-- **`snapshots`** — index state per VCS revision (or timestamp), so "what changed since X" is a diff of two snapshots, with binary `.uasset` changes rendered as *semantic* diffs ("`BP_Enemy`: function `TakeDamage` modified — 3 nodes added; variable `Armor` default 50 → 75").
+- **`snapshots`** — index state per VCS revision (or timestamp), so "what changed since X" is a diff of two snapshots, with binary `.uasset` changes rendered as *semantic* diffs ("`BP_Enemy`: function `TakeDamage` modified — 3 nodes added; variable `Armor` default 50 → 75"). *(planned)*
+
+**Producer-scoped ingest.** Every entity/edge/chunk is tagged with the `producer` that emitted it (`gameiq-cpp`, `gameiq-ue-registry`, `gameiq-ue-assets`, `gameiq-ue-bp`, `gameiq-config`, …). Re-ingesting a producer replaces only *its own* rows, so producers compose without ordering assumptions or cross-clobbering — e.g. the registry owns a Blueprint's entity while the blueprints producer adds a structure chunk to it, and either can re-run independently. This is what makes the multi-producer, incrementally-refreshed model safe.
 
 ### 5.3 Query engine
 
@@ -144,23 +147,26 @@ Two rules hold across both phases:
 
 Connectors are pluggable in the same spirit as recipes (§5.1): start with local markdown + Google Drive, add Notion/Confluence as demand shows. **v0.3+** — the chunk model already accommodates Phase 1; Phase 2 reuses the existing entity/edge machinery once the core technical index is proven.
 
+### 5.5 Scoping the index (config)
+
+"Knows *your* game" means the index shouldn't be dominated by third-party plugin internals. By default the editor-less walk sweeps the whole tree, so a project-root **`gameiq.config.json`** (committed) lists directories to exclude — matched by name (`VibeUE`) or project-relative path (`Plugins/VibeUE`); Game IQ's own plugin is always excluded. Same list is editable in the editor under **Project Settings → Plugins → Game IQ** (`UGameIQSettings`), which writes the JSON; `gameiq index --exclude <dir…>` overrides ad hoc. (On ThirdPerson58, excluding `Plugins/VibeUE` dropped ~2,400 vendored-plugin C++ entities from the index.)
+
 ## 6. Surfaces
 
 ### 6.1 MCP server (the product's center of gravity)
 
-`gameiq mcp` (stdio, local; same shape as the rest of the ecosystem). Proposed v1 tool surface:
+`gameiq mcp` (stdio, local; same shape as the rest of the ecosystem). Following the UE Skills MCP v2 consolidation — **few tools, rich parameters** — this shipped as **one `game_iq` multi-action tool** (matching `unreal-engine-skills-manager`), keeping the tool count at one in agent contexts. Actions:
 
-| Tool | What it does |
+| Action | What it does |
 |---|---|
-| `search_project(query, kind?)` | Hybrid search across everything; returns ranked entities with summaries. |
-| `get_entity(id)` | Full detail: BP pseudocode, C++ signature + location, asset metadata. |
-| `references(id, direction, depth?)` | Who uses this / what does this use. |
-| `impact(id)` | Transitive "what could break if I change or delete this," ranked by edge type. |
-| `explain(topic)` | Retrieval bundle for a system ("damage", "inventory"): the relevant entities, their edges, and pseudocode — pre-assembled context for the agent to reason over. |
-| `changes(since)` | Semantic digest of project changes since a revision/date. |
-| `project_stats(facet)` | Counts, sizes, unused-asset candidates, largest dependencies — the hygiene queries. |
+| `search(query, kind?)` | Hybrid search (FTS5 today) across all chunks; ranked entities with a snippet. |
+| `get_entity(id)` | Full detail: summary, chunks (BP pseudocode / recipe), edges, and child entities. **Bounded** — arrays capped with full `counts` + a `truncated` flag so a level with hundreds of actors stays usable. |
+| `references(id, direction, depth?, edgeType?, kind?)` | Who uses this / what it uses. `edgeType` filters the relation (`uses-skeleton`, `placed-in-level`, …); `kind` filters the result entity kind. |
+| `impact(id)` | Transitive "what could break if I change or delete this," severity-ranked by edge type. |
+| `explain(topic)` | Retrieval bundle for a system: seed hits + immediate neighborhood, pre-assembled context. |
+| `project_stats(facet)` | Counts, unused-asset candidates, largest dependencies — the hygiene queries. |
 
-Design rule learned from the UE Skills MCP v2 consolidation: **few tools, rich parameters** — possibly literally one `game-iq` multi-action tool, matching the `unreal-engine-skills-manager` pattern, so the tool count stays low in agent contexts.
+Every response carries an index-age stamp (design §8). `changes(since)` (semantic diff) is **planned** — pending snapshots (§5.2). The server is stdio and spawned on demand by the MCP client (`claude mcp add <name> -- node …/cli mcp --project <dir>`); user-scoped registrations should use an absolute `--project` path.
 
 ### 6.2 CLI
 
@@ -236,7 +242,7 @@ Non-negotiable for adoption: **the index never leaves the developer's machine by
 Game IQ is **a standalone Node/TypeScript app, not a UE plugin** — the plugin is one (deepest) extraction backend, not the product. The core installs once via `npx gameiq` and runs across many projects, writing each project's index to its `.gameiq/`. It never opens Unreal for the editor-less tiers; it invokes the commandlet / talks to the in-editor bridge only for deep binary extraction.
 
 - **Core / CLI / MCP:** TypeScript on Node — matches the team's existing MCP servers and tooling, mature MCP SDK, easy distribution (`npx gameiq`). Performance-critical parsing can drop to a native module later if profiling demands it.
-- **Extractors in UE:** UE Python + a small C++ plugin/commandlet (shares VibeUE's proven editor-bridge patterns, but ships as its own plugin — Game IQ is not bundled with VibeUE).
+- **Extractors in UE:** a small **all-C++** editor plugin exposing three commandlets (`GameIQExport`/`GameIQAssets`/`GameIQBlueprints`); ships as its own plugin (not bundled with VibeUE, though it shares the bridge patterns). Module deps are deliberately minimal (`AssetRegistry`, `Json`, `EnhancedInput`, `DeveloperSettings`, and editor modules for Tier 2). *(An earlier Python Tier 1 extractor was removed — the C++ `GameIQAssets` superseded it. Python remains a candidate for the future live in-editor bridge and user-pluggable recipes, not for batch extraction.)*
 - **Store:** SQLite (better-sqlite3) + FTS5; sqlite-vec for vectors. Turso/libSQL enters only for the future team-sync tier — same stack already used for vibeue usage data.
 - **Licensing/business (placeholder):** free core for indie/solo, paid team tier (sync, CI, dashboard). Decide before public beta.
 
@@ -250,7 +256,8 @@ unreal-game-iq/
     core/        # TS: CLI, MCP server, query engine, SQLite  → publishes to npm
     shared/      # the entity/edge/export schema both sides import
   plugin/
-    GameIQ/      # contents == <Game>/Plugins/GameIQ/ ; .uplugin + Source/ + Content/Python/
+    GameIQ/      # contents == <Game>/Plugins/GameIQ/ ; .uplugin + Source/ (all C++)
+  scripts/       # deploy.ps1 — copy plugin → build → extract → index for a target project
   design.md
 ```
 
@@ -284,7 +291,24 @@ Techniques and libraries worth studying or reusing:
 9. **Design-doc ingestion (§5.4):** Phase 1 just makes doc sections retrievable and lets the agent connect intent to implementation — the open question is whether agent-side connecting is *good enough* in practice, or whether the explicit doc→code edges of Phase 2 are needed sooner than expected. The hard Phase 2 problem is *how* to link a prose section to the right entities (heading/naming heuristics vs. LLM-assisted matching). Which connectors first (local markdown + Drive likely)?
 10. **Plugin delivery — source vs. precompiled (§10.1):** a source plugin needs the game to be a C++ project and compiles per engine version (5.7 vs 5.8…); precompiled binaries avoid that but mean maintaining a per-version build matrix (and a Fab/marketplace listing). Decide before beta — it gates BP-only projects.
 11. **EDA / Toolset Registry investment (§6.5):** how much to build against an Experimental, `NoRedist` 5.8 API while it churns — ship the thin adapter early for the dock-context win, or wait until it stabilizes?
+12. **World Partition level actors:** the Level recipe reads `PersistentLevel->Actors`, which is correct for non-WP maps but **misses actors in World Partition maps** (they live as One-File-Per-Actor `.uasset`s under `__ExternalActors__/`, streamed/unloaded). A real WP game's main level would extract with ~no placed actors. Fix needs either loading the WP grid or reading external-actor asset data. (Surfaced on ThirdPerson58, whose `Lvl_ThirdPerson` map was deleted but left 68 orphaned external actors — itself a hygiene signal Game IQ can flag.)
 
 ## 13. Trademark note
 
 All public materials follow the existing convention: Unreal® is a trademark of Epic Games, Inc.; Unreal Game IQ is an independent Buckley Builds LLC product, not affiliated with or endorsed by Epic Games. Keep marketing version-agnostic ("Unreal Engine", not "UE5.x").
+
+## 14. Implementation status (v0.1)
+
+Snapshot of shipped vs. planned so the vision above doesn't read as done. Verified end-to-end on **ThirdPerson58 (UE 5.8)**: extract → index → MCP → agent.
+
+**Shipped**
+- Monorepo: `packages/shared` (schema), `packages/core` (SQLite+FTS5 store, producer-scoped ingest, query engine, MCP server, CLI), `plugin/GameIQ` (all-C++ editor plugin), `scripts/deploy.ps1`.
+- **Editor-less:** C++ header reflection parse, config/`.ini`/`.uproject` parse, directory-exclude config (§5.5).
+- **Commandlets:** `GameIQExport` (Tier 0 registry graph), `GameIQAssets` (Tier 1: static/skeletal mesh, texture, skeleton, data table, material, **Input Mapping Context/Action**, **level actor inventory with light/mesh detail**, generic reflection fallback for the rest), `GameIQBlueprints` (Tier 2 pseudocode + variables/components/interfaces).
+- **Edges:** `depends-on`, `references`, `inherits`, `implements`, `calls`, `uses-material`, `uses-texture`, `uses-skeleton`, `placed-in-level`.
+- **MCP:** one `game_iq` multi-action tool (§6.1), verified over stdio; `claude mcp add` registration.
+- Cross-language robustness: BOM-tolerant JSON reader, UTF-8 output, bounded `get_entity`.
+
+**Not yet built** — editor-less Tier 0 (registry-file parsing, still commandlet-only); in-editor live bridge + filesystem watcher (§8); snapshots / `changes` semantic diff; embeddings (FTS5 only); `ask` synthesis; design-doc ingestion (§5.4); Tier 2 for materials/AnimBP/Behavior Trees; bespoke recipes for Niagara/Sound/Physics (generic fallback today); World Partition actors (§12.12); Mac/Linux; team sync.
+
+**Known gaps** — World Partition level actors (§12.12); base-material texture refs only via Tier 0 `depends-on` (headless `GetUsedTextures` returns empty; MI overrides are typed); level per-actor entities capped at 500 (full class counts always reported, §12.7).
