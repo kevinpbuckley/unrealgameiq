@@ -37,6 +37,10 @@ public class GameIQ : ModuleRules
 				"BlueprintGraph",
 				"Kismet",
 				"EditorSubsystem", // in-editor save hook (incremental index updates)
+				"Slate",           // Tools > Game IQ panel (index stats + rebuild)
+				"SlateCore",
+				"ToolMenus",       // register the Tools menu entry
+				"WorkspaceMenuStructure", // Tools category for the dockable tab
 			});
 		}
 	}

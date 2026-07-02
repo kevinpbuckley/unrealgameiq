@@ -20,5 +20,10 @@ private:
 	/** Expose UGameIQService on UE 5.8's native ToolsetRegistry / MCP endpoint (needs GEditor). */
 	void RegisterToolsets();
 
+	/** Register the Tools > Game IQ panel (dockable tab + menu entry) and unregister on shutdown. */
+	void RegisterUI();
+	void UnregisterUI();
+	TSharedRef<class SDockTab> OnSpawnGameIQTab(const class FSpawnTabArgs& Args);
+
 	FDelegateHandle PostEngineInitHandle;
 };
