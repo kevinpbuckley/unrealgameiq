@@ -39,7 +39,7 @@ void UGameIQSaveHookSubsystem::OnPackageSaved(const FString& /*PackageFilename*/
 	// Find the Blueprint in the saved package (v1 handles Blueprints — the most-edited asset;
 	// other asset types stay fresh via `gameiq index`).
 	TArray<UObject*> Objects;
-	GetObjectsWithPackage(Package, Objects, /*bIncludeNestedObjects=*/false);
+	GetObjectsWithPackage(Package, Objects, EGetObjectsFlags::None);
 	UBlueprint* BP = nullptr;
 	for (UObject* Obj : Objects)
 	{

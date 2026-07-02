@@ -225,13 +225,13 @@ UE 5.8 ships (Experimental, `EditorOnly`, `NoRedist`, off by default) the **`AIA
 Freshness has two separable jobs, and conflating them is the common mistake: **detection** (what changed) is cheap and editor-free; **extraction** (reading the changed thing) is not, because a binary `.uasset` must be loaded into a UE process to render Tier 1/2 — detecting the change doesn't read it.
 
 - **Detection** — a filesystem watcher on `Content/` + `Source/` (a `.uasset` only hits disk on *save*, which is the right granularity) plus a VCS hook. Editor-free, and it naturally covers both "I saved" and "I synced/pulled." Text artifacts (C++, config) and the Tier 0 graph are *also* extracted here with no editor.
-- **Extraction of changed binary assets** — needs a live UE process. Three modes, increasing freshness:
-  1. **`gameiq index`** (MVP) — explicit full or `--changed` incremental run via the headless commandlet; the Asset Registry makes incremental cheap.
-  2. **Watcher → debounced commandlet** (v0.2) — the watcher batches changed packages and fires a headless `UnrealEditor-Cmd -run=GameIQExport`. No interactive editor; freshness in *seconds* (bounded by UE process cold-start, so batch — don't run per-save).
-  3. **In-editor bridge** (the plugin) — when the editor is already open during active work, the asset is already loaded in memory: sub-second freshness, and it's the only mode that can see *unsaved* in-editor edits. This is what live agent workflows need.
+- **Extraction of changed binary assets** — needs a live UE process. Two modes:
+  1. **`gameiq index`** — explicit full (or `--changed`) run via the headless commandlets; the Asset Registry makes it cheap. The baseline / cold-start path.
+  2. **In-editor save hook** *(shipped for Blueprints)* — while the editor is open, `UGameIQSaveHookSubsystem` hooks `PackageSavedWithContextEvent`: on save it extracts that asset **in memory** (instant — already loaded) with the same recipe as the commandlet and writes a small **delta** (`replaces:[assetId]`) to `.gameiq/extract/incremental/`. No commandlet cold-start, no editor stall.
+- **Applying deltas — lazy, no watcher.** The MCP server **drains pending deltas before every query** (entity-scoped patch ingest, §5.2), so an agent always reads the just-saved state without any always-on process. `gameiq drain` / `gameiq patch <file>` are the one-shot equivalents. (An early filesystem-watcher design was dropped: the save hook + lazy-drain is simpler and doesn't require a background daemon.)
 - Every query response carries an index-age stamp so agents (and humans) know how stale the answer might be.
 
-The plugin is therefore **in scope** (not merely an optional nicety): the watcher+commandlet path can't see unsaved state and pays cold-start, so the live mode is the bridge. See §10.1 for how the plugin is delivered.
+**Verified end-to-end** on ThirdPerson58: create/edit a Blueprint via the editor → save → the hook writes a delta → the next `game_iq` query auto-drains it and returns the new variable/structure, no full rebuild. **Gaps:** the hook covers Blueprints today (other asset saves refresh via `gameiq index`); asset **deletion/rename** isn't hooked yet (stale until the next full index); and *unsaved* in-editor edits aren't captured (save is the trigger).
 
 ## 9. Privacy & IP
 
@@ -307,8 +307,9 @@ Snapshot of shipped vs. planned so the vision above doesn't read as done. Verifi
 - **Commandlets:** `GameIQExport` (Tier 0 registry graph), `GameIQAssets` (Tier 1: static/skeletal mesh, texture, skeleton, data table, material, **Input Mapping Context/Action**, **level actor inventory with light/mesh detail**, generic reflection fallback for the rest), `GameIQBlueprints` (Tier 2 pseudocode + variables/components/interfaces).
 - **Edges:** `depends-on`, `references`, `inherits`, `implements`, `calls`, `uses-material`, `uses-texture`, `uses-skeleton`, `placed-in-level`.
 - **MCP:** one `game_iq` multi-action tool (§6.1), verified over stdio; `claude mcp add` registration.
+- **Incremental updates (§8):** in-editor save hook (`UGameIQSaveHookSubsystem`) writes a delta on Blueprint save; MCP server drains pending deltas before each query (entity-scoped patch). Verified live: save a Blueprint → next query reflects it, no full rebuild.
 - Cross-language robustness: BOM-tolerant JSON reader, UTF-8 output, bounded `get_entity`.
 
-**Not yet built** — editor-less Tier 0 (registry-file parsing, still commandlet-only); in-editor live bridge + filesystem watcher (§8); snapshots / `changes` semantic diff; embeddings (FTS5 only); `ask` synthesis; design-doc ingestion (§5.4); Tier 2 for materials/AnimBP/Behavior Trees; bespoke recipes for Niagara/Sound/Physics (generic fallback today); World Partition actors (§12.12); Mac/Linux; team sync.
+**Not yet built** — editor-less Tier 0 (registry-file parsing, still commandlet-only); save hook for non-Blueprint assets + deletion/rename + unsaved edits (§8); snapshots / `changes` semantic diff; embeddings (FTS5 only); `ask` synthesis; design-doc ingestion (§5.4); Tier 2 for materials/AnimBP/Behavior Trees; bespoke recipes for Niagara/Sound/Physics (generic fallback today); World Partition actors (§12.12); Mac/Linux; team sync.
 
 **Known gaps** — World Partition level actors (§12.12); base-material texture refs only via Tier 0 `depends-on` (headless `GetUsedTextures` returns empty; MI overrides are typed); level per-actor entities capped at 500 (full class counts always reported, §12.7).
