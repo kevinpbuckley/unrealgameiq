@@ -26,6 +26,7 @@ public class GameIQ : ModuleRules
 			"SQLiteCore",        // in-editor toolset reads the .gameiq/index.db (FTS5) natively, no Node
 			"ToolsetRegistry",   // UE 5.8 native AI toolset registry — exposes GameIQ queries on Epic's MCP endpoint
 			"ImageWrapper",      // read image dimensions (png/jpg/…) for the docs image extractor (issue #7)
+			"zlib",              // inflate PDF FlateDecode content streams for text extraction (issue #5)
 		});
 
 		// Editor-only machinery for the live in-editor bridge and Tier 2 graph export
@@ -42,6 +43,7 @@ public class GameIQ : ModuleRules
 				"SlateCore",
 				"ToolMenus",       // register the Tools menu entry
 				"WorkspaceMenuStructure", // Tools category for the dockable tab
+				"FileUtilities",   // FZipArchiveReader (over bundled libzip) — read DOCX word/document.xml (issue #5)
 			});
 		}
 	}

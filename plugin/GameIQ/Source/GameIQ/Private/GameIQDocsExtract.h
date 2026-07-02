@@ -4,6 +4,7 @@
 
 #include "CoreMinimal.h"
 #include "Dom/JsonObject.h"
+#include "GameIQBinaryDoc.h"
 #include "GameIQDocText.h"
 #include "GameIQDocType.h"
 #include "GameIQFileWalk.h"
@@ -81,14 +82,40 @@ namespace GameIQDocsExtract
 			if (Rel.EndsWith(TEXT(".caption.txt"))) { continue; }
 
 			const FString Ext = FPaths::GetExtension(File).ToLower();
-			FString Content;
-			if (!LoadDocText(File, Content)) { ++OutSkipped; continue; }
+			GameIQDocText::FParsed Parsed;
+			if (Ext == TEXT("docx") || Ext == TEXT("doc"))
+			{
+				// DOCX (zip+XML) via FZipArchiveReader; legacy binary .doc isn't a zip → falls through unsupported.
+				FString Text;
+				if (GameIQBinaryDoc::ExtractDocx(File, Text) && !Text.TrimStartAndEnd().IsEmpty())
+				{
+					Parsed.Format = TEXT("docx"); Parsed.bSupported = true;
+					GameIQDocText::ParseMarkdown(Text, Parsed);
+				}
+				else { Parsed.Format = Ext; Parsed.bSupported = false; }
+			}
+			else if (Ext == TEXT("pdf"))
+			{
+				// PDF text layer via FlateDecode-stream inflate; scanned/image PDFs yield nothing → skip honestly.
+				FString Text;
+				if (GameIQBinaryDoc::ExtractPdf(File, Text) && Text.TrimStartAndEnd().Len() >= 16)
+				{
+					Parsed.Format = TEXT("pdf"); Parsed.bSupported = true;
+					GameIQDocText::ParseMarkdown(Text, Parsed);
+				}
+				else { Parsed.Format = TEXT("pdf (no extractable text layer)"); Parsed.bSupported = false; }
+			}
+			else
+			{
+				FString Content;
+				if (!LoadDocText(File, Content)) { ++OutSkipped; continue; }
+				Parsed = GameIQDocText::Parse(Content, Ext);
+			}
 
-			GameIQDocText::FParsed Parsed = GameIQDocText::Parse(Content, Ext);
 			if (!Parsed.bSupported)
 			{
 				++OutSkipped;
-				UE_LOG(LogGameIQDocs, Display, TEXT("  skip %s (%s needs a converter — issue #5)"), *Rel, *Parsed.Format);
+				UE_LOG(LogGameIQDocs, Display, TEXT("  skip %s (%s — issue #5)"), *Rel, *Parsed.Format);
 				continue;
 			}
 
