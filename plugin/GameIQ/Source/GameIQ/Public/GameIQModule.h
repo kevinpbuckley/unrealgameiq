@@ -15,4 +15,10 @@ class FGameIQModule : public IModuleInterface
 public:
 	virtual void StartupModule() override;
 	virtual void ShutdownModule() override;
+
+private:
+	/** Expose UGameIQService on UE 5.8's native ToolsetRegistry / MCP endpoint (needs GEditor). */
+	void RegisterToolsets();
+
+	FDelegateHandle PostEngineInitHandle;
 };

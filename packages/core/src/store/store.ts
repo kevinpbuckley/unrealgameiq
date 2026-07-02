@@ -139,8 +139,13 @@ export class Store {
   constructor(dbPath: string) {
     if (dbPath !== ":memory:") mkdirSync(dirname(dbPath), { recursive: true });
     this.db = new Database(dbPath);
-    this.db.pragma("journal_mode = WAL");
+    // Rollback journal (not WAL): the index is read concurrently by the in-editor toolset, whose
+    // UE-embedded SQLite is a *different* SQLite build. On Windows two builds can't share a WAL's
+    // -shm memory (opens fail with "disk I/O error"); a rollback journal has no -shm, so any SQLite
+    // reader can open the file read-only while we hold it. Write concurrency is irrelevant here.
+    this.db.pragma("journal_mode = DELETE");
     this.db.pragma("synchronous = NORMAL");
+    this.db.pragma("busy_timeout = 3000"); // tolerate a reader/writer overlap instead of failing
     this.db.pragma("foreign_keys = OFF"); // edges may point at not-yet-extracted entities
     this.#migrate();
   }
