@@ -1,10 +1,4 @@
-# Node
-node_modules/
-dist/
-*.tsbuildinfo
-npm-debug.log*
-
-# Game IQ generated index (also gitignored inside target projects by `gameiq init`)
+# Game IQ generated index (gitignored inside target projects too)
 .gameiq/
 
 # UE plugin build artifacts (when plugin/GameIQ is compiled in a project)

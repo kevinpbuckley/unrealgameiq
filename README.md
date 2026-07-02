@@ -1,97 +1,85 @@
 # Unreal Game IQ
 
-> **Knows your game.** A continuously updated, queryable index of an Unreal Engine project — assets, Blueprints, C++, config, and how they connect — exposed to you and to AI agents.
+> **Knows your game.** A continuously updated, queryable index of an Unreal Engine project — assets, Blueprints, C++, config, and how they connect — exposed to AI agents as a native UE 5.8 editor toolset.
 
 See [design.md](design.md) for the full design.
 
 ## What this repo is
 
-A monorepo with two distributable artifacts (see design §10.1):
+A single, all-C++ Unreal Engine 5.8 editor plugin — no Node, no external runtime:
 
 ```
-packages/
-  shared/   # the entity/edge/chunk + extractor-output schema (the cross-artifact contract)
-  core/     # TS: CLI, MCP server, SQLite index, query engine  → publishes to npm
 plugin/
-  GameIQ/   # the UE plugin (contents == <Game>/Plugins/GameIQ/) — deep extraction backend
+  GameIQ/   # the UE plugin (contents == <Game>/Plugins/GameIQ/)
+scripts/    # deploy.ps1 (copy plugin into a project) + build-index.ps1
 ```
 
-Two layers with opposite runtime needs (design §6.5):
+The plugin does everything in-process:
 
-- **Extraction** *builds* the index — it loads assets, so it needs the UE binary (the plugin's
-  commandlets run headless via `UnrealEditor-Cmd`, no UI, but not UE-free).
-- **Serving** *answers* from the index — it only reads `<project>/.gameiq/index.db` (SQLite+FTS),
-  so it needs **no UE at all**. This is the Node core (CLI + MCP + query engine), and it's why
-  the MCP lives outside Unreal: it answers with the editor — and often UE entirely — closed.
+- **Extract** — commandlets read the project (Asset Registry graph, per-asset recipes, Blueprint
+  pseudocode, `.ini`/`.uproject` config, C++ header reflection) into `<project>/.gameiq/extract/*.json`.
+- **Store & query** — a SQLite index (`.gameiq/index.db`, FTS5) via UE's `SQLiteCore`, with the query
+  engine (`search`/`get_entity`/`references`/`impact`/`explain`/`project_stats`) ported to C++.
+- **Serve** — `UGameIQService`, a `UToolsetDefinition` registered on UE 5.8's native `ToolsetRegistry`,
+  so GameIQ's queries appear on Epic's MCP endpoint for any agent already on the built-in UE MCP or
+  VibeUE — zero extra setup, answered in-process.
+- **Stay fresh** — an editor save hook patches the index directly on every asset save / delete / rename.
 
-## Quick start (development)
+## Quick start
 
-```bash
-npm install
-npm run build
-npm test
+### 1. Deploy the plugin into a project
+
+```powershell
+pwsh scripts/deploy.ps1 -Project <path-to-project-dir>
 ```
 
-### Index a real project
+Then build the editor target (e.g. via your project's build script) so `UnrealEditor-GameIQ.dll`
+is compiled. The plugin enables its dependencies (`SQLiteCore`, `ToolsetRegistry`, `EnhancedInput`).
 
-The plugin's three commandlets (Tier 0 registry, Tier 1 assets, Tier 2 Blueprints) write JSON
-into `<project>/.gameiq/extract/`, which the core ingests. The deploy script does it all:
+### 2. Build the index (once)
 
-```bash
-# copy the plugin into the project, build the editor target, run the commandlets, index:
-pwsh scripts/deploy.ps1 -Project <path-to-uproject-dir> -All
+With the editor **closed**:
 
-# or just re-index after extraction (editor-less):
-npm run gameiq -- index --project <path-to-uproject-dir>
+```powershell
+pwsh scripts/build-index.ps1 -Project <path-to-project-dir>
 ```
+
+This runs the `GameIQBuild` commandlet — every extractor plus the SQLite ingest — in a single editor
+boot, writing `<project>/.gameiq/index.db`. After that, the in-editor **save hook** keeps the index
+current automatically; a full rebuild is only needed after large out-of-editor changes (e.g. a VCS sync).
+
+### 3. Query it from an AI agent
+
+Open the project in the editor. GameIQ registers `GameIQ.GameIQService` on UE's MCP endpoint, so an
+agent on the native UE MCP (or VibeUE) can call it with no setup:
+
+| tool | what it answers |
+|---|---|
+| `Search` | hybrid FTS search across everything (optional `Kind` filter) |
+| `GetEntity` | full detail: summary, chunks (BP pseudocode / recipe), edges, child entities |
+| `References` | who uses this / what this uses (`Direction`, `Depth`, `EdgeType` filter) |
+| `Impact` | what could break if this changes (severity-ranked dependents) |
+| `Explain` | assembled context bundle for a system/topic |
+| `ProjectStats` | counts, unused-asset candidates, largest dependencies |
+
+From Python it mirrors VibeUE's services, e.g.
+`unreal.GameIQService.search("reload ammo", "blueprint")`.
+Example: *"which meshes use this skeleton?"* → `References` with `EdgeType: "uses-skeleton"`, `Direction: "in"`.
 
 ### Excluding directories (config)
 
-By default the editor-less C++/config walk indexes the whole project tree — including
-third-party plugin source. To keep the index focused on *your* game, add a
-`gameiq.config.json` at the project root:
+The editor-less config/C++ walk indexes the whole project tree, including third-party plugin source.
+To keep the index focused on *your* game, add a `gameiq.config.json` at the project root:
 
 ```json
 { "exclude": ["Plugins/VibeUE", "Plugins/SomeMarketplacePlugin"] }
 ```
 
-Entries match a directory name (`VibeUE`) or a project-relative path (`Plugins/VibeUE`).
-Game IQ's own plugin is always excluded. You can also pass `--exclude <dir...>` to `index`,
-or edit the list in the editor under **Project Settings → Plugins → Game IQ** (the plugin
-writes `gameiq.config.json` for you).
-
-### Use it from an AI agent (MCP)
-
-The core serves the index over the Model Context Protocol. Register it with any MCP client
-(here, a project `.mcp.json` for Claude Code):
-
-```json
-{
-  "mcpServers": {
-    "game-iq": {
-      "command": "npx",
-      "args": ["-y", "@gameiq/core", "mcp", "--project", "."]
-    }
-  }
-}
-```
-
-Until `@gameiq/core` is published, point at the local build instead:
-`"command": "node", "args": ["<repo>/packages/core/dist/cli/index.js", "mcp", "--project", "."]`.
-
-The server exposes one multi-action `game_iq` tool (few-tools pattern, design §6.1):
-
-| action | what it answers |
-|---|---|
-| `search` | hybrid search across everything (optional `kind` filter) |
-| `get_entity` | full detail: summary, chunks (BP pseudocode / recipe), edges, and child entities |
-| `references` | who uses this / what this uses (`direction`, `depth`, `edgeType` filter) |
-| `impact` | what could break if this changes (severity-ranked dependents) |
-| `explain` | assembled context bundle for a system/topic |
-| `project_stats` | counts, unused-asset candidates, largest dependencies |
-
-Example: *"which meshes use this skeleton?"* → `references` with `edgeType: "uses-skeleton"`, `direction: "in"`.
+Entries match a directory name (`VibeUE`) or a project-relative path (`Plugins/VibeUE`). Game IQ's own
+plugin is always excluded. You can also edit the list in the editor under
+**Project Settings → Plugins → Game IQ**.
 
 ## Status
 
-v0.1 MVP, in development. See design §7 for the MVP cut and success criterion.
+v0.1 MVP, in development. See design §7 for the MVP cut and success criterion. The entire pipeline —
+extract, store, query, live update — runs inside Unreal; there is no Node dependency.
