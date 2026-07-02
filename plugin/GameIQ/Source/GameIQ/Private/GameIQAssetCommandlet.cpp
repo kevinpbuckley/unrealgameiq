@@ -4,6 +4,7 @@
 
 #include "Animation/Skeleton.h"
 #include "AssetRegistry/ARFilter.h"
+#include "Components/ActorComponent.h"
 #include "Components/LightComponent.h"
 #include "Components/PointLightComponent.h"
 #include "Components/SpotLightComponent.h"
@@ -264,6 +265,121 @@ namespace
 		return Out;
 	}
 
+	/**
+	 * Reflect the edit-exposed UPROPERTYs of `Struct` over `Container`, emitting only the ones that
+	 * DIFFER from `Default` (i.e. actually configured, not engine defaults) as `name=value` lines +
+	 * detail JSON fields, and asset object-references as `references` edges. Recurses one level into
+	 * structs so nested overrides (e.g. FPostProcessSettings) are captured. `Budget` bounds the total.
+	 */
+	void ReflectConfiguredProps(
+		FOut& O, const FString& OwnerId, UObject* Parent, const UStruct* Struct,
+		const void* Container, const void* Default, const FString& Prefix,
+		TArray<FString>& Lines, TSharedRef<FJsonObject>& OutJson, int32& Budget, int32 Depth)
+	{
+		// Noise that differs from defaults on every placed actor but says nothing about configuration:
+		// transforms (already captured as `location`), attachment plumbing, tag arrays, heavy sub-structs.
+		static const TSet<FString> Skip = {
+			TEXT("RelativeLocation"), TEXT("RelativeRotation"), TEXT("RelativeScale3D"),
+			TEXT("RootComponent"), TEXT("AttachParent"), TEXT("AttachSocketName"),
+			TEXT("BodyInstance"), TEXT("ComponentTags"), TEXT("Tags"), TEXT("AssetImportData"),
+			TEXT("BlueprintCreatedComponents"), TEXT("InstanceComponents") };
+
+		for (TFieldIterator<FProperty> It(Struct); It && Budget > 0; ++It)
+		{
+			const FProperty* Prop = *It;
+			if (Prop->HasAnyPropertyFlags(CPF_Transient | CPF_Deprecated)) { continue; }
+			if (!Prop->HasAnyPropertyFlags(CPF_Edit)) { continue; } // only user-facing settings
+			if (Skip.Contains(Prop->GetName())) { continue; }
+
+			const void* Val = Prop->ContainerPtrToValuePtr<void>(Container);
+			const void* Def = Default ? Prop->ContainerPtrToValuePtr<void>(Default) : nullptr;
+			if (Def && Prop->Identical(Val, Def, PPF_None)) { continue; } // unchanged from the default
+
+			const FString Field = Prefix.IsEmpty() ? Prop->GetName() : Prefix + TEXT(".") + Prop->GetName();
+
+			// Object references → edge + name, but only to real assets (skip components/actors/levels).
+			if (const FObjectPropertyBase* ObjProp = CastField<FObjectPropertyBase>(Prop))
+			{
+				UObject* Ref = ObjProp->GetObjectPropertyValue(Val);
+				if (Ref && Ref->IsAsset() && IsProjectObject(Ref))
+				{
+					Lines.Add(FString::Printf(TEXT("%s=%s"), *Field, *Ref->GetName()));
+					OutJson->SetStringField(Field, Ref->GetName());
+					O.Edges.Add(MakeShared<FJsonValueObject>(
+						GameIQ::MakeEdge(OwnerId, AssetIdOf(Ref), TEXT("references"), Prop->GetName())));
+					--Budget;
+				}
+				continue;
+			}
+
+			if (Prop->IsA<FNumericProperty>() || Prop->IsA<FBoolProperty>() || Prop->IsA<FNameProperty>() ||
+				Prop->IsA<FStrProperty>() || Prop->IsA<FEnumProperty>() || Prop->IsA<FByteProperty>())
+			{
+				FString Value;
+				Prop->ExportTextItem_Direct(Value, Val, /*Default=*/nullptr, Parent, PPF_None);
+				Value = GameIQ::OneLine(Value);
+				if (Value.Len() > 0 && Value.Len() < 80)
+				{
+					Lines.Add(FString::Printf(TEXT("%s=%s"), *Field, *Value));
+					OutJson->SetStringField(Field, Value);
+					--Budget;
+				}
+				continue;
+			}
+
+			// One-level struct dive so nested overrides (FPostProcessSettings, FLinearColor, …) surface.
+			if (Depth < 1)
+			{
+				if (const FStructProperty* SP = CastField<FStructProperty>(Prop))
+				{
+					ReflectConfiguredProps(O, OwnerId, Parent, SP->Struct, Val, Def, Field, Lines, OutJson, Budget, Depth + 1);
+				}
+			}
+		}
+	}
+
+	/**
+	 * Reflection-based detail for any actor class without a bespoke recipe (SkyLight, SkyAtmosphere,
+	 * ExponentialHeightFog, VolumetricCloud, PostProcessVolume, Landscape, …). Captures the actor's own
+	 * configured (non-default) properties plus those of each distinct component class. Returns a compact
+	 * `name=value` string, or an explicit "engine defaults" marker when nothing was configured — so
+	 * callers can tell "uses engine defaults" apart from "unindexed". (issue #1)
+	 */
+	FString GenericActorDetail(FOut& O, const AActor* Actor, const FString& ActorId, TSharedRef<FJsonObject>& OutJson)
+	{
+		TArray<FString> Lines;
+		int32 Budget = 28;
+		UObject* Parent = const_cast<AActor*>(Actor);
+
+		// The actor's own overrides (e.g. APostProcessVolume::Settings/Priority/bUnbound).
+		ReflectConfiguredProps(O, ActorId, Parent, Actor->GetClass(), Actor, Actor->GetArchetype(),
+			FString(), Lines, OutJson, Budget, 0);
+
+		// Each distinct component class' overrides (SkyLight/Fog/Atmosphere/Cloud settings live here).
+		// Dedupe by class so a Landscape's many identical components don't flood the budget.
+		TSet<FName> SeenClasses;
+		TArray<UActorComponent*> Comps;
+		Actor->GetComponents(Comps);
+		for (UActorComponent* Comp : Comps)
+		{
+			if (!Comp || Budget <= 0) { continue; }
+			if (SeenClasses.Contains(Comp->GetClass()->GetFName())) { continue; }
+			SeenClasses.Add(Comp->GetClass()->GetFName());
+			const UObject* Arch = Comp->GetArchetype();
+			const FString CompPrefix = Comp->GetClass()->GetName().Replace(TEXT("Component"), TEXT(""));
+			ReflectConfiguredProps(O, ActorId, Comp, Comp->GetClass(), Comp,
+				Arch ? Arch : Comp->GetClass()->GetDefaultObject(), CompPrefix, Lines, OutJson, Budget, 0);
+		}
+
+		if (Lines.Num() == 0)
+		{
+			// Explicit, machine-readable: this actor was indexed and genuinely uses engine defaults.
+			OutJson->SetBoolField(TEXT("usesEngineDefaults"), true);
+			return TEXT("engine defaults");
+		}
+		return FString::Join(Lines, TEXT(" "));
+	}
+
 	/** Type-specific one-line detail for a placed actor (lights, static meshes), for the searchable chunk. */
 	FString ActorDetail(FOut& O, const AActor* Actor, const FString& ActorId, TSharedRef<FJsonObject>& OutJson)
 	{
@@ -311,7 +427,9 @@ namespace
 				}
 			}
 		}
-		return FString();
+		// Everything else (SkyLight, SkyAtmosphere, fog, clouds, post-process, landscape, …) gets its
+		// actual configured properties via reflection, so the index reflects the real level setup. (issue #1)
+		return GenericActorDetail(O, Actor, ActorId, OutJson);
 	}
 
 	void RecipeLevel(FOut& O, UWorld* World, const FString& Id, const FString& Name)
