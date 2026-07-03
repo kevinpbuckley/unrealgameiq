@@ -22,8 +22,11 @@ public:
 
 private:
 	FReply OnRebuildClicked();
+	FReply OnReindexDocsClicked();
 	FReply OnRefreshClicked();
 	void Refresh();
+	/** Spawn a headless commandlet (`-run=<RunArg>`) as a background process; poll it to completion. */
+	FReply StartBuild(const FString& RunArg, const FText& StartedMsg);
 	/** Poll the background rebuild process; refresh stats and stop when it exits. */
 	bool PollRebuild(float DeltaTime);
 

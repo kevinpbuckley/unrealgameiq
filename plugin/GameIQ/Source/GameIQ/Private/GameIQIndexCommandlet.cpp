@@ -7,6 +7,7 @@
 #include "GameIQStore.h"
 #include "HAL/FileManager.h"
 #include "Misc/FileHelper.h"
+#include "Misc/Parse.h"
 #include "Misc/Paths.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
@@ -21,9 +22,22 @@ UGameIQIndexCommandlet::UGameIQIndexCommandlet()
 	LogToConsole = true;
 }
 
-int32 UGameIQIndexCommandlet::Main(const FString& /*Params*/)
+int32 UGameIQIndexCommandlet::Main(const FString& Params)
 {
 	const FString ExtractDir = FPaths::Combine(FPaths::ProjectDir(), TEXT(".gameiq"), TEXT("extract"));
+
+	// Optional `-only=docs.json+images.json+…` restricts ingest to those extract files. Because ingest
+	// is producer-scoped (each file's producer rows are replaced), this reindexes just those producers
+	// without touching the rest of the index — e.g. a fast docs-only refresh. Files are '+'-separated
+	// ('+', not ',', because FParse::Value truncates a value at the first comma).
+	TSet<FString> OnlyFiles;
+	FString Only;
+	if (FParse::Value(*Params, TEXT("only="), Only) && !Only.IsEmpty())
+	{
+		TArray<FString> Parts;
+		Only.ParseIntoArray(Parts, TEXT("+"));
+		for (const FString& P : Parts) { const FString T = P.TrimStartAndEnd(); if (!T.IsEmpty()) { OnlyFiles.Add(T); } }
+	}
 
 	TArray<FString> Files;
 	IFileManager::Get().FindFiles(Files, *(ExtractDir / TEXT("*.json")), /*Files=*/true, /*Directories=*/false);
@@ -45,6 +59,7 @@ int32 UGameIQIndexCommandlet::Main(const FString& /*Params*/)
 
 	for (const FString& File : Files)
 	{
+		if (OnlyFiles.Num() > 0 && !OnlyFiles.Contains(File)) { continue; }
 		const FString FullPath = ExtractDir / File;
 		FString Json;
 		if (!FFileHelper::LoadFileToString(Json, *FullPath))
