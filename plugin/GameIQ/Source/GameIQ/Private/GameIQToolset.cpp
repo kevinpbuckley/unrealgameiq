@@ -4,9 +4,9 @@
 
 #include "GameIQQuery.h"
 
-FString UGameIQService::Search(const FString& Query, const FString& Kind, int32 Limit)
+FString UGameIQService::Search(const FString& Query, const FString& Kind, int32 Limit, int32 Offset)
 {
-	return GameIQQuery::Search(Query, Kind, Limit > 0 ? Limit : 20);
+	return GameIQQuery::Search(Query, Kind, Limit > 0 ? Limit : 20, Offset);
 }
 
 FString UGameIQService::GetEntity(const FString& Id)
@@ -15,14 +15,14 @@ FString UGameIQService::GetEntity(const FString& Id)
 }
 
 FString UGameIQService::References(const FString& Id, const FString& Direction, int32 Depth,
-	const FString& EdgeType, const FString& Kind)
+	const FString& EdgeType, const FString& Kind, int32 Offset)
 {
-	return GameIQQuery::References(Id, Direction, Depth, EdgeType, Kind);
+	return GameIQQuery::References(Id, Direction, Depth, EdgeType, Kind, /*Limit=*/200, Offset);
 }
 
-FString UGameIQService::Impact(const FString& Id)
+FString UGameIQService::Impact(const FString& Id, int32 Limit)
 {
-	return GameIQQuery::Impact(Id);
+	return GameIQQuery::Impact(Id, /*MaxDepth=*/4, Limit);
 }
 
 FString UGameIQService::Explain(const FString& Topic)
@@ -43,4 +43,9 @@ FString UGameIQService::Coverage(const FString& DocType)
 FString UGameIQService::Drift()
 {
 	return GameIQQuery::Drift();
+}
+
+FString UGameIQService::Doctor()
+{
+	return GameIQQuery::Doctor();
 }

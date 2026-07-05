@@ -39,8 +39,23 @@ int32 UGameIQIndexCommandlet::Main(const FString& Params)
 		for (const FString& P : Parts) { const FString T = P.TrimStartAndEnd(); if (!T.IsEmpty()) { OnlyFiles.Add(T); } }
 	}
 
+	// Optional `-skipfiles=assets.json+…`: extract outputs the build orchestrator judged stale
+	// (their stage failed to refresh them this run) — ingesting an old delta would re-apply
+	// out-of-date rows on top of newer save-hook patches.
+	TSet<FString> SkipFiles;
+	FString Skip;
+	if (FParse::Value(*Params, TEXT("skipfiles="), Skip) && !Skip.IsEmpty())
+	{
+		TArray<FString> Parts;
+		Skip.ParseIntoArray(Parts, TEXT("+"));
+		for (const FString& P : Parts) { const FString T = P.TrimStartAndEnd(); if (!T.IsEmpty()) { SkipFiles.Add(T); } }
+	}
+
 	TArray<FString> Files;
 	IFileManager::Get().FindFiles(Files, *(ExtractDir / TEXT("*.json")), /*Files=*/true, /*Directories=*/false);
+	// The signature caches are extractor-private state, not ExtractorOutput — filter them out
+	// up front instead of fully parsing 60+ MB of JSON just to discover there's no `producer`.
+	Files.RemoveAll([](const FString& F) { return F.EndsWith(TEXT("-hashes.json")) || F.EndsWith(TEXT(".tmp")); });
 	if (Files.Num() == 0)
 	{
 		UE_LOG(LogGameIQIndex, Warning, TEXT("Game IQ: no extractor outputs in %s — run the extract commandlets first."), *ExtractDir);
@@ -55,11 +70,17 @@ int32 UGameIQIndexCommandlet::Main(const FString& Params)
 	}
 
 	int32 TotalEntities = 0, TotalEdges = 0, TotalChunks = 0;
+	int32 FailedIngests = 0;
 	bool bMetaSet = false;
 
 	for (const FString& File : Files)
 	{
 		if (OnlyFiles.Num() > 0 && !OnlyFiles.Contains(File)) { continue; }
+		if (SkipFiles.Contains(File))
+		{
+			UE_LOG(LogGameIQIndex, Warning, TEXT("Game IQ: skipping stale extract output %s (its stage did not refresh it this run)."), *File);
+			continue;
+		}
 		const FString FullPath = ExtractDir / File;
 		FString Json;
 		if (!FFileHelper::LoadFileToString(Json, *FullPath))
@@ -91,12 +112,45 @@ int32 UGameIQIndexCommandlet::Main(const FString& Params)
 		Root->TryGetArrayField(TEXT("edges"), Edges);
 		Root->TryGetArrayField(TEXT("chunks"), Chunks);
 
-		Store.IngestProducer(Producer, *Entities, *Edges, *Chunks);
+		// Delta mode (incremental extract): apply on top of the rows already in the index,
+		// replacing only this producer's rows for the listed subtrees. Full mode: wipe + reinsert.
+		FString Mode;
+		Root->TryGetStringField(TEXT("mode"), Mode);
+		bool bOk;
+		if (Mode == TEXT("delta"))
+		{
+			TArray<FString> Replaces;
+			const TArray<TSharedPtr<FJsonValue>>* ReplacesJson = nullptr;
+			if (Root->TryGetArrayField(TEXT("replaces"), ReplacesJson))
+			{
+				for (const TSharedPtr<FJsonValue>& V : *ReplacesJson)
+				{
+					FString Id;
+					if (V.IsValid() && V->TryGetString(Id) && !Id.IsEmpty()) { Replaces.Add(Id); }
+				}
+			}
+			if (Replaces.Num() == 0 && Entities->Num() == 0 && Edges->Num() == 0 && Chunks->Num() == 0)
+			{
+				UE_LOG(LogGameIQIndex, Display, TEXT("  %s: no changes (delta empty)"), *Producer);
+				bOk = true;
+			}
+			else
+			{
+				bOk = Store.PatchProducerScoped(Replaces, *Entities, *Edges, *Chunks, Producer);
+				UE_LOG(LogGameIQIndex, Display, TEXT("  %s: delta — %d replaced roots, %d entities, %d edges, %d chunks%s"),
+					*Producer, Replaces.Num(), Entities->Num(), Edges->Num(), Chunks->Num(), bOk ? TEXT("") : TEXT(" — FAILED"));
+			}
+		}
+		else
+		{
+			bOk = Store.IngestProducer(Producer, *Entities, *Edges, *Chunks);
+			UE_LOG(LogGameIQIndex, Display, TEXT("  %s: %d entities, %d edges, %d chunks%s"),
+				*Producer, Entities->Num(), Edges->Num(), Chunks->Num(), bOk ? TEXT("") : TEXT(" — FAILED"));
+		}
+		if (!bOk) { ++FailedIngests; continue; }
 		TotalEntities += Entities->Num();
 		TotalEdges += Edges->Num();
 		TotalChunks += Chunks->Num();
-		UE_LOG(LogGameIQIndex, Display, TEXT("  %s: %d entities, %d edges, %d chunks"),
-			*Producer, Entities->Num(), Edges->Num(), Chunks->Num());
 
 		if (!bMetaSet)
 		{
@@ -113,8 +167,26 @@ int32 UGameIQIndexCommandlet::Main(const FString& Params)
 		}
 	}
 
+	// Verify what actually landed in the DB — extract-file counts are not proof of ingestion
+	// (the July 2026 empty-index bug shipped "success" logs against a schema-less DB).
+	int64 DbEntities = 0, DbEdges = 0, DbChunks = 0;
+	Store.GetCounts(DbEntities, DbEdges, DbChunks);
 	Store.Close();
-	UE_LOG(LogGameIQIndex, Display, TEXT("Game IQ: indexed %d files → %d entities, %d edges, %d chunks."),
+
+	UE_LOG(LogGameIQIndex, Display, TEXT("Game IQ: ingested %d files (%d entities, %d edges, %d chunks in this pass)."),
 		Files.Num(), TotalEntities, TotalEdges, TotalChunks);
+	UE_LOG(LogGameIQIndex, Display, TEXT("Game IQ: INDEX VERIFIED — DB now holds %lld entities, %lld edges, %lld chunks."),
+		DbEntities, DbEdges, DbChunks);
+
+	if (FailedIngests > 0)
+	{
+		UE_LOG(LogGameIQIndex, Error, TEXT("Game IQ: %d producer ingest(s) FAILED — the index is incomplete for those producers."), FailedIngests);
+		return 1;
+	}
+	if (DbEntities == 0)
+	{
+		UE_LOG(LogGameIQIndex, Error, TEXT("Game IQ: INDEX EMPTY after ingest — something is wrong (schema, permissions, or empty extracts). Queries will return nothing."));
+		return 1;
+	}
 	return 0;
 }

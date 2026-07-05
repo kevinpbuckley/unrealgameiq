@@ -13,9 +13,12 @@
 #include "Engine/Blueprint.h"
 #include "Engine/SCS_Node.h"
 #include "Engine/SimpleConstructionScript.h"
+#include "GameIQFileWalk.h"
 #include "GameIQHash.h"
 #include "GameIQJson.h"
+#include "GameIQStore.h"
 #include "HAL/FileManager.h"
+#include "HAL/PlatformMemory.h"
 #include "HAL/PlatformTime.h"
 #include "K2Node_CallFunction.h"
 #include "K2Node_Event.h"
@@ -35,12 +38,6 @@ namespace
 {
 	const TCHAR* BlueprintProducer = TEXT("gameiq-ue-bp@0.1.0");
 	constexpr int32 MaxNodesPerGraph = 400; // guard against pathological graphs
-
-	// See GameIQAssetCommandlet.cpp's AssetGCFlushInterval: a full GC pass costs O(entire live
-	// UObject graph), so flushing every N loaded Blueprints amortizes that cost while still
-	// bounding peak memory across a full /Game scan.
-	// (Named per-commandlet: unity builds merge these anonymous namespaces into one TU.)
-	constexpr int32 BlueprintGCFlushInterval = 300;
 
 	FString NodeTitle(const UEdGraphNode* Node)
 	{
@@ -381,13 +378,29 @@ int32 UGameIQBlueprintsCommandlet::Main(const FString& Params)
 	}
 	IFileManager::Get().MakeDirectory(*OutDir, /*Tree=*/true);
 
+	const FString ProjectRoot = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir());
+	const TArray<FString> ShallowPaths = GameIQWalk::LoadShallowPackagePaths(ProjectRoot);
+
 	// Incremental rebuild (-full forces a from-scratch pass, ignoring/overwriting the cache).
+	// Sig-only cache keyed to the index DB's generation — see GameIQAssetCommandlet.cpp.
 	const bool bForceFull = FParse::Param(*Params, TEXT("full"));
+	FString DbGeneration = FGameIQStore::ReadMetaValue(TEXT("dbGeneration"));
+	if (DbGeneration.IsEmpty())
+	{
+		FGameIQStore Store;
+		if (Store.Open())
+		{
+			DbGeneration = Store.GetMeta(TEXT("dbGeneration"));
+			Store.Close();
+		}
+	}
 	const FString HashCachePath = FPaths::Combine(OutDir, TEXT("blueprint-hashes.json"));
-	TMap<FString, GameIQHash::FCachedAssetRow> PrevCache =
-		bForceFull ? TMap<FString, GameIQHash::FCachedAssetRow>() : GameIQHash::LoadAssetHashCache(HashCachePath);
-	TMap<FString, GameIQHash::FCachedAssetRow> NewCache;
-	NewCache.Reserve(PrevCache.Num());
+	TMap<FString, FString> PrevSigs = (bForceFull || DbGeneration.IsEmpty())
+		? TMap<FString, FString>()
+		: GameIQHash::LoadSignatureCache(HashCachePath, DbGeneration);
+	const bool bDeltaMode = PrevSigs.Num() > 0;
+	TMap<FString, FString> NewSigs;
+	NewSigs.Reserve(PrevSigs.Num());
 
 	FAssetRegistryModule& ARM =
 		FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
@@ -406,13 +419,38 @@ int32 UGameIQBlueprintsCommandlet::Main(const FString& Params)
 	TArray<TSharedPtr<FJsonValue>> Entities;
 	TArray<TSharedPtr<FJsonValue>> Edges;
 	TArray<TSharedPtr<FJsonValue>> Chunks;
+	TArray<FString> Replaces;
+	TSet<FString> SeenIds;
 
 	const int32 TotalBlueprints = BlueprintAssets.Num();
 	int32 Rendered = 0;
 	int32 Skipped = 0;
+	int32 Shallow = 0;
 	int32 Index = 0;
 	int32 LoadedSinceLastGC = 0;
 	double LastProgressLogTime = FPlatformTime::Seconds();
+
+	// GC on memory pressure (checked every 64 loads) with a hard backstop every 1000 —
+	// same policy as GameIQAssetCommandlet.cpp.
+	auto MaybeCollectGarbage = [&LoadedSinceLastGC]()
+	{
+		if (++LoadedSinceLastGC >= 1000)
+		{
+			CollectGarbage(RF_NoFlags, /*bPerformFullPurge=*/true);
+			LoadedSinceLastGC = 0;
+			return;
+		}
+		if ((LoadedSinceLastGC & 63) == 0)
+		{
+			const FPlatformMemoryStats Stats = FPlatformMemory::GetStats();
+			if (Stats.UsedPhysical > Stats.TotalPhysical / 10 * 7)
+			{
+				CollectGarbage(RF_NoFlags, /*bPerformFullPurge=*/true);
+				LoadedSinceLastGC = 0;
+			}
+		}
+	};
+
 	for (const FAssetData& Data : BlueprintAssets)
 	{
 		++Index;
@@ -420,73 +458,67 @@ int32 UGameIQBlueprintsCommandlet::Main(const FString& Params)
 		if (Now - LastProgressLogTime >= 2.0)
 		{
 			UE_LOG(LogGameIQBlueprints, Display, TEXT("Game IQ blueprints: %d/%d scanned (%d rendered, %d skipped-unchanged so far)..."),
-				Index, TotalBlueprints, Rendered - Skipped, Skipped);
+				Index, TotalBlueprints, Rendered, Skipped);
 			LastProgressLogTime = Now;
 		}
 
+		// Shallow third-party content (gameiq.config.json `shallowPaths`): no Tier 2 rendering —
+		// Tier 0 registry coverage (identity + dependencies) and the Assets stage's tag summary
+		// keep it visible without vendor pseudocode drowning search results.
+		if (GameIQWalk::IsShallowPackage(Data.PackageName.ToString(), ShallowPaths)) { ++Shallow; continue; }
+
 		const FString Id = GameIQHash::AssetIdOfPackage(Data.PackageName);
 		const FString Sig = GameIQHash::ComputeChangeSignature(AR, Data);
+		SeenIds.Add(Id);
 
-		// Incremental rebuild: an unchanged Blueprint's previously-extracted rows (graphs, vars,
-		// components) are carried forward verbatim — see GameIQAssetCommandlet.cpp for the same
-		// pattern. An empty Sig ("unknown") is never cached/matched, so it's always reprocessed.
-		if (!Sig.IsEmpty())
+		// Incremental rebuild: an unchanged Blueprint's rows already live in the index — skip it
+		// entirely. An empty Sig ("unknown") is never cached/matched, so it's always reprocessed.
+		if (bDeltaMode && !Sig.IsEmpty())
 		{
-			if (const GameIQHash::FCachedAssetRow* Cached = PrevCache.Find(Id))
+			if (const FString* Prev = PrevSigs.Find(Id))
 			{
-				if (Cached->Signature == Sig)
+				if (*Prev == Sig)
 				{
-					Entities.Append(Cached->Entities);
-					Edges.Append(Cached->Edges);
-					Chunks.Append(Cached->Chunks);
-					NewCache.Add(Id, *Cached);
-					++Rendered;
+					NewSigs.Add(Id, Sig);
 					++Skipped;
 					continue;
 				}
 			}
 		}
 
-		const int32 EntitiesBefore = Entities.Num();
-		const int32 EdgesBefore = Edges.Num();
-		const int32 ChunksBefore = Chunks.Num();
-
 		UBlueprint* BP = Cast<UBlueprint>(Data.GetAsset());
 		if (!BP) { continue; }
 		GameIQBlueprint::ExtractBlueprint(BP, Entities, Edges, Chunks);
 		++Rendered;
+		MaybeCollectGarbage();
 
-		// Bound peak memory across a full /Game scan: nothing here holds a reference to BP (or the
-		// dependencies it pulled in) past this point, so a periodic flush lets the GC actually
-		// reclaim them — a commandlet's Main() never yields back to the engine tick loop that
-		// would otherwise trigger this automatically.
-		if (++LoadedSinceLastGC >= BlueprintGCFlushInterval)
-		{
-			CollectGarbage(RF_NoFlags, /*bPerformFullPurge=*/true);
-			LoadedSinceLastGC = 0;
-		}
+		if (bDeltaMode) { Replaces.Add(Id); }
+		if (!Sig.IsEmpty()) { NewSigs.Add(Id, Sig); }
+	}
 
-		if (!Sig.IsEmpty())
+	// Blueprints deleted since the last run: drop their producer-owned rows.
+	if (bDeltaMode)
+	{
+		for (const TPair<FString, FString>& Prev : PrevSigs)
 		{
-			GameIQHash::FCachedAssetRow Row;
-			Row.Signature = Sig;
-			if (const int32 N = Entities.Num() - EntitiesBefore) { Row.Entities.Append(Entities.GetData() + EntitiesBefore, N); }
-			if (const int32 N = Edges.Num() - EdgesBefore) { Row.Edges.Append(Edges.GetData() + EdgesBefore, N); }
-			if (const int32 N = Chunks.Num() - ChunksBefore) { Row.Chunks.Append(Chunks.GetData() + ChunksBefore, N); }
-			NewCache.Add(Id, MoveTemp(Row));
+			if (!SeenIds.Contains(Prev.Key)) { Replaces.Add(Prev.Key); }
 		}
 	}
 
-	GameIQHash::SaveAssetHashCache(HashCachePath, NewCache);
+	GameIQHash::SaveSignatureCache(HashCachePath, NewSigs, DbGeneration);
 
-	if (!GameIQ::WriteOutput(OutDir, TEXT("blueprints.json"), BlueprintProducer, Entities, Edges, Chunks))
+	if (!GameIQ::WriteOutput(OutDir, TEXT("blueprints.json"), BlueprintProducer, Entities, Edges, Chunks,
+		bDeltaMode ? &Replaces : nullptr))
 	{
 		UE_LOG(LogGameIQBlueprints, Error, TEXT("Failed to write blueprints.json to %s"), *OutDir);
 		return 1;
 	}
 
+	const int32 Considered = Rendered + Skipped;
+	const double HitRate = Considered > 0 ? 100.0 * Skipped / Considered : 0.0;
 	UE_LOG(LogGameIQBlueprints, Display,
-		TEXT("Game IQ: rendered %d Blueprints (%d skipped, unchanged) — %d entities (graphs/vars/components), %d edges, %d chunks to %s"),
-		Rendered, Skipped, Entities.Num(), Edges.Num(), Chunks.Num(), *FPaths::Combine(OutDir, TEXT("blueprints.json")));
+		TEXT("Game IQ: rendered %d Blueprints (%d skipped-unchanged, %.0f%% cache hits; %d shallow) — wrote %s blueprints.json: %d entities, %d edges, %d chunks"),
+		Rendered, Skipped, HitRate, Shallow, bDeltaMode ? TEXT("delta") : TEXT("full"),
+		Entities.Num(), Edges.Num(), Chunks.Num());
 	return 0;
 }

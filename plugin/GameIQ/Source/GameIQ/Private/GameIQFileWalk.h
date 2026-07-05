@@ -52,6 +52,49 @@ namespace GameIQWalk
 		return Excludes;
 	}
 
+	/**
+	 * gameiq.config.json `shallowPaths`: package-path prefixes ("/Game/UltraDynamicSky") for
+	 * third-party/marketplace content living inside /Game. Assets under a shallow path keep full
+	 * Tier 0 registry coverage (identity + dependency graph) but skip deep extraction — no UObject
+	 * load in the Assets stage, no Tier 2 pseudocode in the Blueprints stage. Both faster and
+	 * better retrieval (vendor internals stop drowning search results).
+	 */
+	inline TArray<FString> LoadShallowPackagePaths(const FString& Root)
+	{
+		TArray<FString> Paths;
+		FString Json;
+		if (FFileHelper::LoadFileToString(Json, *FPaths::Combine(Root, TEXT("gameiq.config.json"))))
+		{
+			TSharedPtr<FJsonObject> Obj;
+			const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Json);
+			const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+			if (FJsonSerializer::Deserialize(Reader, Obj) && Obj.IsValid() && Obj->TryGetArrayField(TEXT("shallowPaths"), Arr))
+			{
+				for (const TSharedPtr<FJsonValue>& V : *Arr)
+				{
+					FString S;
+					if (V.IsValid() && V->TryGetString(S) && !S.IsEmpty())
+					{
+						S = S.Replace(TEXT("\\"), TEXT("/")).TrimStartAndEnd();
+						while (S.EndsWith(TEXT("/"))) { S.LeftChopInline(1); }
+						if (S.StartsWith(TEXT("/"))) { Paths.Add(S); }
+					}
+				}
+			}
+		}
+		return Paths;
+	}
+
+	/** True when a package name ("/Game/Foo/Bar") falls under one of the shallow path prefixes. */
+	inline bool IsShallowPackage(const FString& PackageName, const TArray<FString>& ShallowPaths)
+	{
+		for (const FString& P : ShallowPaths)
+		{
+			if (PackageName == P || PackageName.StartsWith(P + TEXT("/"))) { return true; }
+		}
+		return false;
+	}
+
 	inline bool IsExcluded(const FString& Name, const FString& Rel, const TArray<FString>& Excludes)
 	{
 		for (const FString& E : Excludes)

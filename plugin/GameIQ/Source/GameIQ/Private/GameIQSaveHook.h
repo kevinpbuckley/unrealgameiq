@@ -3,6 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Containers/Ticker.h"
 #include "EditorSubsystem.h"
 #include "UObject/ObjectSaveContext.h"
 #include "GameIQSaveHook.generated.h"
@@ -12,11 +13,10 @@ struct FAssetData;
 
 /**
  * Incremental index updates (design §8). While the editor is open this subsystem keeps the
- * Game IQ index in step with edits: on save it extracts the changed asset in-memory (same
- * recipe as the commandlets) and writes a delta to `<project>/.gameiq/extract/incremental/`;
- * on delete/rename it writes a delta that removes the asset. The MCP server drains pending
- * deltas before its next query, so an agent always sees the current project — no full rebuild,
- * no watcher, no editor stall.
+ * Game IQ index in step with edits: a save enqueues the package and a low-frequency ticker
+ * extracts + patches SQLite on the next editor tick(s) — extraction and the DB write happen
+ * OFF the save critical path, so saving never stalls on Game IQ. Deletes/renames patch
+ * immediately (no extraction, just a subtree drop). No full rebuild, no watcher, no Node.
  */
 UCLASS()
 class UGameIQSaveHookSubsystem : public UEditorSubsystem
@@ -32,12 +32,20 @@ private:
 	void OnAssetRemoved(const FAssetData& AssetData);
 	void OnAssetRenamed(const FAssetData& AssetData, const FString& OldObjectPath);
 
-	/** Serialize a delta to a unique file in the incremental dir. */
-	void WriteDelta(
-		const TArray<FString>& Replaces,
-		const TArray<TSharedPtr<FJsonValue>>& Entities,
-		const TArray<TSharedPtr<FJsonValue>>& Edges,
-		const TArray<TSharedPtr<FJsonValue>>& Chunks);
+	/** Ticker callback: extract + patch one queued package per tick. */
+	bool ProcessQueue(float DeltaTime);
+	void EnsureTicker();
+
+	/** Extract the (still-loaded) package and patch the index. */
+	void PatchSavedPackage(const FString& PackageName);
+
+	/** Apply a subtree-drop patch (delete/rename) directly — cheap, no extraction. */
+	void DropSubtree(const FString& EntityId);
+
+	/** Saved packages waiting for extraction (deduped; insertion-ordered). */
+	TArray<FString> PendingPackages;
+	TSet<FString> PendingSet;
+	FTSTicker::FDelegateHandle TickerHandle;
 
 	FDelegateHandle SaveHandle;
 	FDelegateHandle RemovedHandle;

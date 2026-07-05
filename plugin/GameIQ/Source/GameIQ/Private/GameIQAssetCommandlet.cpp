@@ -27,9 +27,13 @@
 #include "Engine/Texture2D.h"
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
+#include "GameIQFileWalk.h"
 #include "GameIQHash.h"
 #include "GameIQJson.h"
+#include "GameIQStore.h"
+#include "GameIQTextUtil.h"
 #include "HAL/FileManager.h"
+#include "HAL/PlatformMemory.h"
 #include "HAL/PlatformTime.h"
 #include "Materials/MaterialInstance.h"
 #include "Materials/MaterialInterface.h"
@@ -48,13 +52,6 @@ namespace
 {
 	const TCHAR* AssetsProducer = TEXT("gameiq-ue-assets@0.1.0");
 	constexpr int32 MaxActorEntitiesPerLevel = 500; // list this many actors; always aggregate counts
-
-	// A full GC pass costs O(entire live UObject graph), not O(one asset) — flushing after every
-	// asset would spend more time in GC than extraction and would thrash shared dependencies
-	// (a material used by 50 meshes gets reloaded 50 times). Flushing every N loaded assets instead
-	// amortizes that cost while still bounding peak memory across a full /Game scan.
-	// (Named per-commandlet: unity builds merge these anonymous namespaces into one TU.)
-	constexpr int32 AssetGCFlushInterval = 300;
 
 	/** Stable Game IQ id for a loaded asset, from its package name: asset:/Game/Path/Name. */
 	FString AssetIdOf(const UObject* Obj)
@@ -82,10 +79,10 @@ namespace
 	}
 
 	/**
-	 * Generic fallback for any asset without a bespoke recipe (design §5.1 "reflection export
-	 * is the foundation"). Reflects the asset's top-level UPROPERTYs into a bounded property
-	 * bag via ExportTextItem_Direct, and turns object-reference properties into `references`
-	 * edges — so Niagara systems, sounds, physics assets, data assets, etc. are never invisible.
+	 * Generic fallback for a LOADED asset without a bespoke recipe. Reflects the asset's top-level
+	 * UPROPERTYs into a bounded property bag via ExportTextItem_Direct, and turns object-reference
+	 * properties into `references` edges. Only used where an object is already in memory (the save
+	 * hook); the commandlet's bulk path uses the no-load ExtractFromTags below instead.
 	 */
 	FString GenericReflectionSummary(FOut& O, const UObject* Asset, const FString& Id)
 	{
@@ -126,10 +123,86 @@ namespace
 		return FString::Join(Lines, TEXT(", "));
 	}
 
-	void RecipeStaticMesh(FOut& O, const UStaticMesh* Mesh, const FString& Id, const FString& Name)
+	/** Parse an AssetRegistry tag value that references an object — "/Game/Path/Asset.Asset" or
+	 *  "Class'/Game/Path/Asset.Asset'" — down to its /Game package name. Empty if it's not one. */
+	FString PackageFromTagValue(const FString& Raw)
+	{
+		FString S = Raw;
+		int32 Quote;
+		if (S.FindChar(TEXT('\''), Quote)) { S = S.Mid(Quote + 1); S.RemoveFromEnd(TEXT("'")); }
+		if (!S.StartsWith(TEXT("/Game"))) { return FString(); }
+		int32 Dot;
+		if (S.FindChar(TEXT('.'), Dot)) { S.LeftInline(Dot); }
+		return S;
+	}
+
+	/**
+	 * No-load extraction from AssetRegistry tags alone, for every asset class without a bespoke
+	 * recipe (design §5.1's "shallow coverage for free" — Niagara, sounds, anim assets, physics,
+	 * data assets, marketplace types, …) and for assets under a `shallowPaths` prefix. The tags
+	 * carry the class's own registry-published summary values; object-path tag values become
+	 * typed `references` edges (an AnimSequence's Skeleton tag becomes `uses-skeleton`). Deep
+	 * dependency coverage is already guaranteed by the Tier 0 registry export, so skipping the
+	 * UObject load here loses nothing structural — it removes the single biggest cost of a full
+	 * rebuild (synchronously loading tens of thousands of assets).
+	 */
+	void ExtractFromTags(FOut& O, const FAssetData& Data, const FString& Id, const FString& Name)
+	{
+		const FString ClassName = Data.AssetClassPath.GetAssetName().ToString();
+
+		TArray<FString> Lines;
+		int32 Count = 0;
+		for (const TPair<FName, FAssetTagValueRef>& Tag : Data.TagsAndValues)
+		{
+			if (Count >= 12) { break; }
+			const FString Key = Tag.Key.ToString();
+			// Editor bookkeeping tags that never answer a project question.
+			if (Key == TEXT("FiBData") || Key == TEXT("AssetImportData") || Key == TEXT("PrimaryAssetType") ||
+				Key == TEXT("PrimaryAssetName") || Key.StartsWith(TEXT("Blueprint")))
+			{
+				continue;
+			}
+			const FString Value = Tag.Value.AsString();
+			if (Value.IsEmpty() || Value.Len() > 96) { continue; }
+
+			const FString RefPackage = PackageFromTagValue(Value);
+			if (!RefPackage.IsEmpty())
+			{
+				const FString RefName = FPaths::GetBaseFilename(RefPackage);
+				// Semantic edge where the tag name tells us the relation; generic references otherwise.
+				const bool bSkeleton = Key == TEXT("Skeleton");
+				O.Edges.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEdge(
+					Id, FString::Printf(TEXT("asset:%s"), *RefPackage),
+					bSkeleton ? TEXT("uses-skeleton") : TEXT("references"), Key)));
+				Lines.Add(FString::Printf(TEXT("%s=%s"), *Key, *RefName));
+				++Count;
+				continue;
+			}
+
+			Lines.Add(FString::Printf(TEXT("%s=%s"), *Key, *GameIQ::OneLine(Value)));
+			++Count;
+		}
+
+		AddSummary(O, Id, Lines.Num() == 0
+			? FString::Printf(TEXT("%s (%s)"), *Name, *ClassName)
+			: FString::Printf(TEXT("%s (%s)\n%s"), *Name, *ClassName, *FString::Join(Lines, TEXT(", "))));
+	}
+
+	void RecipeStaticMesh(FOut& O, const UStaticMesh* Mesh, const FString& Id, const FString& Name, const FAssetData* RegistryData)
 	{
 		const int32 LODs = Mesh->GetNumLODs();
-		const int32 Tris = LODs > 0 ? Mesh->GetNumTriangles(0) : 0;
+		// Triangle count: prefer the registry tag (published at save time, no derived data),
+		// fall back to render data only when it's already built — never force a DDC build for a stat.
+		int32 Tris = 0;
+		FString TagTris;
+		if (RegistryData && RegistryData->GetTagValue(FName(TEXT("Triangles")), TagTris))
+		{
+			Tris = FCString::Atoi(*TagTris);
+		}
+		if (Tris == 0 && Mesh->HasValidRenderData() && LODs > 0)
+		{
+			Tris = Mesh->GetNumTriangles(0);
+		}
 		const TArray<FStaticMaterial>& Mats = Mesh->GetStaticMaterials();
 		TArray<FString> MatNames;
 		for (const FStaticMaterial& M : Mats)
@@ -278,19 +351,6 @@ namespace
 			? ValueEnum->GetNameStringByValue(static_cast<int64>(IA->ValueType))
 			: FString::FromInt(static_cast<int32>(IA->ValueType));
 		AddSummary(O, Id, FString::Printf(TEXT("%s (InputAction)\nValueType: %s"), *Name, *ValueType));
-	}
-
-	/** "DirectionalLight" → "Directional Light" so FTS (whole-word tokens) matches a search for "light". */
-	FString SplitCamel(const FString& In)
-	{
-		FString Out;
-		for (int32 i = 0; i < In.Len(); ++i)
-		{
-			const TCHAR C = In[i];
-			if (i > 0 && FChar::IsUpper(C) && !FChar::IsUpper(In[i - 1])) { Out.AppendChar(TEXT(' ')); }
-			Out.AppendChar(C);
-		}
-		return Out;
 	}
 
 	/**
@@ -460,7 +520,7 @@ namespace
 		return GenericActorDetail(O, Actor, ActorId, OutJson);
 	}
 
-	void RecipeLevel(FOut& O, UWorld* World, const FString& Id, const FString& Name)
+	void RecipeLevel(FOut& O, UWorld* World, const FString& Id, const FString& Name, bool bIncludeExternalActors)
 	{
 		ULevel* Level = World->PersistentLevel;
 		if (!Level) { return; }
@@ -518,7 +578,7 @@ namespace
 				// compound class token (FTS indexes whole words).
 				O.Chunks.Add(MakeShared<FJsonValueObject>(GameIQ::MakeChunk(
 					FString::Printf(TEXT("%s#actor"), *ActorId), ActorId, TEXT("recipe-summary"),
-					FString::Printf(TEXT("%s (%s / %s) in %s%s"), *ActorLabel, *ClassName, *SplitCamel(ClassName), *Name,
+					FString::Printf(TEXT("%s (%s / %s) in %s%s"), *ActorLabel, *ClassName, *GameIQText::SplitCamel(ClassName), *Name,
 						Detail.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" — %s"), *Detail)))));
 				++Listed;
 			}
@@ -531,7 +591,10 @@ namespace
 		// only WorldSettings/Brush/WorldDataLayers. Pull those packages from the Asset Registry and
 		// extract each the same way, so a WP level's lights/actors become real, linked level-actor
 		// entities with full detail instead of orphaned generic assets. (§12.12)
+		// Skipped on the save-hook path (bIncludeExternalActors=false): loading hundreds of OFPA
+		// packages mid-save would stall the editor; the build refreshes them instead.
 		int32 External = 0;
+		if (bIncludeExternalActors)
 		{
 			const FString LevelPackage = World->GetPackage()->GetName();
 			const FString ExtPath = ULevel::GetExternalActorsPath(LevelPackage);
@@ -565,20 +628,34 @@ namespace
 		AddSummary(O, Id, FString::Printf(TEXT("%s (Level)\nActors: %d in %d classes%s%s\n%s"),
 			*Name, Total, ClassCounts.Num(), *WpNote, *CapNote, *FString::Join(CountLines, TEXT(", "))));
 	}
+
+	/** Asset classes whose bespoke recipe needs the UObject loaded. Everything else goes through
+	 *  the no-load tag path. (A custom C++ subclass of one of these registers under its own class
+	 *  name and falls to the tag path — Tier 0 still covers it fully.) */
+	bool ClassNeedsLoad(const FString& AssetClassName)
+	{
+		static const TSet<FString> LoadClasses = {
+			TEXT("StaticMesh"), TEXT("SkeletalMesh"), TEXT("Skeleton"), TEXT("DataTable"),
+			TEXT("Material"), TEXT("MaterialInstanceConstant"),
+			TEXT("InputMappingContext"), TEXT("InputAction"), TEXT("World") };
+		return LoadClasses.Contains(AssetClassName);
+	}
 }
 
 void GameIQAsset::ExtractAsset(
 	UObject* Asset,
 	TArray<TSharedPtr<FJsonValue>>& Entities,
 	TArray<TSharedPtr<FJsonValue>>& Edges,
-	TArray<TSharedPtr<FJsonValue>>& Chunks)
+	TArray<TSharedPtr<FJsonValue>>& Chunks,
+	const FAssetData* RegistryData,
+	bool bIncludeExternalActors)
 {
 	if (!Asset || !IsProjectObject(Asset)) { return; }
 	FOut O{ Entities, Edges, Chunks };
 	const FString Id = AssetIdOf(Asset);
 	const FString Name = Asset->GetName();
 
-	if (const UStaticMesh* SM = Cast<UStaticMesh>(Asset)) { RecipeStaticMesh(O, SM, Id, Name); }
+	if (const UStaticMesh* SM = Cast<UStaticMesh>(Asset)) { RecipeStaticMesh(O, SM, Id, Name, RegistryData); }
 	else if (const USkeletalMesh* SK = Cast<USkeletalMesh>(Asset)) { RecipeSkeletalMesh(O, SK, Id, Name); }
 	else if (const UTexture2D* Tex = Cast<UTexture2D>(Asset)) { RecipeTexture(O, Tex, Id, Name); }
 	else if (const USkeleton* Skel = Cast<USkeleton>(Asset)) { RecipeSkeleton(O, Skel, Id, Name); }
@@ -586,7 +663,7 @@ void GameIQAsset::ExtractAsset(
 	else if (const UMaterialInterface* Mat = Cast<UMaterialInterface>(Asset)) { RecipeMaterial(O, Mat, Id, Name); }
 	else if (const UInputMappingContext* IMC = Cast<UInputMappingContext>(Asset)) { RecipeInputMappingContext(O, IMC, Id, Name); }
 	else if (const UInputAction* IA = Cast<UInputAction>(Asset)) { RecipeInputAction(O, IA, Id, Name); }
-	else if (UWorld* World = Cast<UWorld>(Asset)) { RecipeLevel(O, World, Id, Name); }
+	else if (UWorld* World = Cast<UWorld>(Asset)) { RecipeLevel(O, World, Id, Name, bIncludeExternalActors); }
 	else
 	{
 		const FString Props = GenericReflectionSummary(O, Asset, Id);
@@ -615,13 +692,38 @@ int32 UGameIQAssetsCommandlet::Main(const FString& Params)
 	}
 	IFileManager::Get().MakeDirectory(*OutDir, /*Tree=*/true);
 
+	const FString ProjectRoot = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir());
+	const TArray<FString> ShallowPaths = GameIQWalk::LoadShallowPackagePaths(ProjectRoot);
+	if (ShallowPaths.Num() > 0)
+	{
+		UE_LOG(LogGameIQAssets, Display, TEXT("Game IQ assets: %d shallow content path(s) — tag-only extraction, no loads under: %s"),
+			ShallowPaths.Num(), *FString::Join(ShallowPaths, TEXT(", ")));
+	}
+
 	// Incremental rebuild (-full forces a from-scratch pass, ignoring/overwriting the cache).
+	// The cache is keyed to the index DB's generation: if the DB was rebuilt (self-heal, deleted),
+	// "unchanged" would mean "carried forward into a DB that doesn't hold the rows" — invalid.
 	const bool bForceFull = FParse::Param(*Params, TEXT("full"));
+	FString DbGeneration = FGameIQStore::ReadMetaValue(TEXT("dbGeneration"));
+	if (DbGeneration.IsEmpty())
+	{
+		// No index DB yet (or no generation stamp): create it now so the signature cache written at
+		// the end of this run is keyed to a real generation and the NEXT run can be incremental.
+		// (GameIQBuild pre-creates the DB before launching stages; this covers standalone runs.)
+		FGameIQStore Store;
+		if (Store.Open())
+		{
+			DbGeneration = Store.GetMeta(TEXT("dbGeneration"));
+			Store.Close();
+		}
+	}
 	const FString HashCachePath = FPaths::Combine(OutDir, TEXT("asset-hashes.json"));
-	TMap<FString, GameIQHash::FCachedAssetRow> PrevCache =
-		bForceFull ? TMap<FString, GameIQHash::FCachedAssetRow>() : GameIQHash::LoadAssetHashCache(HashCachePath);
-	TMap<FString, GameIQHash::FCachedAssetRow> NewCache;
-	NewCache.Reserve(PrevCache.Num());
+	TMap<FString, FString> PrevSigs = (bForceFull || DbGeneration.IsEmpty())
+		? TMap<FString, FString>()
+		: GameIQHash::LoadSignatureCache(HashCachePath, DbGeneration);
+	const bool bDeltaMode = PrevSigs.Num() > 0;
+	TMap<FString, FString> NewSigs;
+	NewSigs.Reserve(PrevSigs.Num());
 
 	FAssetRegistryModule& ARM =
 		FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
@@ -637,21 +739,48 @@ int32 UGameIQAssetsCommandlet::Main(const FString& Params)
 	TArray<TSharedPtr<FJsonValue>> Entities;
 	TArray<TSharedPtr<FJsonValue>> Edges;
 	TArray<TSharedPtr<FJsonValue>> Chunks;
+	TArray<FString> Replaces;    // delta mode: changed + removed subtree roots
+	TSet<FString> SeenIds;       // to compute removals against the previous cache
 
 	const int32 TotalAssets = Assets.Num();
 	int32 Considered = 0;
+	int32 Loaded = 0;
+	int32 TagOnly = 0;
 	int32 Skipped = 0;
 	int32 Index = 0;
 	int32 LoadedSinceLastGC = 0;
 	double LastProgressLogTime = FPlatformTime::Seconds();
+
+	// GC policy: a full purge costs O(entire live UObject graph), so run it on memory pressure
+	// (checked every 64 loads) with a hard backstop every 1000 loads — not on a fixed small
+	// interval that mostly measures GC, and never for tag-only assets (nothing was loaded).
+	auto MaybeCollectGarbage = [&LoadedSinceLastGC]()
+	{
+		if (++LoadedSinceLastGC >= 1000)
+		{
+			CollectGarbage(RF_NoFlags, /*bPerformFullPurge=*/true);
+			LoadedSinceLastGC = 0;
+			return;
+		}
+		if ((LoadedSinceLastGC & 63) == 0)
+		{
+			const FPlatformMemoryStats Stats = FPlatformMemory::GetStats();
+			if (Stats.UsedPhysical > Stats.TotalPhysical / 10 * 7)
+			{
+				CollectGarbage(RF_NoFlags, /*bPerformFullPurge=*/true);
+				LoadedSinceLastGC = 0;
+			}
+		}
+	};
+
 	for (const FAssetData& Data : Assets)
 	{
 		++Index;
 		const double Now = FPlatformTime::Seconds();
 		if (Now - LastProgressLogTime >= 2.0)
 		{
-			UE_LOG(LogGameIQAssets, Display, TEXT("Game IQ assets: %d/%d scanned (%d loaded, %d skipped-unchanged so far)..."),
-				Index, TotalAssets, Considered - Skipped, Skipped);
+			UE_LOG(LogGameIQAssets, Display, TEXT("Game IQ assets: %d/%d scanned (%d loaded, %d tag-only, %d skipped-unchanged so far)..."),
+				Index, TotalAssets, Loaded, TagOnly, Skipped);
 			LastProgressLogTime = Now;
 		}
 
@@ -661,87 +790,87 @@ int32 UGameIQAssetsCommandlet::Main(const FString& Params)
 		// World Partition external actors (One-File-Per-Actor) are resolved by RecipeLevel into typed,
 		// level-linked actor entities — skip them here so they aren't also emitted as orphaned generic
 		// assets (which surfaced only misleading top-level property diffs, no light detail).
-		if (Data.PackageName.ToString().Contains(TEXT("/__ExternalActors__/"))) { continue; }
+		const FString PackageName = Data.PackageName.ToString();
+		if (PackageName.Contains(TEXT("/__ExternalActors__/"))) { continue; }
 
 		const FString Id = GameIQHash::AssetIdOfPackage(Data.PackageName);
 		const FString Sig = GameIQHash::ComputeChangeSignature(AR, Data);
+		SeenIds.Add(Id);
+		++Considered;
 
-		// Incremental rebuild: an unchanged asset's previously-extracted rows are carried forward
-		// verbatim (from the last run's cache), so completeness never regresses — only the
-		// (expensive) load + extraction is skipped. An empty Sig means "unknown" and is never cached
-		// or matched, so an asset Game IQ can't confidently fingerprint is always reprocessed.
-		if (!Sig.IsEmpty())
+		// Incremental rebuild: an unchanged asset's rows already live in the index — skip it
+		// entirely (it is neither re-extracted nor re-serialized). An empty Sig means "unknown"
+		// and is never cached or matched, so an asset Game IQ can't confidently fingerprint is
+		// always reprocessed.
+		if (bDeltaMode && !Sig.IsEmpty())
 		{
-			if (const GameIQHash::FCachedAssetRow* Cached = PrevCache.Find(Id))
+			if (const FString* Prev = PrevSigs.Find(Id))
 			{
-				if (Cached->Signature == Sig)
+				if (*Prev == Sig)
 				{
-					Entities.Append(Cached->Entities);
-					Edges.Append(Cached->Edges);
-					Chunks.Append(Cached->Chunks);
-					NewCache.Add(Id, *Cached);
-					++Considered;
+					NewSigs.Add(Id, Sig);
 					++Skipped;
 					continue;
 				}
 			}
 		}
 
-		const int32 EntitiesBefore = Entities.Num();
-		const int32 EdgesBefore = Edges.Num();
-		const int32 ChunksBefore = Chunks.Num();
+		FOut O{ Entities, Edges, Chunks };
+		const FString AssetName = Data.AssetName.ToString();
+		const FString ClassName = Data.AssetClassPath.GetAssetName().ToString();
 
-		// Texture2D's summary is fully derivable from AssetRegistry tags (Dimensions) — skip the
-		// full load entirely for it. Any UTexture2D subclass falls through to the normal load path
-		// below unchanged, exactly as it did before this fast path existed.
 		bool bHandled = false;
-		if (Data.AssetClassPath.GetAssetName() == FName(TEXT("Texture2D")))
+		// Texture2D: dimensions come from the registry's `Dimensions` tag — no load.
+		if (ClassName == TEXT("Texture2D"))
 		{
-			FOut O{ Entities, Edges, Chunks };
-			bHandled = ExtractTextureNoLoad(O, Data, Id, Data.AssetName.ToString());
+			bHandled = ExtractTextureNoLoad(O, Data, Id, AssetName);
+			if (bHandled) { ++TagOnly; }
+		}
+		// Shallow content and every class without a bespoke recipe: tag-based summary, no load.
+		if (!bHandled && (GameIQWalk::IsShallowPackage(PackageName, ShallowPaths) || !ClassNeedsLoad(ClassName)))
+		{
+			ExtractFromTags(O, Data, Id, AssetName);
+			bHandled = true;
+			++TagOnly;
 		}
 
 		if (!bHandled)
 		{
 			UObject* Asset = Data.GetAsset();
 			if (!Asset || !IsProjectObject(Asset)) { continue; }
-			GameIQAsset::ExtractAsset(Asset, Entities, Edges, Chunks);
-
-			// Bound peak memory across a full /Game scan: nothing here holds a reference to Asset
-			// (or the dependencies it pulled in) past this point, so a periodic flush lets the GC
-			// actually reclaim them — a commandlet's Main() never yields back to the engine tick
-			// loop that would otherwise trigger this automatically.
-			if (++LoadedSinceLastGC >= AssetGCFlushInterval)
-			{
-				CollectGarbage(RF_NoFlags, /*bPerformFullPurge=*/true);
-				LoadedSinceLastGC = 0;
-			}
+			GameIQAsset::ExtractAsset(Asset, Entities, Edges, Chunks, &Data);
+			++Loaded;
+			MaybeCollectGarbage();
 		}
-		++Considered;
 
-		if (!Sig.IsEmpty())
+		if (bDeltaMode) { Replaces.Add(Id); }
+		if (!Sig.IsEmpty()) { NewSigs.Add(Id, Sig); }
+	}
+
+	// Assets that existed last run but are gone now: their producer-owned rows must be dropped.
+	if (bDeltaMode)
+	{
+		for (const TPair<FString, FString>& Prev : PrevSigs)
 		{
-			GameIQHash::FCachedAssetRow Row;
-			Row.Signature = Sig;
-			if (const int32 N = Entities.Num() - EntitiesBefore) { Row.Entities.Append(Entities.GetData() + EntitiesBefore, N); }
-			if (const int32 N = Edges.Num() - EdgesBefore) { Row.Edges.Append(Edges.GetData() + EdgesBefore, N); }
-			if (const int32 N = Chunks.Num() - ChunksBefore) { Row.Chunks.Append(Chunks.GetData() + ChunksBefore, N); }
-			NewCache.Add(Id, MoveTemp(Row));
+			if (!SeenIds.Contains(Prev.Key)) { Replaces.Add(Prev.Key); }
 		}
 	}
 
-	GameIQHash::SaveAssetHashCache(HashCachePath, NewCache);
-	UE_LOG(LogGameIQAssets, Display, TEXT("Game IQ assets: %d/%d loaded, %d skipped (unchanged)."),
-		Considered - Skipped, TotalAssets, Skipped);
+	GameIQHash::SaveSignatureCache(HashCachePath, NewSigs, DbGeneration);
+	const double HitRate = Considered > 0 ? 100.0 * Skipped / Considered : 0.0;
+	UE_LOG(LogGameIQAssets, Display, TEXT("Game IQ assets: %d considered — %d loaded, %d tag-only, %d skipped-unchanged (%.0f%% cache hits)."),
+		Considered, Loaded, TagOnly, Skipped, HitRate);
 
-	if (!GameIQ::WriteOutput(OutDir, TEXT("assets.json"), AssetsProducer, Entities, Edges, Chunks))
+	if (!GameIQ::WriteOutput(OutDir, TEXT("assets.json"), AssetsProducer, Entities, Edges, Chunks,
+		bDeltaMode ? &Replaces : nullptr))
 	{
 		UE_LOG(LogGameIQAssets, Error, TEXT("Failed to write assets.json to %s"), *OutDir);
 		return 1;
 	}
 
 	UE_LOG(LogGameIQAssets, Display,
-		TEXT("Game IQ: summarized %d assets — %d entities, %d edges, %d chunks to %s"),
-		Considered, Entities.Num(), Edges.Num(), Chunks.Num(), *FPaths::Combine(OutDir, TEXT("assets.json")));
+		TEXT("Game IQ: wrote %s assets.json — %d entities, %d edges, %d chunks%s"),
+		bDeltaMode ? TEXT("delta") : TEXT("full"), Entities.Num(), Edges.Num(), Chunks.Num(),
+		bDeltaMode ? *FString::Printf(TEXT(" (%d replaced roots)"), Replaces.Num()) : TEXT(""));
 	return 0;
 }

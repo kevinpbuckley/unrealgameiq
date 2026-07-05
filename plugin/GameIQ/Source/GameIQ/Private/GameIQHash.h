@@ -15,13 +15,21 @@
 #include "Serialization/JsonWriter.h"
 
 /**
- * Incremental-rebuild support (design: skip unchanged assets on a full rebuild without losing
- * completeness). `inline` so multiple commandlet translation units can include this without
- * ODR/redefinition conflicts, matching GameIQJson.h's convention.
+ * Incremental-rebuild support: skip unchanged assets on a rebuild without losing completeness.
+ *
+ * The cache stores ONLY per-asset signatures (plus the dbGeneration it was built against). The
+ * previously-extracted rows for unchanged assets are NOT duplicated here — they already live in
+ * the SQLite index, and the extractor emits a producer-scoped *delta* (`replaces` = changed +
+ * removed ids) that the ingest applies on top. (v1 of this cache carried every asset's full
+ * entities/edges/chunks forward through a JSON side-car that grew larger than the extract itself
+ * — 60 MB of pure duplication per run on a mid-size project.)
+ *
+ * `inline` so multiple commandlet translation units can include this without ODR/redefinition
+ * conflicts, matching GameIQJson.h's convention.
  */
 namespace GameIQHash
 {
-	inline constexpr int32 CacheSchemaVersion = 1;
+	inline constexpr int32 CacheSchemaVersion = 2; // v2: sig-only + dbGeneration (v1 carried full rows)
 
 	/** Stable Game IQ id for an asset from its package name, with no load required — matches
 	 *  the `asset:%s` format used by the loaded-object AssetIdOf() and GameIQSaveHook.cpp. */
@@ -45,22 +53,16 @@ namespace GameIQHash
 		return Hash.IsZero() ? FString() : LexToString(Hash);
 	}
 
-	/** One asset's cached signature + the exact entities/edges/chunks its extraction produced
-	 *  last run, carried forward verbatim on a cache hit so output completeness never regresses. */
-	struct FCachedAssetRow
+	/**
+	 * Load a producer's signature cache (e.g. `.gameiq/extract/asset-hashes.json`): id → sig.
+	 * Returns an empty map on a missing file, a parse failure, a schema-version mismatch, or a
+	 * dbGeneration mismatch (the index DB was rebuilt since this cache was written, so "unchanged"
+	 * assets would be carried forward into a DB that doesn't hold their rows) — any of which means
+	 * "no usable cache", so callers naturally fall back to a full extraction.
+	 */
+	inline TMap<FString, FString> LoadSignatureCache(const FString& FilePath, const FString& CurrentDbGeneration)
 	{
-		FString Signature;
-		TArray<TSharedPtr<FJsonValue>> Entities;
-		TArray<TSharedPtr<FJsonValue>> Edges;
-		TArray<TSharedPtr<FJsonValue>> Chunks;
-	};
-
-	/** Load a producer's asset-hash side-car (e.g. `.gameiq/extract/asset-hashes.json`). Returns
-	 *  an empty map on a missing file, a parse failure, or a schema-version mismatch — any of
-	 *  which means "no usable cache", so callers naturally fall back to a full extraction. */
-	inline TMap<FString, FCachedAssetRow> LoadAssetHashCache(const FString& FilePath)
-	{
-		TMap<FString, FCachedAssetRow> Result;
+		TMap<FString, FString> Result;
 
 		FString Text;
 		if (!FFileHelper::LoadFileToString(Text, *FilePath)) { return Result; }
@@ -75,47 +77,45 @@ namespace GameIQHash
 			return Result;
 		}
 
-		const TSharedPtr<FJsonObject>* AssetsObj = nullptr;
-		if (!Root->TryGetObjectField(TEXT("assets"), AssetsObj) || !AssetsObj || !AssetsObj->IsValid())
+		FString Generation;
+		Root->TryGetStringField(TEXT("dbGeneration"), Generation);
+		if (CurrentDbGeneration.IsEmpty() || Generation != CurrentDbGeneration)
 		{
 			return Result;
 		}
 
-		for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : (*AssetsObj)->Values)
+		const TSharedPtr<FJsonObject>* SigsObj = nullptr;
+		if (!Root->TryGetObjectField(TEXT("sigs"), SigsObj) || !SigsObj || !SigsObj->IsValid())
 		{
-			const TSharedPtr<FJsonObject> EntryObj = Pair.Value.IsValid() ? Pair.Value->AsObject() : nullptr;
-			if (!EntryObj.IsValid()) { continue; }
+			return Result;
+		}
 
-			FCachedAssetRow Row;
-			EntryObj->TryGetStringField(TEXT("sig"), Row.Signature);
-			const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
-			if (EntryObj->TryGetArrayField(TEXT("entities"), Arr)) { Row.Entities = *Arr; }
-			if (EntryObj->TryGetArrayField(TEXT("edges"), Arr)) { Row.Edges = *Arr; }
-			if (EntryObj->TryGetArrayField(TEXT("chunks"), Arr)) { Row.Chunks = *Arr; }
-			Result.Add(Pair.Key, MoveTemp(Row));
+		for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : (*SigsObj)->Values)
+		{
+			FString Sig;
+			if (Pair.Value.IsValid() && Pair.Value->TryGetString(Sig) && !Sig.IsEmpty())
+			{
+				Result.Add(Pair.Key, MoveTemp(Sig));
+			}
 		}
 		return Result;
 	}
 
-	/** Save a producer's asset-hash side-car. Writes to a temp file then renames over the
-	 *  destination so a process killed mid-write can never leave a half-written cache that would
-	 *  cause false skips on the next run. */
-	inline bool SaveAssetHashCache(const FString& FilePath, const TMap<FString, FCachedAssetRow>& Cache)
+	/** Save a producer's signature cache. Writes to a temp file then renames over the destination
+	 *  so a process killed mid-write can never leave a half-written cache that would cause false
+	 *  skips on the next run. */
+	inline bool SaveSignatureCache(const FString& FilePath, const TMap<FString, FString>& Sigs, const FString& DbGeneration)
 	{
-		const TSharedRef<FJsonObject> AssetsObj = MakeShared<FJsonObject>();
-		for (const TPair<FString, FCachedAssetRow>& Pair : Cache)
+		const TSharedRef<FJsonObject> SigsObj = MakeShared<FJsonObject>();
+		for (const TPair<FString, FString>& Pair : Sigs)
 		{
-			const TSharedRef<FJsonObject> Entry = MakeShared<FJsonObject>();
-			Entry->SetStringField(TEXT("sig"), Pair.Value.Signature);
-			Entry->SetArrayField(TEXT("entities"), Pair.Value.Entities);
-			Entry->SetArrayField(TEXT("edges"), Pair.Value.Edges);
-			Entry->SetArrayField(TEXT("chunks"), Pair.Value.Chunks);
-			AssetsObj->SetObjectField(Pair.Key, Entry);
+			SigsObj->SetStringField(Pair.Key, Pair.Value);
 		}
 
 		const TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
 		Root->SetNumberField(TEXT("schemaVersion"), CacheSchemaVersion);
-		Root->SetObjectField(TEXT("assets"), AssetsObj);
+		Root->SetStringField(TEXT("dbGeneration"), DbGeneration);
+		Root->SetObjectField(TEXT("sigs"), SigsObj);
 
 		FString Out;
 		const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Out);

@@ -85,12 +85,21 @@ namespace GameIQ
 		return O;
 	}
 
-	/** Serialize a full ExtractorOutput and save it to OutDir/FileName. Returns success. */
+	/**
+	 * Serialize a full ExtractorOutput and save it to OutDir/FileName. Returns success.
+	 *
+	 * `Replaces` (optional) switches the file to DELTA mode: it lists the entity ids whose
+	 * producer-owned subtrees this output replaces (changed + removed assets). Ingest applies a
+	 * delta with FGameIQStore::PatchProducerScoped on top of the rows already in the index,
+	 * instead of a full DeleteByProducer + reinsert — so an incremental extract only serializes
+	 * what actually changed. Pass nullptr (default) for a full snapshot.
+	 */
 	inline bool WriteOutput(
 		const FString& OutDir, const FString& FileName, const FString& Producer,
 		const TArray<TSharedPtr<FJsonValue>>& Entities,
 		const TArray<TSharedPtr<FJsonValue>>& Edges,
-		const TArray<TSharedPtr<FJsonValue>>& Chunks)
+		const TArray<TSharedPtr<FJsonValue>>& Chunks,
+		const TArray<FString>* Replaces = nullptr)
 	{
 		TSharedRef<FJsonObject> Project = MakeShared<FJsonObject>();
 		Project->SetStringField(TEXT("name"), FApp::GetProjectName());
@@ -104,6 +113,13 @@ namespace GameIQ
 		Root->SetArrayField(TEXT("entities"), Entities);
 		Root->SetArrayField(TEXT("edges"), Edges);
 		Root->SetArrayField(TEXT("chunks"), Chunks);
+		if (Replaces)
+		{
+			Root->SetStringField(TEXT("mode"), TEXT("delta"));
+			TArray<TSharedPtr<FJsonValue>> ReplacesJson;
+			for (const FString& R : *Replaces) { ReplacesJson.Add(MakeShared<FJsonValueString>(R)); }
+			Root->SetArrayField(TEXT("replaces"), ReplacesJson);
+		}
 
 		FString Out;
 		TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Out);
@@ -114,36 +130,4 @@ namespace GameIQ
 			Out, *FPaths::Combine(OutDir, FileName), FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
 	}
 
-	/**
-	 * Write an incremental delta to OutFile (absolute). Like WriteOutput but with a `replaces`
-	 * array — the entity ids whose subtrees this delta fully replaces (patch ingest, §8).
-	 */
-	inline bool WriteDelta(
-		const FString& OutFile, const FString& Producer, const TArray<FString>& Replaces,
-		const TArray<TSharedPtr<FJsonValue>>& Entities,
-		const TArray<TSharedPtr<FJsonValue>>& Edges,
-		const TArray<TSharedPtr<FJsonValue>>& Chunks)
-	{
-		TSharedRef<FJsonObject> Project = MakeShared<FJsonObject>();
-		Project->SetStringField(TEXT("name"), FApp::GetProjectName());
-		Project->SetStringField(TEXT("root"), FPaths::ConvertRelativePathToFull(FPaths::ProjectDir()));
-
-		TArray<TSharedPtr<FJsonValue>> ReplacesJson;
-		for (const FString& R : Replaces) { ReplacesJson.Add(MakeShared<FJsonValueString>(R)); }
-
-		TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
-		Root->SetNumberField(TEXT("schemaVersion"), SchemaVersion);
-		Root->SetStringField(TEXT("generatedAtIso"), FDateTime::UtcNow().ToIso8601());
-		Root->SetStringField(TEXT("producer"), Producer);
-		Root->SetObjectField(TEXT("project"), Project);
-		Root->SetArrayField(TEXT("entities"), Entities);
-		Root->SetArrayField(TEXT("edges"), Edges);
-		Root->SetArrayField(TEXT("chunks"), Chunks);
-		Root->SetArrayField(TEXT("replaces"), ReplacesJson);
-
-		FString Out;
-		TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Out);
-		FJsonSerializer::Serialize(Root, Writer);
-		return FFileHelper::SaveStringToFile(Out, *OutFile, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
-	}
 }

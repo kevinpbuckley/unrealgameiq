@@ -2,7 +2,7 @@
 
 #include "GameIQBuildProcess.h"
 
-#include "HAL/PlatformMisc.h"
+#include "HAL/FileManager.h"
 #include "Misc/App.h"
 #include "Misc/Paths.h"
 
@@ -12,13 +12,6 @@ namespace GameIQBuildProcess
 {
 	namespace
 	{
-		struct FInFlightStage
-		{
-			FString Name;
-			FProcHandle Handle;
-			double StartTime = 0.0;
-		};
-
 		/** Same resolution GameIQBuildRunner.cpp uses for the top-level build's own subprocess. */
 		bool ResolveExeAndProject(FString& OutExe, FString& OutProject)
 		{
@@ -28,80 +21,111 @@ namespace GameIQBuildProcess
 		}
 	}
 
-	bool RunStagesConcurrently(
-		const TArray<FStageSpec>& Specs,
-		const FString& ExtraArgs,
-		int32 MaxConcurrent,
-		TArray<GameIQ::FStageTiming>& OutTimings)
+	TArray<FLaunchedStage> LaunchStages(const TArray<FStageSpec>& Specs, const FString& ExtraArgs)
 	{
+		TArray<FLaunchedStage> Stages;
+
 		FString Exe, Project;
 		if (!ResolveExeAndProject(Exe, Project))
 		{
 			UE_LOG(LogGameIQBuildProcess, Error, TEXT("Game IQ: couldn't resolve UnrealEditor-Cmd/project to launch extraction stages."));
-			return false;
+			for (const FStageSpec& Spec : Specs)
+			{
+				FLaunchedStage Failed;
+				Failed.Spec = Spec;
+				Stages.Add(MoveTemp(Failed));
+			}
+			return Stages;
 		}
-		MaxConcurrent = FMath::Max(1, MaxConcurrent);
 
-		bool bAllOk = true;
-		int32 NextToLaunch = 0;
-		TArray<FInFlightStage> InFlight;
-
-		auto LaunchNext = [&]()
+		for (const FStageSpec& Spec : Specs)
 		{
-			const FStageSpec& Spec = Specs[NextToLaunch++];
 			const FString Args = ExtraArgs.IsEmpty()
 				? FString::Printf(TEXT("\"%s\" -run=%s -unattended -nopause -nosplash"), *Project, *Spec.RunArg)
 				: FString::Printf(TEXT("\"%s\" -run=%s -unattended -nopause -nosplash %s"), *Project, *Spec.RunArg, *ExtraArgs);
 
-			FInFlightStage Stage;
-			Stage.Name = Spec.Name;
+			FLaunchedStage Stage;
+			Stage.Spec = Spec;
 			Stage.StartTime = FPlatformTime::Seconds();
+			Stage.LaunchUtc = FDateTime::UtcNow();
 			Stage.Handle = FPlatformProcess::CreateProc(*Exe, *Args, /*bLaunchDetached=*/false,
 				/*bLaunchHidden=*/true, /*bLaunchReallyHidden=*/true, nullptr, 0, nullptr, nullptr, nullptr);
-			if (!Stage.Handle.IsValid())
+			Stage.bLaunched = Stage.Handle.IsValid();
+			if (Stage.bLaunched)
+			{
+				UE_LOG(LogGameIQBuildProcess, Display, TEXT("Game IQ: launched stage '%s' (-run=%s)..."), *Spec.Name, *Spec.RunArg);
+			}
+			else
 			{
 				UE_LOG(LogGameIQBuildProcess, Warning, TEXT("Game IQ: failed to start stage '%s' (-run=%s)."), *Spec.Name, *Spec.RunArg);
-				bAllOk = false;
-				OutTimings.Add(GameIQ::FStageTiming{Spec.Name, 0.0});
-				return;
 			}
-			UE_LOG(LogGameIQBuildProcess, Display, TEXT("Game IQ: launched stage '%s' (-run=%s)..."), *Spec.Name, *Spec.RunArg);
-			InFlight.Add(MoveTemp(Stage));
-		};
+			Stages.Add(MoveTemp(Stage));
+		}
+		return Stages;
+	}
 
-		while (NextToLaunch < Specs.Num() && InFlight.Num() < MaxConcurrent)
+	bool WaitForStages(
+		TArray<FLaunchedStage>& Stages,
+		const FString& ExtractDir,
+		TArray<GameIQ::FStageTiming>& OutTimings,
+		TArray<FString>& OutStaleOutputs)
+	{
+		bool bAllOk = true;
+
+		TArray<int32> Pending;
+		for (int32 i = 0; i < Stages.Num(); ++i)
 		{
-			LaunchNext();
+			if (Stages[i].bLaunched) { Pending.Add(i); }
+			else
+			{
+				bAllOk = false;
+				OutTimings.Add(GameIQ::FStageTiming{Stages[i].Spec.Name, 0.0});
+				if (!Stages[i].Spec.OutputFile.IsEmpty()) { OutStaleOutputs.Add(Stages[i].Spec.OutputFile); }
+			}
 		}
 
-		while (InFlight.Num() > 0)
+		while (Pending.Num() > 0)
 		{
-			for (int32 i = InFlight.Num() - 1; i >= 0; --i)
+			for (int32 p = Pending.Num() - 1; p >= 0; --p)
 			{
-				if (FPlatformProcess::IsProcRunning(InFlight[i].Handle)) { continue; }
+				FLaunchedStage& Stage = Stages[Pending[p]];
+				if (FPlatformProcess::IsProcRunning(Stage.Handle)) { continue; }
 
 				int32 ReturnCode = -1;
-				FPlatformProcess::GetProcReturnCode(InFlight[i].Handle, &ReturnCode);
-				FPlatformProcess::CloseProc(InFlight[i].Handle);
-				const double Elapsed = FPlatformTime::Seconds() - InFlight[i].StartTime;
-				OutTimings.Add(GameIQ::FStageTiming{InFlight[i].Name, Elapsed});
+				FPlatformProcess::GetProcReturnCode(Stage.Handle, &ReturnCode);
+				FPlatformProcess::CloseProc(Stage.Handle);
+				const double Elapsed = FPlatformTime::Seconds() - Stage.StartTime;
+				OutTimings.Add(GameIQ::FStageTiming{Stage.Spec.Name, Elapsed});
 
-				if (ReturnCode == 0)
+				// The exit code reflects the engine's logged-error count (benign shutdown/content
+				// warnings included), not the commandlet's own result — every stage routinely exits
+				// nonzero on clean runs. What actually matters is whether the stage refreshed its
+				// extract output; judge success by the output file's timestamp.
+				bool bFresh = true;
+				if (!Stage.Spec.OutputFile.IsEmpty())
 				{
-					UE_LOG(LogGameIQBuildProcess, Display, TEXT("Game IQ: stage '%s' done in %.1fs."), *InFlight[i].Name, Elapsed);
+					const FString OutPath = ExtractDir / Stage.Spec.OutputFile;
+					const FDateTime Stamp = IFileManager::Get().GetTimeStamp(*OutPath);
+					bFresh = Stamp != FDateTime::MinValue() && Stamp >= Stage.LaunchUtc - FTimespan::FromMinutes(1);
+				}
+
+				if (bFresh)
+				{
+					UE_LOG(LogGameIQBuildProcess, Display, TEXT("Game IQ: stage '%s' done in %.1fs (exit %d, output fresh)."),
+						*Stage.Spec.Name, Elapsed, ReturnCode);
 				}
 				else
 				{
 					bAllOk = false;
-					UE_LOG(LogGameIQBuildProcess, Error, TEXT("Game IQ: stage '%s' exited with code %d after %.1fs."),
-						*InFlight[i].Name, ReturnCode, Elapsed);
+					OutStaleOutputs.Add(Stage.Spec.OutputFile);
+					UE_LOG(LogGameIQBuildProcess, Error,
+						TEXT("Game IQ: stage '%s' FAILED — it exited (code %d) after %.1fs without refreshing %s; its stale output will be skipped by the ingest."),
+						*Stage.Spec.Name, ReturnCode, Elapsed, *Stage.Spec.OutputFile);
 				}
-				InFlight.RemoveAt(i);
-
-				if (NextToLaunch < Specs.Num()) { LaunchNext(); }
+				Pending.RemoveAt(p);
 			}
 
-			if (InFlight.Num() > 0) { FPlatformProcess::Sleep(0.25f); }
+			if (Pending.Num() > 0) { FPlatformProcess::Sleep(0.25f); }
 		}
 
 		return bAllOk;
