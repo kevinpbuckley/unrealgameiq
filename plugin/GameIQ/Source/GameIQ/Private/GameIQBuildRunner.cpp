@@ -3,6 +3,7 @@
 #include "GameIQBuildRunner.h"
 
 #include "Framework/Notifications/NotificationManager.h"
+#include "GameIQBuildTiming.h"
 #include "HAL/PlatformProcess.h"
 #include "Misc/App.h"
 #include "Misc/Paths.h"
@@ -92,6 +93,7 @@ void FGameIQBuildRunner::StartBuild(const FString& RunArg, const FText& Label, c
 	PendingLineFragment.Reset();
 	CurrentStage = Label.ToString();
 	bBuilding = true;
+	BuildStartUtc = FDateTime::UtcNow();
 
 	FNotificationInfo Info(Label);
 	Info.ExpireDuration = 4.0f;
@@ -179,12 +181,39 @@ void FGameIQBuildRunner::FinishBuild()
 	bBuilding = false;
 	PollHandle.Reset();
 
-	const bool bSuccess = (ReturnCode == 0);
+	// Judge the run by the result marker the commandlet wrote, NEVER the process exit code —
+	// UnrealEditor-Cmd's exit code is the engine's logged-error count (benign content warnings
+	// and an intentional store self-heal both inflate it), so clean builds routinely exit
+	// nonzero. A missing or stale marker means the commandlet died before finishing.
+	GameIQ::FBuildResult Result;
+	const bool bMarkerFresh = GameIQ::ReadBuildResult(Result)
+		&& Result.TimestampUtc >= BuildStartUtc - FTimespan::FromMinutes(1);
+	const bool bSuccess = bMarkerFresh && Result.bSuccess;
+	UE_LOG(LogGameIQRunner, Display, TEXT("Game IQ: build process exited with code %d; result marker: %s."),
+		ReturnCode,
+		!bMarkerFresh ? TEXT("missing/stale") : (Result.bSuccess ? TEXT("success") : TEXT("failure")));
+
 	if (TSharedPtr<SNotificationItem> Item = NotificationItem.Pin())
 	{
-		Item->SetText(bSuccess
-			? NSLOCTEXT("GameIQBuildRunner", "Done", "Game IQ: index rebuild complete.")
-			: FText::Format(NSLOCTEXT("GameIQBuildRunner", "Failed", "Game IQ: rebuild failed (exit code {0})."), FText::AsNumber(ReturnCode)));
+		FText Message;
+		if (bSuccess)
+		{
+			Message = FText::Format(
+				NSLOCTEXT("GameIQBuildRunner", "Done", "Game IQ: rebuild complete in {0}s — {1} entities, {2} edges, {3} chunks."),
+				FText::AsNumber((int32)Result.TotalSeconds), FText::AsNumber(Result.Entities),
+				FText::AsNumber(Result.Edges), FText::AsNumber(Result.Chunks));
+		}
+		else if (bMarkerFresh)
+		{
+			Message = NSLOCTEXT("GameIQBuildRunner", "FailedVerify",
+				"Game IQ: rebuild FAILED verification — see the Output Log (LogGameIQRunner).");
+		}
+		else
+		{
+			Message = NSLOCTEXT("GameIQBuildRunner", "FailedNoMarker",
+				"Game IQ: rebuild process died before finishing — see the Output Log (LogGameIQRunner).");
+		}
+		Item->SetText(Message);
 		Item->SetCompletionState(bSuccess ? SNotificationItem::CS_Success : SNotificationItem::CS_Fail);
 		Item->ExpireAndFadeout();
 	}

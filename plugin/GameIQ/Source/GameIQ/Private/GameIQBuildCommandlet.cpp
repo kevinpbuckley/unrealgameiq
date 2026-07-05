@@ -115,5 +115,21 @@ int32 UGameIQBuildCommandlet::Main(const FString& Params)
 		UE_LOG(LogGameIQBuild, Display, TEXT("Game IQ: full build complete in %.1fs."), TotalSeconds);
 	}
 	GameIQ::AppendBuildTimingRecord(TEXT("GameIQBuild"), TotalSeconds, StageTimings);
+
+	// Result marker — what FGameIQBuildRunner (and anything else launching this as a subprocess)
+	// judges the build by, since UnrealEditor-Cmd's exit code only counts logged engine errors.
+	{
+		GameIQ::FBuildResult Result;
+		Result.RunType = TEXT("GameIQBuild");
+		Result.bSuccess = IndexResult == 0;
+		Result.TotalSeconds = TotalSeconds;
+		FGameIQStore Store;
+		if (Store.Open())
+		{
+			Store.GetCounts(Result.Entities, Result.Edges, Result.Chunks);
+			Store.Close();
+		}
+		GameIQ::WriteBuildResult(Result);
+	}
 	return IndexResult;
 }

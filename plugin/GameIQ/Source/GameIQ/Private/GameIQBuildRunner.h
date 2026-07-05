@@ -48,6 +48,7 @@ private:
 	TArray<FString> LogLines;
 	FString CurrentStage;
 	bool bBuilding = false;
+	FDateTime BuildStartUtc;
 	FTSTicker::FDelegateHandle PollHandle;
 	TWeakPtr<class SNotificationItem> NotificationItem;
 };

@@ -8,6 +8,7 @@
 #include "GameIQImageCommandlet.h"
 #include "GameIQIndexCommandlet.h"
 #include "GameIQLinkCommandlet.h"
+#include "GameIQStore.h"
 #include "HAL/PlatformTime.h"
 #include "Templates/Function.h"
 
@@ -56,5 +57,21 @@ int32 UGameIQDocsBuildCommandlet::Main(const FString& /*Params*/)
 	const double TotalSeconds = FPlatformTime::Seconds() - BuildStart;
 	UE_LOG(LogGameIQDocsBuild, Display, TEXT("Game IQ: documents reindex complete in %.1fs."), TotalSeconds);
 	GameIQ::AppendBuildTimingRecord(TEXT("GameIQDocsBuild"), TotalSeconds, StageTimings);
+
+	// Result marker — subprocess launchers judge the run by this, not the exit code (which only
+	// counts logged engine errors). See GameIQBuildCommandlet.cpp.
+	{
+		GameIQ::FBuildResult BuildResult;
+		BuildResult.RunType = TEXT("GameIQDocsBuild");
+		BuildResult.bSuccess = Result == 0;
+		BuildResult.TotalSeconds = TotalSeconds;
+		FGameIQStore Store;
+		if (Store.Open())
+		{
+			Store.GetCounts(BuildResult.Entities, BuildResult.Edges, BuildResult.Chunks);
+			Store.Close();
+		}
+		GameIQ::WriteBuildResult(BuildResult);
+	}
 	return Result;
 }
