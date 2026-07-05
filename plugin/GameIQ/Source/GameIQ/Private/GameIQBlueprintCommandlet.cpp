@@ -27,6 +27,7 @@
 #include "Modules/ModuleManager.h"
 #include "UObject/PropertyPortFlags.h"
 #include "UObject/UnrealType.h"
+#include "UObject/UObjectGlobals.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogGameIQBlueprints, Log, All);
 
@@ -34,6 +35,12 @@ namespace
 {
 	const TCHAR* BlueprintProducer = TEXT("gameiq-ue-bp@0.1.0");
 	constexpr int32 MaxNodesPerGraph = 400; // guard against pathological graphs
+
+	// See GameIQAssetCommandlet.cpp's AssetGCFlushInterval: a full GC pass costs O(entire live
+	// UObject graph), so flushing every N loaded Blueprints amortizes that cost while still
+	// bounding peak memory across a full /Game scan.
+	// (Named per-commandlet: unity builds merge these anonymous namespaces into one TU.)
+	constexpr int32 BlueprintGCFlushInterval = 300;
 
 	FString NodeTitle(const UEdGraphNode* Node)
 	{
@@ -404,6 +411,7 @@ int32 UGameIQBlueprintsCommandlet::Main(const FString& Params)
 	int32 Rendered = 0;
 	int32 Skipped = 0;
 	int32 Index = 0;
+	int32 LoadedSinceLastGC = 0;
 	double LastProgressLogTime = FPlatformTime::Seconds();
 	for (const FAssetData& Data : BlueprintAssets)
 	{
@@ -447,6 +455,16 @@ int32 UGameIQBlueprintsCommandlet::Main(const FString& Params)
 		if (!BP) { continue; }
 		GameIQBlueprint::ExtractBlueprint(BP, Entities, Edges, Chunks);
 		++Rendered;
+
+		// Bound peak memory across a full /Game scan: nothing here holds a reference to BP (or the
+		// dependencies it pulled in) past this point, so a periodic flush lets the GC actually
+		// reclaim them — a commandlet's Main() never yields back to the engine tick loop that
+		// would otherwise trigger this automatically.
+		if (++LoadedSinceLastGC >= BlueprintGCFlushInterval)
+		{
+			CollectGarbage(RF_NoFlags, /*bPerformFullPurge=*/true);
+			LoadedSinceLastGC = 0;
+		}
 
 		if (!Sig.IsEmpty())
 		{

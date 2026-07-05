@@ -40,6 +40,7 @@
 #include "UObject/Package.h"
 #include "UObject/PropertyPortFlags.h"
 #include "UObject/UnrealType.h"
+#include "UObject/UObjectGlobals.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogGameIQAssets, Log, All);
 
@@ -47,6 +48,13 @@ namespace
 {
 	const TCHAR* AssetsProducer = TEXT("gameiq-ue-assets@0.1.0");
 	constexpr int32 MaxActorEntitiesPerLevel = 500; // list this many actors; always aggregate counts
+
+	// A full GC pass costs O(entire live UObject graph), not O(one asset) — flushing after every
+	// asset would spend more time in GC than extraction and would thrash shared dependencies
+	// (a material used by 50 meshes gets reloaded 50 times). Flushing every N loaded assets instead
+	// amortizes that cost while still bounding peak memory across a full /Game scan.
+	// (Named per-commandlet: unity builds merge these anonymous namespaces into one TU.)
+	constexpr int32 AssetGCFlushInterval = 300;
 
 	/** Stable Game IQ id for a loaded asset, from its package name: asset:/Game/Path/Name. */
 	FString AssetIdOf(const UObject* Obj)
@@ -634,6 +642,7 @@ int32 UGameIQAssetsCommandlet::Main(const FString& Params)
 	int32 Considered = 0;
 	int32 Skipped = 0;
 	int32 Index = 0;
+	int32 LoadedSinceLastGC = 0;
 	double LastProgressLogTime = FPlatformTime::Seconds();
 	for (const FAssetData& Data : Assets)
 	{
@@ -697,6 +706,16 @@ int32 UGameIQAssetsCommandlet::Main(const FString& Params)
 			UObject* Asset = Data.GetAsset();
 			if (!Asset || !IsProjectObject(Asset)) { continue; }
 			GameIQAsset::ExtractAsset(Asset, Entities, Edges, Chunks);
+
+			// Bound peak memory across a full /Game scan: nothing here holds a reference to Asset
+			// (or the dependencies it pulled in) past this point, so a periodic flush lets the GC
+			// actually reclaim them — a commandlet's Main() never yields back to the engine tick
+			// loop that would otherwise trigger this automatically.
+			if (++LoadedSinceLastGC >= AssetGCFlushInterval)
+			{
+				CollectGarbage(RF_NoFlags, /*bPerformFullPurge=*/true);
+				LoadedSinceLastGC = 0;
+			}
 		}
 		++Considered;
 
