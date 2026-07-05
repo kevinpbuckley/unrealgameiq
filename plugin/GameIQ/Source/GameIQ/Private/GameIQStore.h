@@ -53,4 +53,9 @@ private:
 	void InsertEdge(const FJsonObject& E, const FString& Producer);
 	void InsertChunk(const FJsonObject& C, const FString& Producer);
 	void SetMeta(const FString& Key, const FString& Value);
+
+	/** Lazily prepared, reused across calls (see .cpp) — keyed by SQL text so each distinct
+	 *  statement is compiled once per Db lifetime instead of once per row. Cleared in Close(). */
+	TMap<FString, FSQLitePreparedStatement> StmtCache;
+	FSQLitePreparedStatement& GetCachedStmt(const TCHAR* Sql);
 };

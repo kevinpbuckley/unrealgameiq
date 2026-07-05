@@ -99,8 +99,19 @@ void FGameIQStore::Close()
 {
 	if (Db.IsValid())
 	{
+		StmtCache.Empty(); // must not outlive the FSQLiteDatabase they were prepared against
 		Db.Close();
 	}
+}
+
+FSQLitePreparedStatement& FGameIQStore::GetCachedStmt(const TCHAR* Sql)
+{
+	FSQLitePreparedStatement& Stmt = StmtCache.FindOrAdd(FString(Sql));
+	if (!Stmt.IsValid())
+	{
+		Stmt.Create(Db, Sql, ESQLitePreparedStatementFlags::Persistent);
+	}
+	return Stmt;
 }
 
 void FGameIQStore::EnsureSchema()
@@ -115,7 +126,7 @@ void FGameIQStore::EnsureSchema()
 
 void FGameIQStore::SetMeta(const FString& Key, const FString& Value)
 {
-	FSQLitePreparedStatement Stmt = Db.PrepareStatement(
+	FSQLitePreparedStatement& Stmt = GetCachedStmt(
 		TEXT("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"));
 	if (!Stmt.IsValid()) { return; }
 	Stmt.SetBindingValueByIndex(1, Key);
@@ -125,7 +136,7 @@ void FGameIQStore::SetMeta(const FString& Key, const FString& Value)
 
 void FGameIQStore::UpsertEntity(const FJsonObject& E, const FString& Producer)
 {
-	FSQLitePreparedStatement Stmt = Db.PrepareStatement(
+	FSQLitePreparedStatement& Stmt = GetCachedStmt(
 		TEXT("INSERT INTO entities (id, kind, name, path, parent, source, summary, detail, producer, authority) "
 		     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
 		     "ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, name=excluded.name, path=excluded.path, "
@@ -159,7 +170,7 @@ void FGameIQStore::UpsertEntity(const FJsonObject& E, const FString& Producer)
 
 void FGameIQStore::InsertEdge(const FJsonObject& E, const FString& Producer)
 {
-	FSQLitePreparedStatement Stmt = Db.PrepareStatement(
+	FSQLitePreparedStatement& Stmt = GetCachedStmt(
 		TEXT("INSERT INTO edges (src, dst, type, attrs, producer) VALUES (?, ?, ?, ?, ?) "
 		     "ON CONFLICT(src, dst, type) DO UPDATE SET attrs=excluded.attrs, producer=excluded.producer"));
 	if (!Stmt.IsValid()) { return; }
@@ -178,7 +189,7 @@ void FGameIQStore::InsertChunk(const FJsonObject& C, const FString& Producer)
 	const FString ChunkId = C.GetStringField(TEXT("id"));
 	const FString EntityId = C.GetStringField(TEXT("entityId"));
 	{
-		FSQLitePreparedStatement Stmt = Db.PrepareStatement(
+		FSQLitePreparedStatement& Stmt = GetCachedStmt(
 			TEXT("INSERT INTO chunks (id, entity_id, kind, text, producer) VALUES (?, ?, ?, ?, ?) "
 			     "ON CONFLICT(id) DO UPDATE SET entity_id=excluded.entity_id, kind=excluded.kind, "
 			     "text=excluded.text, producer=excluded.producer"));
@@ -192,11 +203,11 @@ void FGameIQStore::InsertChunk(const FJsonObject& C, const FString& Producer)
 	}
 	// keep FTS in sync (delete any prior row for this chunk id, then insert)
 	{
-		FSQLitePreparedStatement Del = Db.PrepareStatement(TEXT("DELETE FROM chunks_fts WHERE chunk_id = ?"));
+		FSQLitePreparedStatement& Del = GetCachedStmt(TEXT("DELETE FROM chunks_fts WHERE chunk_id = ?"));
 		if (Del.IsValid()) { Del.SetBindingValueByIndex(1, ChunkId); Del.Execute(); }
 	}
 	{
-		FSQLitePreparedStatement Ins = Db.PrepareStatement(
+		FSQLitePreparedStatement& Ins = GetCachedStmt(
 			TEXT("INSERT INTO chunks_fts (chunk_id, entity_id, producer, text) VALUES (?, ?, ?, ?)"));
 		if (Ins.IsValid())
 		{
@@ -217,7 +228,7 @@ void FGameIQStore::DeleteByProducer(const FString& Producer)
 		TEXT("DELETE FROM edges WHERE producer = ?"),
 		TEXT("DELETE FROM entities WHERE producer = ?") })
 	{
-		FSQLitePreparedStatement Stmt = Db.PrepareStatement(Sql);
+		FSQLitePreparedStatement& Stmt = GetCachedStmt(Sql);
 		if (Stmt.IsValid()) { Stmt.SetBindingValueByIndex(1, Producer); Stmt.Execute(); }
 	}
 }
@@ -235,8 +246,9 @@ void FGameIQStore::DeleteSubtree(const FString& RootId)
 		TArray<FString> Next;
 		for (const FString& P : Frontier)
 		{
-			FSQLitePreparedStatement Stmt = Db.PrepareStatement(TEXT("SELECT id FROM entities WHERE parent = ?"));
+			FSQLitePreparedStatement& Stmt = GetCachedStmt(TEXT("SELECT id FROM entities WHERE parent = ?"));
 			if (!Stmt.IsValid()) { continue; }
+			Stmt.Reset(); // manual Step() loop below doesn't auto-reset like Execute() does — must rewind before reuse
 			Stmt.SetBindingValueByIndex(1, P);
 			while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
 			{
@@ -256,7 +268,7 @@ void FGameIQStore::DeleteSubtree(const FString& RootId)
 			TEXT("DELETE FROM edges WHERE src = ?"),
 			TEXT("DELETE FROM entities WHERE id = ?") })
 		{
-			FSQLitePreparedStatement Stmt = Db.PrepareStatement(Sql);
+			FSQLitePreparedStatement& Stmt = GetCachedStmt(Sql);
 			if (Stmt.IsValid()) { Stmt.SetBindingValueByIndex(1, Id); Stmt.Execute(); }
 		}
 	}

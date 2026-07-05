@@ -36,17 +36,36 @@ pwsh scripts/deploy.ps1 -Project <path-to-project-dir>
 Then build the editor target (e.g. via your project's build script) so `UnrealEditor-GameIQ.dll`
 is compiled. The plugin enables its dependencies (`SQLiteCore`, `ToolsetRegistry`, `EnhancedInput`).
 
-### 2. Build the index (once)
+### 2. Build the index
 
-With the editor **closed**:
+**Once, headless** (editor closed):
 
 ```powershell
 pwsh scripts/build-index.ps1 -Project <path-to-project-dir>
 ```
 
 This runs the `GameIQBuild` commandlet — every extractor plus the SQLite ingest — in a single editor
-boot, writing `<project>/.gameiq/index.db`. After that, the in-editor **save hook** keeps the index
-current automatically; a full rebuild is only needed after large out-of-editor changes (e.g. a VCS sync).
+boot, writing `<project>/.gameiq/index.db`.
+
+**From a running editor**, rebuild without closing it:
+
+- **Tools ▸ Game IQ panel** — dockable Slate panel with index stats and two buttons: **Rebuild Index**
+  (full — every extractor + ingest) and **Reindex Documents** (docs/images/external sources only, much
+  faster; leaves code/asset entities untouched).
+- **Console commands** — `GameIQ.Rebuild` and `GameIQ.ReindexDocs` do the same two things from the
+  console, handy for scripts or an AI agent driving the editor (e.g. `unreal.SystemLibrary.execute_console_command(world, "GameIQ.Rebuild")`).
+
+Either path spawns the commandlet as a background `UnrealEditor-Cmd` process (never in-process, so the
+live editor stays responsive) and streams live progress — a per-stage editor notification, a live
+stage/log readout in the panel if it's open, and the same lines in the Output Log under
+`LogGameIQRunner`. Each extractor stage logs how long it took, and the Assets/Blueprints stages
+(the ones doing full synchronous asset loads) log a heartbeat every ~2s while they run, so a long
+stage on a big project reads as "still working" rather than "stuck". Every run also appends a
+timing record — per-stage seconds plus the total — to `<project>/.gameiq/build-timings.json` (last
+20 runs kept), so you can compare rebuild performance over time as the project grows.
+
+After the first build, the in-editor **save hook** keeps the index current automatically; a full
+rebuild is only needed after large out-of-editor changes (e.g. a VCS sync).
 
 ### 3. Query it from an AI agent
 

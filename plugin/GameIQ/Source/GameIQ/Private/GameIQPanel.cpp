@@ -3,17 +3,14 @@
 #include "GameIQPanel.h"
 
 #include "Dom/JsonObject.h"
-#include "Framework/Notifications/NotificationManager.h"
+#include "GameIQBuildRunner.h"
 #include "GameIQQuery.h"
 #include "HAL/FileManager.h"
-#include "HAL/PlatformProcess.h"
-#include "Misc/App.h"
 #include "Misc/Paths.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "Styling/AppStyle.h"
 #include "Styling/CoreStyle.h"
-#include "Widgets/Notifications/SNotificationList.h"
 #include "Widgets/Input/SButton.h"
 #include "Widgets/Layout/SBorder.h"
 #include "Widgets/Layout/SScrollBox.h"
@@ -104,6 +101,7 @@ namespace
 void SGameIQPanel::Construct(const FArguments& InArgs)
 {
 	Refresh();
+	BuildFinishedHandle = FGameIQBuildRunner::Get().OnFinished.AddSP(this, &SGameIQPanel::OnBuildFinished);
 
 	ChildSlot
 	[
@@ -125,16 +123,16 @@ void SGameIQPanel::Construct(const FArguments& InArgs)
 			[
 				SNew(SButton)
 				.Text(LOCTEXT("Rebuild", "Rebuild Index"))
-				.ToolTipText(LOCTEXT("RebuildTip", "Re-run every extractor (assets, Blueprints, C++, config, docs) and rebuild the whole index."))
-				.IsEnabled_Lambda([this]() { return !bBuilding; })
+				.ToolTipText(LOCTEXT("RebuildTip", "Re-run every extractor (assets, Blueprints, C++, config, docs) and rebuild the whole index. Same as console command GameIQ.Rebuild."))
+				.IsEnabled_Lambda([]() { return !FGameIQBuildRunner::Get().IsBuilding(); })
 				.OnClicked(this, &SGameIQPanel::OnRebuildClicked)
 			]
 			+ SHorizontalBox::Slot().AutoWidth().Padding(0, 0, 8, 0)
 			[
 				SNew(SButton)
 				.Text(LOCTEXT("ReindexDocs", "Reindex Documents"))
-				.ToolTipText(LOCTEXT("ReindexDocsTip", "Reindex only documentation (docs, images, external sources) and refresh links — leaves code/asset entities untouched. Much faster than a full rebuild."))
-				.IsEnabled_Lambda([this]() { return !bBuilding; })
+				.ToolTipText(LOCTEXT("ReindexDocsTip", "Reindex only documentation (docs, images, external sources) and refresh links — leaves code/asset entities untouched. Much faster than a full rebuild. Same as console command GameIQ.ReindexDocs."))
+				.IsEnabled_Lambda([]() { return !FGameIQBuildRunner::Get().IsBuilding(); })
 				.OnClicked(this, &SGameIQPanel::OnReindexDocsClicked)
 			]
 			+ SHorizontalBox::Slot().AutoWidth()
@@ -145,8 +143,33 @@ void SGameIQPanel::Construct(const FArguments& InArgs)
 			]
 		]
 
+		// Live stage/log readout — only visible while a build is running.
+		+ SVerticalBox::Slot().AutoHeight().Padding(12, 0, 12, 8)
+		[
+			SNew(SBorder)
+			.Visibility_Lambda([]() { return FGameIQBuildRunner::Get().IsBuilding() ? EVisibility::Visible : EVisibility::Collapsed; })
+			.BorderImage(FAppStyle::Get().GetBrush("ToolPanel.GroupBorder"))
+			.Padding(8)
+			[
+				SNew(SVerticalBox)
+				+ SVerticalBox::Slot().AutoHeight()
+				[
+					SNew(STextBlock)
+					.Text_Lambda([]() { return FText::FromString(FGameIQBuildRunner::Get().GetCurrentStage()); })
+					.Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
+				]
+				+ SVerticalBox::Slot().AutoHeight().Padding(0, 4, 0, 0)
+				[
+					SNew(STextBlock)
+					.Text_Lambda([]() { return FText::FromString(FGameIQBuildRunner::Get().GetLogTail()); })
+					.Font(FCoreStyle::GetDefaultFontStyle("Mono", 8))
+					.AutoWrapText(true)
+				]
+			]
+		]
+
 		// Stats
-		+ SVerticalBox::Slot().FillHeight(1.0f).Padding(12, 4, 12, 12)
+		+ SVerticalBox::Slot().FillHeight(1.0f).Padding(12, 0, 12, 12)
 		[
 			SNew(SBorder)
 			.BorderImage(FAppStyle::Get().GetBrush("ToolPanel.GroupBorder"))
@@ -175,95 +198,28 @@ FReply SGameIQPanel::OnRefreshClicked()
 	return FReply::Handled();
 }
 
-namespace
-{
-	void Notify(const FText& Text, SNotificationItem::ECompletionState State)
-	{
-		FNotificationInfo Info(Text);
-		Info.ExpireDuration = 4.0f;
-		if (TSharedPtr<SNotificationItem> Item = FSlateNotificationManager::Get().AddNotification(Info))
-		{
-			Item->SetCompletionState(State);
-		}
-	}
-}
-
-FReply SGameIQPanel::StartBuild(const FString& RunArg, const FText& StartedMsg)
-{
-	if (bBuilding) { return FReply::Handled(); }
-
-	// Run as a *separate* headless commandlet process — never in-process. Loading every asset fresh
-	// inside the live editor trips engine ensures (e.g. Blueprint SimpleConstructionScript parent
-	// fix-up); a clean commandlet process doesn't, and the rollback-journal index tolerates the editor
-	// reading it concurrently.
-	const FString Exe = FPlatformProcess::GenerateApplicationPath(TEXT("UnrealEditor-Cmd"), FApp::GetBuildConfiguration());
-	const FString Project = FPaths::ConvertRelativePathToFull(FPaths::GetProjectFilePath());
-	if (!FPaths::FileExists(Exe) || Project.IsEmpty())
-	{
-		Notify(LOCTEXT("NoCmd", "Game IQ: couldn't find UnrealEditor-Cmd to run the rebuild."), SNotificationItem::CS_Fail);
-		return FReply::Handled();
-	}
-
-	const FString Args = FString::Printf(TEXT("\"%s\" -run=%s -unattended -nopause -nosplash"), *Project, *RunArg);
-	RebuildProc = FPlatformProcess::CreateProc(*Exe, *Args, /*bLaunchDetached=*/false,
-		/*bLaunchHidden=*/true, /*bLaunchReallyHidden=*/true, nullptr, 0, nullptr, nullptr);
-	if (!RebuildProc.IsValid())
-	{
-		Notify(LOCTEXT("SpawnFail", "Game IQ: failed to start the rebuild process."), SNotificationItem::CS_Fail);
-		return FReply::Handled();
-	}
-
-	bBuilding = true;
-	Notify(StartedMsg, SNotificationItem::CS_Pending);
-	PollHandle = FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateSP(this, &SGameIQPanel::PollRebuild), 1.0f);
-	return FReply::Handled();
-}
-
 FReply SGameIQPanel::OnRebuildClicked()
 {
-	return StartBuild(TEXT("GameIQBuild"),
+	FGameIQBuildRunner::Get().StartBuild(TEXT("GameIQBuild"),
 		LOCTEXT("Started", "Game IQ: rebuilding the full index in the background…"));
+	return FReply::Handled();
 }
 
 FReply SGameIQPanel::OnReindexDocsClicked()
 {
-	return StartBuild(TEXT("GameIQDocsBuild"),
+	FGameIQBuildRunner::Get().StartBuild(TEXT("GameIQDocsBuild"),
 		LOCTEXT("StartedDocs", "Game IQ: reindexing documents in the background…"));
+	return FReply::Handled();
 }
 
-bool SGameIQPanel::PollRebuild(float /*DeltaTime*/)
+void SGameIQPanel::OnBuildFinished(bool /*bSuccess*/)
 {
-	if (RebuildProc.IsValid() && FPlatformProcess::IsProcRunning(RebuildProc))
-	{
-		return true; // keep polling
-	}
-
-	int32 ReturnCode = 0;
-	if (RebuildProc.IsValid())
-	{
-		FPlatformProcess::GetProcReturnCode(RebuildProc, &ReturnCode);
-		FPlatformProcess::CloseProc(RebuildProc);
-		RebuildProc.Reset();
-	}
-	bBuilding = false;
-	PollHandle.Reset();
 	Refresh();
-	Notify(LOCTEXT("Done", "Game IQ: index rebuild complete."), SNotificationItem::CS_Success);
-	return false; // stop ticker
 }
 
 SGameIQPanel::~SGameIQPanel()
 {
-	if (PollHandle.IsValid())
-	{
-		FTSTicker::GetCoreTicker().RemoveTicker(PollHandle);
-		PollHandle.Reset();
-	}
-	if (RebuildProc.IsValid())
-	{
-		FPlatformProcess::CloseProc(RebuildProc); // don't kill the build; just release our handle
-		RebuildProc.Reset();
-	}
+	FGameIQBuildRunner::Get().OnFinished.Remove(BuildFinishedHandle);
 }
 
 #undef LOCTEXT_NAMESPACE

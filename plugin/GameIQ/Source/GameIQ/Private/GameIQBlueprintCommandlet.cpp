@@ -13,12 +13,15 @@
 #include "Engine/Blueprint.h"
 #include "Engine/SCS_Node.h"
 #include "Engine/SimpleConstructionScript.h"
+#include "GameIQHash.h"
 #include "GameIQJson.h"
 #include "HAL/FileManager.h"
+#include "HAL/PlatformTime.h"
 #include "K2Node_CallFunction.h"
 #include "K2Node_Event.h"
 #include "K2Node_EventNodeInterface.h"
 #include "K2Node_FunctionEntry.h"
+#include "K2Node_MathExpression.h"
 #include "Misc/Parse.h"
 #include "Misc/Paths.h"
 #include "Modules/ModuleManager.h"
@@ -34,6 +37,18 @@ namespace
 
 	FString NodeTitle(const UEdGraphNode* Node)
 	{
+		// UK2Node_MathExpression::GetNodeTitle() can crash headlessly (no interactive editor) when
+		// the expression references a variable by GUID: it resolves the owning Blueprint via
+		// GetBlueprint() (FBlueprintEditorUtils::FindBlueprintForNode), which can return a Blueprint
+		// whose ParentClass isn't resolved outside a fully-loaded editor context, and
+		// FindMemberVariableNameByGuid() then null-derefs walking ParentClass->ClassGeneratedBy.
+		// Read the node's own raw expression text directly instead — it's plain reflected data, safe
+		// to read unconditionally, and arguably more useful for a search index than the interactive
+		// "friendly" title anyway (e.g. "Health * 2 + Offset" instead of the resolved display form).
+		if (const UK2Node_MathExpression* MathExpr = Cast<UK2Node_MathExpression>(Node))
+		{
+			return MathExpr->Expression.IsEmpty() ? TEXT("Math Expression") : MathExpr->Expression;
+		}
 		return GameIQ::OneLine(Node->GetNodeTitle(ENodeTitleType::ListView).ToString());
 	}
 
@@ -359,6 +374,14 @@ int32 UGameIQBlueprintsCommandlet::Main(const FString& Params)
 	}
 	IFileManager::Get().MakeDirectory(*OutDir, /*Tree=*/true);
 
+	// Incremental rebuild (-full forces a from-scratch pass, ignoring/overwriting the cache).
+	const bool bForceFull = FParse::Param(*Params, TEXT("full"));
+	const FString HashCachePath = FPaths::Combine(OutDir, TEXT("blueprint-hashes.json"));
+	TMap<FString, GameIQHash::FCachedAssetRow> PrevCache =
+		bForceFull ? TMap<FString, GameIQHash::FCachedAssetRow>() : GameIQHash::LoadAssetHashCache(HashCachePath);
+	TMap<FString, GameIQHash::FCachedAssetRow> NewCache;
+	NewCache.Reserve(PrevCache.Num());
+
 	FAssetRegistryModule& ARM =
 		FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
 	IAssetRegistry& AR = ARM.Get();
@@ -377,14 +400,66 @@ int32 UGameIQBlueprintsCommandlet::Main(const FString& Params)
 	TArray<TSharedPtr<FJsonValue>> Edges;
 	TArray<TSharedPtr<FJsonValue>> Chunks;
 
+	const int32 TotalBlueprints = BlueprintAssets.Num();
 	int32 Rendered = 0;
+	int32 Skipped = 0;
+	int32 Index = 0;
+	double LastProgressLogTime = FPlatformTime::Seconds();
 	for (const FAssetData& Data : BlueprintAssets)
 	{
+		++Index;
+		const double Now = FPlatformTime::Seconds();
+		if (Now - LastProgressLogTime >= 2.0)
+		{
+			UE_LOG(LogGameIQBlueprints, Display, TEXT("Game IQ blueprints: %d/%d scanned (%d rendered, %d skipped-unchanged so far)..."),
+				Index, TotalBlueprints, Rendered - Skipped, Skipped);
+			LastProgressLogTime = Now;
+		}
+
+		const FString Id = GameIQHash::AssetIdOfPackage(Data.PackageName);
+		const FString Sig = GameIQHash::ComputeChangeSignature(AR, Data);
+
+		// Incremental rebuild: an unchanged Blueprint's previously-extracted rows (graphs, vars,
+		// components) are carried forward verbatim — see GameIQAssetCommandlet.cpp for the same
+		// pattern. An empty Sig ("unknown") is never cached/matched, so it's always reprocessed.
+		if (!Sig.IsEmpty())
+		{
+			if (const GameIQHash::FCachedAssetRow* Cached = PrevCache.Find(Id))
+			{
+				if (Cached->Signature == Sig)
+				{
+					Entities.Append(Cached->Entities);
+					Edges.Append(Cached->Edges);
+					Chunks.Append(Cached->Chunks);
+					NewCache.Add(Id, *Cached);
+					++Rendered;
+					++Skipped;
+					continue;
+				}
+			}
+		}
+
+		const int32 EntitiesBefore = Entities.Num();
+		const int32 EdgesBefore = Edges.Num();
+		const int32 ChunksBefore = Chunks.Num();
+
 		UBlueprint* BP = Cast<UBlueprint>(Data.GetAsset());
 		if (!BP) { continue; }
 		GameIQBlueprint::ExtractBlueprint(BP, Entities, Edges, Chunks);
 		++Rendered;
+
+		if (!Sig.IsEmpty())
+		{
+			GameIQHash::FCachedAssetRow Row;
+			Row.Signature = Sig;
+			if (const int32 N = Entities.Num() - EntitiesBefore) { Row.Entities.Append(Entities.GetData() + EntitiesBefore, N); }
+			if (const int32 N = Edges.Num() - EdgesBefore) { Row.Edges.Append(Edges.GetData() + EdgesBefore, N); }
+			if (const int32 N = Chunks.Num() - ChunksBefore) { Row.Chunks.Append(Chunks.GetData() + ChunksBefore, N); }
+			NewCache.Add(Id, MoveTemp(Row));
+		}
 	}
+
+	GameIQHash::SaveAssetHashCache(HashCachePath, NewCache);
 
 	if (!GameIQ::WriteOutput(OutDir, TEXT("blueprints.json"), BlueprintProducer, Entities, Edges, Chunks))
 	{
@@ -393,7 +468,7 @@ int32 UGameIQBlueprintsCommandlet::Main(const FString& Params)
 	}
 
 	UE_LOG(LogGameIQBlueprints, Display,
-		TEXT("Game IQ: rendered %d Blueprints — %d entities (graphs/vars/components), %d edges, %d chunks to %s"),
-		Rendered, Entities.Num(), Edges.Num(), Chunks.Num(), *FPaths::Combine(OutDir, TEXT("blueprints.json")));
+		TEXT("Game IQ: rendered %d Blueprints (%d skipped, unchanged) — %d entities (graphs/vars/components), %d edges, %d chunks to %s"),
+		Rendered, Skipped, Entities.Num(), Edges.Num(), Chunks.Num(), *FPaths::Combine(OutDir, TEXT("blueprints.json")));
 	return 0;
 }

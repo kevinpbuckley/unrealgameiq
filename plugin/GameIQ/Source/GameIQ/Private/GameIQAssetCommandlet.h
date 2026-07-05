@@ -25,7 +25,12 @@ namespace GameIQAsset
  * placed-in-level). Anything without a bespoke recipe gets a generic summary so
  * no asset is invisible. Loads assets, so it needs the editor; run headless:
  *
- *   UnrealEditor-Cmd <Project>.uproject -run=GameIQAssets [-out=<dir>]
+ *   UnrealEditor-Cmd <Project>.uproject -run=GameIQAssets [-out=<dir>] [-full]
+ *
+ * Incremental by default: an asset whose AssetRegistry content hash (FAssetPackageData::
+ * GetPackageSavedHash) matches the last run's `asset-hashes.json` side-car is never reloaded —
+ * its previously-extracted rows are carried forward verbatim. Pass -full (or delete
+ * `.gameiq/extract/asset-hashes.json`) to force a from-scratch rebuild.
  *
  * Default output: <ProjectDir>/.gameiq/extract/assets.json
  */

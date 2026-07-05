@@ -1,0 +1,42 @@
+<!-- BEGIN GameIQ agent guidance -->
+# Unreal Game IQ agent guide
+
+This project includes the Unreal Game IQ plugin, which builds an in-editor index of assets, Blueprints, config, C++ and dependency relationships for fast architectural questions.
+
+## How to use GameIQ effectively
+
+- Prefer GameIQ for project-wide questions before falling back to manual file searching.
+- Use the GameIQ toolset when the user asks about systems, dependencies, ownership, or where a feature lives.
+- If the request is about a specific asset, Blueprint, or subsystem, start with Search and then GetEntity.
+- For dependency and impact questions, use References and Impact.
+- For a fuller system summary, use Explain.
+- For project-level health or unused-asset questions, use ProjectStats.
+
+## Available GameIQ queries
+
+- Search: hybrid text search across the indexed project model.
+- GetEntity: retrieve the full entity record, chunks, edges, and child entities for one item.
+- References: find what uses an entity or what it uses.
+- Impact: find likely breakage or downstream dependents if an entity changes.
+- Explain: assemble a compact context bundle for a system or topic.
+- ProjectStats: summarize the project index, dependency hotspots, and unused-asset candidates.
+
+## Working conventions
+
+- The index is built from the project’s .gameiq directory and updated live as assets are saved.
+- If results look stale or missing, rebuild it: in a running editor, run the console command `GameIQ.Rebuild` (full) or `GameIQ.ReindexDocs` (docs/images/external sources only, faster), or click Tools ▸ Game IQ ▸ Rebuild Index. Headless (editor closed), run the `GameIQBuild` commandlet via UnrealEditor-Cmd with `-run=GameIQBuild`. All three report progress via editor notifications and the Output Log (`LogGameIQRunner`).
+- When the user asks for architecture, ownership, or "where is X implemented?", use GameIQ before broad manual search.
+- When the user asks for likely breakage or impact from changing something, use Impact.
+
+## Example prompts
+
+- "Where is the reload logic implemented?"
+- "What Blueprints depend on this input mapping?"
+- "Which systems are most coupled to the inventory mesh?"
+- "What would break if I changed this Blueprint interface?"
+
+## Important notes
+
+- GameIQ works best when the plugin is enabled and the index has been built.
+- If the index is missing, tell the user that a rebuild may be needed before answering dependency-focused questions.
+<!-- END GameIQ agent guidance -->

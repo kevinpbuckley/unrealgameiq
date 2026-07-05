@@ -26,7 +26,10 @@ namespace GameIQBlueprint
  * plus `calls` edges into C++. This is the "my agent just read my Blueprint" pass.
  * Needs the editor (loads assets); run headless as a commandlet:
  *
- *   UnrealEditor-Cmd <Project>.uproject -run=GameIQBlueprints [-out=<dir>]
+ *   UnrealEditor-Cmd <Project>.uproject -run=GameIQBlueprints [-out=<dir>] [-full]
+ *
+ * Incremental by default — see GameIQAssetCommandlet.h; this producer's side-car is
+ * `.gameiq/extract/blueprint-hashes.json`.
  *
  * Default output: <ProjectDir>/.gameiq/extract/blueprints.json
  */

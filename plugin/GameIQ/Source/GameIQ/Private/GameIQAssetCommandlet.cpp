@@ -27,8 +27,10 @@
 #include "Engine/Texture2D.h"
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
+#include "GameIQHash.h"
 #include "GameIQJson.h"
 #include "HAL/FileManager.h"
+#include "HAL/PlatformTime.h"
 #include "Materials/MaterialInstance.h"
 #include "Materials/MaterialInterface.h"
 #include "Misc/Parse.h"
@@ -161,6 +163,24 @@ namespace
 	void RecipeTexture(FOut& O, const UTexture2D* Tex, const FString& Id, const FString& Name)
 	{
 		AddSummary(O, Id, FString::Printf(TEXT("%s (Texture2D)\n%dx%d"), *Name, Tex->GetSizeX(), Tex->GetSizeY()));
+	}
+
+	/**
+	 * Texture2D's summary only needs its dimensions, which the AssetRegistry already publishes
+	 * as the `Dimensions` tag ("WxH", e.g. "2048x2048" — confirmed live against a running 5.8
+	 * editor) — so it never needs a full UObject load. Mirrors RecipeTexture's summary text
+	 * exactly, from FAssetData alone. Returns false (caller falls back to a full load) if the
+	 * tag is missing or unparseable.
+	 */
+	bool ExtractTextureNoLoad(FOut& O, const FAssetData& Data, const FString& Id, const FString& Name)
+	{
+		FString Dims, WStr, HStr;
+		if (!Data.GetTagValue(TEXT("Dimensions"), Dims) || !Dims.Split(TEXT("x"), &WStr, &HStr, ESearchCase::IgnoreCase))
+		{
+			return false;
+		}
+		AddSummary(O, Id, FString::Printf(TEXT("%s (Texture2D)\n%dx%d"), *Name, FCString::Atoi(*WStr), FCString::Atoi(*HStr)));
+		return true;
 	}
 
 	void RecipeSkeleton(FOut& O, const USkeleton* Skel, const FString& Id, const FString& Name)
@@ -587,6 +607,14 @@ int32 UGameIQAssetsCommandlet::Main(const FString& Params)
 	}
 	IFileManager::Get().MakeDirectory(*OutDir, /*Tree=*/true);
 
+	// Incremental rebuild (-full forces a from-scratch pass, ignoring/overwriting the cache).
+	const bool bForceFull = FParse::Param(*Params, TEXT("full"));
+	const FString HashCachePath = FPaths::Combine(OutDir, TEXT("asset-hashes.json"));
+	TMap<FString, GameIQHash::FCachedAssetRow> PrevCache =
+		bForceFull ? TMap<FString, GameIQHash::FCachedAssetRow>() : GameIQHash::LoadAssetHashCache(HashCachePath);
+	TMap<FString, GameIQHash::FCachedAssetRow> NewCache;
+	NewCache.Reserve(PrevCache.Num());
+
 	FAssetRegistryModule& ARM =
 		FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
 	IAssetRegistry& AR = ARM.Get();
@@ -602,9 +630,22 @@ int32 UGameIQAssetsCommandlet::Main(const FString& Params)
 	TArray<TSharedPtr<FJsonValue>> Edges;
 	TArray<TSharedPtr<FJsonValue>> Chunks;
 
+	const int32 TotalAssets = Assets.Num();
 	int32 Considered = 0;
+	int32 Skipped = 0;
+	int32 Index = 0;
+	double LastProgressLogTime = FPlatformTime::Seconds();
 	for (const FAssetData& Data : Assets)
 	{
+		++Index;
+		const double Now = FPlatformTime::Seconds();
+		if (Now - LastProgressLogTime >= 2.0)
+		{
+			UE_LOG(LogGameIQAssets, Display, TEXT("Game IQ assets: %d/%d scanned (%d loaded, %d skipped-unchanged so far)..."),
+				Index, TotalAssets, Considered - Skipped, Skipped);
+			LastProgressLogTime = Now;
+		}
+
 		// Blueprints are handled by the GameIQBlueprints (Tier 2) commandlet.
 		if (Data.AssetClassPath.GetAssetName().ToString().EndsWith(TEXT("Blueprint"))) { continue; }
 
@@ -613,11 +654,66 @@ int32 UGameIQAssetsCommandlet::Main(const FString& Params)
 		// assets (which surfaced only misleading top-level property diffs, no light detail).
 		if (Data.PackageName.ToString().Contains(TEXT("/__ExternalActors__/"))) { continue; }
 
-		UObject* Asset = Data.GetAsset();
-		if (!Asset || !IsProjectObject(Asset)) { continue; }
+		const FString Id = GameIQHash::AssetIdOfPackage(Data.PackageName);
+		const FString Sig = GameIQHash::ComputeChangeSignature(AR, Data);
+
+		// Incremental rebuild: an unchanged asset's previously-extracted rows are carried forward
+		// verbatim (from the last run's cache), so completeness never regresses — only the
+		// (expensive) load + extraction is skipped. An empty Sig means "unknown" and is never cached
+		// or matched, so an asset Game IQ can't confidently fingerprint is always reprocessed.
+		if (!Sig.IsEmpty())
+		{
+			if (const GameIQHash::FCachedAssetRow* Cached = PrevCache.Find(Id))
+			{
+				if (Cached->Signature == Sig)
+				{
+					Entities.Append(Cached->Entities);
+					Edges.Append(Cached->Edges);
+					Chunks.Append(Cached->Chunks);
+					NewCache.Add(Id, *Cached);
+					++Considered;
+					++Skipped;
+					continue;
+				}
+			}
+		}
+
+		const int32 EntitiesBefore = Entities.Num();
+		const int32 EdgesBefore = Edges.Num();
+		const int32 ChunksBefore = Chunks.Num();
+
+		// Texture2D's summary is fully derivable from AssetRegistry tags (Dimensions) — skip the
+		// full load entirely for it. Any UTexture2D subclass falls through to the normal load path
+		// below unchanged, exactly as it did before this fast path existed.
+		bool bHandled = false;
+		if (Data.AssetClassPath.GetAssetName() == FName(TEXT("Texture2D")))
+		{
+			FOut O{ Entities, Edges, Chunks };
+			bHandled = ExtractTextureNoLoad(O, Data, Id, Data.AssetName.ToString());
+		}
+
+		if (!bHandled)
+		{
+			UObject* Asset = Data.GetAsset();
+			if (!Asset || !IsProjectObject(Asset)) { continue; }
+			GameIQAsset::ExtractAsset(Asset, Entities, Edges, Chunks);
+		}
 		++Considered;
-		GameIQAsset::ExtractAsset(Asset, Entities, Edges, Chunks);
+
+		if (!Sig.IsEmpty())
+		{
+			GameIQHash::FCachedAssetRow Row;
+			Row.Signature = Sig;
+			if (const int32 N = Entities.Num() - EntitiesBefore) { Row.Entities.Append(Entities.GetData() + EntitiesBefore, N); }
+			if (const int32 N = Edges.Num() - EdgesBefore) { Row.Edges.Append(Edges.GetData() + EdgesBefore, N); }
+			if (const int32 N = Chunks.Num() - ChunksBefore) { Row.Chunks.Append(Chunks.GetData() + ChunksBefore, N); }
+			NewCache.Add(Id, MoveTemp(Row));
+		}
 	}
+
+	GameIQHash::SaveAssetHashCache(HashCachePath, NewCache);
+	UE_LOG(LogGameIQAssets, Display, TEXT("Game IQ assets: %d/%d loaded, %d skipped (unchanged)."),
+		Considered - Skipped, TotalAssets, Skipped);
 
 	if (!GameIQ::WriteOutput(OutDir, TEXT("assets.json"), AssetsProducer, Entities, Edges, Chunks))
 	{
