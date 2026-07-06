@@ -85,6 +85,26 @@ namespace GameIQWalk
 		return Paths;
 	}
 
+	/**
+	 * gameiq.config.json `docsPath`: folder the in-repo docs stage scans (project-relative or
+	 * absolute). Empty = unset → scan the whole project tree (legacy behavior).
+	 */
+	inline FString LoadDocsPath(const FString& Root)
+	{
+		FString Json;
+		if (FFileHelper::LoadFileToString(Json, *FPaths::Combine(Root, TEXT("gameiq.config.json"))))
+		{
+			TSharedPtr<FJsonObject> Obj;
+			const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Json);
+			FString S;
+			if (FJsonSerializer::Deserialize(Reader, Obj) && Obj.IsValid() && Obj->TryGetStringField(TEXT("docsPath"), S))
+			{
+				return S.Replace(TEXT("\\"), TEXT("/")).TrimStartAndEnd();
+			}
+		}
+		return FString();
+	}
+
 	/** True when a package name ("/Game/Foo/Bar") falls under one of the shallow path prefixes. */
 	inline bool IsShallowPackage(const FString& PackageName, const TArray<FString>& ShallowPaths)
 	{

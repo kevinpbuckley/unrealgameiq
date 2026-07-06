@@ -26,6 +26,15 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Indexing")
 	TArray<FString> ExcludeDirectories;
 
+	/**
+	 * Folder the in-repo docs stage scans for design docs (.md, .txt, .pdf, …), project-relative
+	 * (e.g. "Docs") or absolute. Empty = the whole project tree (legacy behavior). Point it at a
+	 * dedicated docs folder to stop READMEs, tool notes and vendored text from entering the index.
+	 * Written to <Project>/gameiq.config.json as `docsPath`.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Indexing")
+	FString DocsDirectory;
+
 	//~ UDeveloperSettings — surface under the "Plugins" category
 	virtual FName GetCategoryName() const override { return TEXT("Plugins"); }
 

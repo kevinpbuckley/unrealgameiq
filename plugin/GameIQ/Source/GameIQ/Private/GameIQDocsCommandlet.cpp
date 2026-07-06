@@ -26,9 +26,23 @@ int32 UGameIQDocsCommandlet::Main(const FString& /*Params*/)
 	const FString Root = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir());
 	TArray<TSharedPtr<FJsonValue>> Entities, Edges, Chunks;
 
+	// gameiq.config.json `docsPath` narrows the scan to a dedicated docs folder; unset = whole tree.
+	FString DocsRoot = Root;
+	const FString DocsPath = GameIQWalk::LoadDocsPath(Root);
+	if (!DocsPath.IsEmpty())
+	{
+		DocsRoot = FPaths::IsRelative(DocsPath) ? FPaths::Combine(Root, DocsPath) : DocsPath;
+		DocsRoot = FPaths::ConvertRelativePathToFull(DocsRoot);
+		if (!IFileManager::Get().DirectoryExists(*DocsRoot))
+		{
+			UE_LOG(LogGameIQDocs, Warning, TEXT("Game IQ docs: docsPath '%s' not found (%s) — no documents indexed."),
+				*DocsPath, *DocsRoot);
+		}
+	}
+
 	int32 Walked = 0, Skipped = 0;
 	const int32 Docs = GameIQDocsExtract::ExtractTree(
-		Root, TEXT("repo"), FString(), Entities, Edges, Chunks, Walked, Skipped, /*bSkipPlugins=*/true);
+		DocsRoot, TEXT("repo"), FString(), Entities, Edges, Chunks, Walked, Skipped, /*bSkipPlugins=*/true);
 
 	const FString OutDir = FPaths::Combine(Root, TEXT(".gameiq"), TEXT("extract"));
 	IFileManager::Get().MakeDirectory(*OutDir, true);

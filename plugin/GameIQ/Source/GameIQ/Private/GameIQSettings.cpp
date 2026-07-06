@@ -5,6 +5,7 @@
 #include "Dom/JsonObject.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
+#include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
 
@@ -30,14 +31,37 @@ void UGameIQSettings::WriteConfigJson() const
 		}
 	}
 
-	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+	const FString Path = FPaths::Combine(FPaths::ProjectDir(), TEXT("gameiq.config.json"));
+
+	// Merge into the existing file: only own `exclude`/`docsPath`, so hand-maintained keys
+	// (`shallowPaths`, `externalDocs`, `docTypes`, …) survive a settings-UI save.
+	TSharedPtr<FJsonObject> Root;
+	FString Existing;
+	if (FFileHelper::LoadFileToString(Existing, *Path))
+	{
+		const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Existing);
+		FJsonSerializer::Deserialize(Reader, Root);
+	}
+	if (!Root.IsValid())
+	{
+		Root = MakeShared<FJsonObject>();
+	}
 	Root->SetArrayField(TEXT("exclude"), Excludes);
+
+	const FString Docs = DocsDirectory.Replace(TEXT("\\"), TEXT("/")).TrimStartAndEnd();
+	if (Docs.IsEmpty())
+	{
+		Root->RemoveField(TEXT("docsPath"));
+	}
+	else
+	{
+		Root->SetStringField(TEXT("docsPath"), Docs);
+	}
 
 	FString Out;
 	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Out);
-	FJsonSerializer::Serialize(Root, Writer);
+	FJsonSerializer::Serialize(Root.ToSharedRef(), Writer);
 
-	const FString Path = FPaths::Combine(FPaths::ProjectDir(), TEXT("gameiq.config.json"));
 	if (FFileHelper::SaveStringToFile(Out, *Path, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
 	{
 		UE_LOG(LogGameIQSettings, Display, TEXT("Game IQ: wrote %s (%d excludes)"), *Path, Excludes.Num());
