@@ -25,14 +25,24 @@ class UGameIQService : public UToolsetDefinition
 public:
 	/** Full-text search over the whole index (stemmed, camelCase-aware — "player" matches
 	 *  BP_PlayerCharacter); `Kind` optionally filters to one entity kind (e.g. "blueprint",
-	 *  "asset", "level-actor"); `Offset` pages through results. Returns a JSON string. */
+	 *  "asset", "level-actor"); `Offset` pages through results. `PathPrefix` scopes hits to one
+	 *  content path (e.g. "/Game/Coursera" — matches asset ids and file paths). Returns a JSON string. */
 	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "GameIQ")
-	static FString Search(const FString& Query, const FString& Kind = TEXT(""), int32 Limit = 20, int32 Offset = 0);
+	static FString Search(const FString& Query, const FString& Kind = TEXT(""), int32 Limit = 20, int32 Offset = 0,
+		const FString& PathPrefix = TEXT(""));
 
 	/** Full detail for one entity id — entity fields, edges (in/out), child entities, and chunks,
-	 *  with arrays capped and full counts reported. Returns a JSON string. */
+	 *  with arrays capped and full counts reported. Children are round-robin by class (every class
+	 *  represented) with a `childrenByClass` rollup. Returns a JSON string. */
 	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "GameIQ")
 	static FString GetEntity(const FString& Id);
+
+	/** Page through an entity's children (e.g. a level's placed actors), optionally filtered by
+	 *  class — `ClassFilter` substring-matches the child's class (level-actor `detail.class`) or
+	 *  entity kind, so Children(mapId, "Light") lists every light. Returns a JSON string with
+	 *  `total` for the filter. */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "GameIQ")
+	static FString Children(const FString& Id, const FString& ClassFilter = TEXT(""), int32 Limit = 50, int32 Offset = 0);
 
 	/** Graph walk from an entity: who uses it / what it uses. `Direction` is "in", "out", or "both".
 	 *  `EdgeType` optionally restricts to one edge (e.g. "uses-skeleton", "calls"); `Kind` filters

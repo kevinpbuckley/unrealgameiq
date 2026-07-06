@@ -59,6 +59,10 @@ int32 UGameIQConfigCommandlet::Main(const FString& /*Params*/)
 	// --- .ini sections ---
 	for (const FString& File : GameIQWalk::WalkFiles(Root, { TEXT(".ini") }))
 	{
+		// Stale duplicates ("DefaultEngine - Copy.ini", "*backup*") carry outdated settings that
+		// outrank the live file in search — never index them.
+		const FString Base = FPaths::GetBaseFilename(File);
+		if (Base.Contains(TEXT(" - Copy")) || Base.Contains(TEXT("backup"), ESearchCase::IgnoreCase)) { continue; }
 		FString Text;
 		if (!FFileHelper::LoadFileToString(Text, *File)) { continue; }
 		const FString Rel = GameIQWalk::RelPath(Root, File);

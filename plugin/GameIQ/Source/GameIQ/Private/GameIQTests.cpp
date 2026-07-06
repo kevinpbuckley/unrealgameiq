@@ -412,4 +412,99 @@ void AMyCharacter::Move(const FInputActionValue& Value)
 	return true;
 }
 
+/**
+ * Children paging + class rollup: a level's capped children must round-robin across classes
+ * (never 50 rocks), GetEntity must report a full childrenByClass rollup, and Children(id, filter)
+ * must page one class. Regression test for the "969-actor map hid its one sky actor" failure.
+ */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGameIQQueryChildrenTest, "GameIQ.Query.ChildrenRollupAndFilter",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGameIQQueryChildrenTest::RunTest(const FString& Parameters)
+{
+	using namespace GameIQTestUtil;
+	const FString DbPath = TempDbPath(TEXT("children.db"));
+
+	auto ActorEntity = [](const FString& Id, const FString& Name, const FString& Class, const TCHAR* Parent)
+	{
+		TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+		O->SetStringField(TEXT("id"), Id);
+		O->SetStringField(TEXT("kind"), TEXT("level-actor"));
+		O->SetStringField(TEXT("name"), Name);
+		O->SetStringField(TEXT("path"), TEXT("/Game/Test"));
+		O->SetStringField(TEXT("source"), TEXT("asset"));
+		O->SetStringField(TEXT("parent"), Parent);
+		TSharedRef<FJsonObject> D = MakeShared<FJsonObject>();
+		D->SetStringField(TEXT("class"), Class);
+		O->SetObjectField(TEXT("detail"), D);
+		return MakeShared<FJsonValueObject>(O);
+	};
+
+	const TCHAR* Map = TEXT("asset:/Game/Maps/L");
+	FGameIQStore Store;
+	if (!TestTrue(TEXT("open"), Store.OpenAtPath(DbPath))) { return false; }
+	TArray<TSharedPtr<FJsonValue>> Entities;
+	Entities.Add(Entity(Map, TEXT("asset"), TEXT("L")));
+	for (int32 i = 0; i < 5; ++i)
+	{
+		Entities.Add(ActorEntity(FString::Printf(TEXT("%s::actor::Rock%d"), Map, i),
+			FString::Printf(TEXT("Rock%d"), i), TEXT("StaticMeshActor"), Map));
+	}
+	Entities.Add(ActorEntity(FString::Printf(TEXT("%s::actor::Sky"), Map), TEXT("Sky"), TEXT("Ultra_Dynamic_Sky_C"), Map));
+	Entities.Add(ActorEntity(FString::Printf(TEXT("%s::actor::Lamp"), Map), TEXT("Lamp"), TEXT("PointLight"), Map));
+	Store.IngestProducer(TEXT("test"), Entities, {}, {});
+	Store.Close();
+
+	GameIQQuery::SetDbPathOverrideForTests(DbPath);
+	ON_SCOPE_EXIT { GameIQQuery::SetDbPathOverrideForTests(FString()); };
+
+	// GetEntity with a cap of 3: round-robin must show all three classes, not three rocks.
+	{
+		const TSharedPtr<FJsonValue> Result = ParseResult(GameIQQuery::GetEntity(Map, /*Cap=*/3));
+		const TSharedPtr<FJsonObject>* Payload = nullptr;
+		if (!TestTrue(TEXT("entity payload"), Result.IsValid() && Result->TryGetObject(Payload))) { return false; }
+		const TArray<TSharedPtr<FJsonValue>>* Kids = nullptr;
+		if (!TestTrue(TEXT("children array"), (*Payload)->TryGetArrayField(TEXT("children"), Kids))) { return false; }
+		if (!TestEqual(TEXT("children capped"), Kids->Num(), 3)) { return false; }
+		TSet<FString> Classes;
+		for (const TSharedPtr<FJsonValue>& K : *Kids)
+		{
+			Classes.Add(K->AsObject()->GetObjectField(TEXT("detail"))->GetStringField(TEXT("class")));
+		}
+		TestEqual(TEXT("one child per class under the cap"), Classes.Num(), 3);
+
+		const TArray<TSharedPtr<FJsonValue>>* Rollup = nullptr;
+		if (!TestTrue(TEXT("childrenByClass present"), (*Payload)->TryGetArrayField(TEXT("childrenByClass"), Rollup))) { return false; }
+		TestEqual(TEXT("rollup covers all classes"), Rollup->Num(), 3);
+		TestEqual(TEXT("rollup ordered by count"),
+			(*Rollup)[0]->AsObject()->GetStringField(TEXT("class")), FString(TEXT("StaticMeshActor")));
+		TestEqual(TEXT("rollup counts full set"),
+			(int32)(*Rollup)[0]->AsObject()->GetNumberField(TEXT("count")), 5);
+		TestTrue(TEXT("truncation note present"), (*Payload)->HasField(TEXT("note")));
+	}
+
+	// Children with a class filter pages exactly that class.
+	{
+		const TSharedPtr<FJsonValue> Result = ParseResult(GameIQQuery::Children(Map, TEXT("Light"), 50, 0));
+		const TSharedPtr<FJsonObject>* Payload = nullptr;
+		if (!TestTrue(TEXT("children payload"), Result.IsValid() && Result->TryGetObject(Payload))) { return false; }
+		TestEqual(TEXT("filter total"), (int32)(*Payload)->GetNumberField(TEXT("total")), 1);
+		const TArray<TSharedPtr<FJsonValue>>* Rows = nullptr;
+		if (!TestTrue(TEXT("rows array"), (*Payload)->TryGetArrayField(TEXT("children"), Rows))) { return false; }
+		if (!TestEqual(TEXT("one light"), Rows->Num(), 1)) { return false; }
+		TestEqual(TEXT("light name"), (*Rows)[0]->AsObject()->GetStringField(TEXT("name")), FString(TEXT("Lamp")));
+	}
+
+	// Unfiltered Children reports the full child count even when the page is small.
+	{
+		const TSharedPtr<FJsonValue> Result = ParseResult(GameIQQuery::Children(Map, FString(), 2, 0));
+		const TSharedPtr<FJsonObject>* Payload = nullptr;
+		if (!TestTrue(TEXT("children payload"), Result.IsValid() && Result->TryGetObject(Payload))) { return false; }
+		TestEqual(TEXT("total is uncapped"), (int32)(*Payload)->GetNumberField(TEXT("total")), 7);
+		const TArray<TSharedPtr<FJsonValue>>* Rows = nullptr;
+		if (!TestTrue(TEXT("rows array"), (*Payload)->TryGetArrayField(TEXT("children"), Rows))) { return false; }
+		TestEqual(TEXT("page limited"), Rows->Num(), 2);
+	}
+	return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS

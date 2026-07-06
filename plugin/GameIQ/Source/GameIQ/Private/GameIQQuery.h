@@ -15,11 +15,21 @@ namespace GameIQQuery
 {
 	/** FTS search across all chunks (porter-stemmed, AND-first with OR and prefix fallbacks,
 	 *  camelCase-aware via the aux column); optional `Kind` filters to one entity kind.
-	 *  `Offset` pages through results. */
-	FString Search(const FString& Query, const FString& Kind, int32 Limit = 20, int32 Offset = 0);
+	 *  `Offset` pages through results. `PathPrefix` scopes hits to one content path (e.g.
+	 *  "/Game/Coursera") — matches asset ids and entity paths. Hits are re-ranked by how much
+	 *  of the query appears in the entity NAME, and bulk asset classes (textures, material
+	 *  instances) are demoted so they can't drown intent-shaped queries. */
+	FString Search(const FString& Query, const FString& Kind, int32 Limit = 20, int32 Offset = 0,
+		const FString& PathPrefix = TEXT(""));
 
-	/** Full detail for one entity id (entity + edges + children + chunks, arrays capped). */
+	/** Full detail for one entity id (entity + edges + children + chunks, arrays capped).
+	 *  Children are returned round-robin by class (one of each class first) with a
+	 *  `childrenByClass` rollup, so a capped list still shows every class. */
 	FString GetEntity(const FString& Id, int32 Cap = 50);
+
+	/** Page through an entity's children, optionally filtered by class (level-actor `detail.class`
+	 *  or entity kind, substring match) — the drill-down companion to GetEntity's rollup. */
+	FString Children(const FString& Id, const FString& ClassFilter = TEXT(""), int32 Limit = 50, int32 Offset = 0);
 
 	/** Graph walk (recursive CTE) from `Id` up to `Depth` hops; optional edge-type / kind filters.
 	 *  Direction is "in" | "out" | "both". `Offset` pages through results. */

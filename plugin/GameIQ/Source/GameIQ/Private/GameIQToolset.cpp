@@ -4,14 +4,20 @@
 
 #include "GameIQQuery.h"
 
-FString UGameIQService::Search(const FString& Query, const FString& Kind, int32 Limit, int32 Offset)
+FString UGameIQService::Search(const FString& Query, const FString& Kind, int32 Limit, int32 Offset,
+	const FString& PathPrefix)
 {
-	return GameIQQuery::Search(Query, Kind, Limit > 0 ? Limit : 20, Offset);
+	return GameIQQuery::Search(Query, Kind, Limit > 0 ? Limit : 20, Offset, PathPrefix);
 }
 
 FString UGameIQService::GetEntity(const FString& Id)
 {
 	return GameIQQuery::GetEntity(Id, /*Cap=*/50);
+}
+
+FString UGameIQService::Children(const FString& Id, const FString& ClassFilter, int32 Limit, int32 Offset)
+{
+	return GameIQQuery::Children(Id, ClassFilter, Limit, Offset);
 }
 
 FString UGameIQService::References(const FString& Id, const FString& Direction, int32 Depth,

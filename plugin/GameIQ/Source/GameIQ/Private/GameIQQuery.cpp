@@ -188,6 +188,7 @@ namespace
 			{ TEXT("binds-input"), 7 }, // breaking an input binding breaks player controls
 			{ TEXT("uses-skeleton"), 8 }, { TEXT("uses-material"), 7 }, { TEXT("uses-texture"), 5 },
 			{ TEXT("overrides-parameter"), 6 }, { TEXT("casts-to"), 6 }, { TEXT("placed-in-level"), 5 },
+			{ TEXT("instance-of"), 5 }, // placed actor → its Blueprint/C++ class
 			{ TEXT("plays-on"), 4 }, { TEXT("depends-on"), 4 }, { TEXT("references"), 3 },
 			{ TEXT("describes"), 2 }, { TEXT("constrains"), 2 }, { TEXT("illustrates"), 2 },
 		};
@@ -211,15 +212,23 @@ namespace
 	 * cpp-body chunks are demoted below summaries for the same reason: a long function body
 	 * mentioning a term shouldn't outrank the entity that IS that term.
 	 */
-	TArray<FSearchHit> RunFtsQuery(FSQLiteDatabase& Db, const FString& Match, const FString& Kind, int32 Limit, int32 Offset)
+	TArray<FSearchHit> RunFtsQuery(FSQLiteDatabase& Db, const FString& Match, const FString& Kind,
+		const FString& PathPrefix, int32 Limit, int32 Offset)
 	{
 		TArray<FSearchHit> Out;
+		// The extra 0.5x CASE demotes bulk asset classes (textures, material instances/functions):
+		// they exist in the thousands, their names echo gameplay words ("teeth_normal_map" matches
+		// "mapping"), and they are almost never the answer to an intent-shaped question. A query
+		// that really wants them still finds them via kind filter or their exact name.
 		FSQLitePreparedStatement Stmt = Db.PrepareStatement(TEXT(
 			"WITH hits AS ("
 			"  SELECT c.id AS chunkId, c.entity_id AS entityId, c.kind AS chunkKind,"
 			"         bm25(chunks_fts, 1.0, 0.6)"
 			"           * (CASE ce.kind WHEN 'level-actor' THEN 0.35 ELSE 1.0 END)"
-			"           * (CASE c.kind WHEN 'cpp-body' THEN 0.7 ELSE 1.0 END) AS score,"
+			"           * (CASE c.kind WHEN 'cpp-body' THEN 0.7 ELSE 1.0 END)"
+			"           * (CASE WHEN json_extract(ce.detail,'$.assetClass') IN"
+			"               ('Texture2D','TextureCube','Texture2DArray','VirtualTexture2D',"
+			"                'MaterialInstanceConstant','MaterialFunction') THEN 0.5 ELSE 1.0 END) AS score,"
 			"         snippet(chunks_fts, 0, '[', ']', ' ... ', 12) AS snip"
 			"  FROM chunks_fts JOIN chunks c ON c.rowid = chunks_fts.rowid"
 			"  JOIN entities ce ON ce.id = c.entity_id"
@@ -230,6 +239,7 @@ namespace
 			"SELECT b.chunkId, b.chunkKind, b.score, b.snip, e.* "
 			"FROM best b JOIN entities e ON e.id = b.entityId "
 			"WHERE b.rn = 1 AND (?2 = '' OR e.kind = ?2) "
+			"AND (?5 = '' OR e.id LIKE 'asset:' || ?5 || '%' OR e.path LIKE ?5 || '%') "
 			"ORDER BY b.score LIMIT ?3 OFFSET ?4"));
 		if (!Stmt.IsValid())
 		{
@@ -240,6 +250,7 @@ namespace
 		Stmt.SetBindingValueByIndex(2, Kind);
 		Stmt.SetBindingValueByIndex(3, Limit);
 		Stmt.SetBindingValueByIndex(4, Offset);
+		Stmt.SetBindingValueByIndex(5, PathPrefix);
 		while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
 		{
 			double Score = 0.0;
@@ -249,22 +260,62 @@ namespace
 		return Out;
 	}
 
-	/** AND-first (precision), then OR (recall), then prefix-OR (partial words) — first tier
-	 *  with any hits wins, so "reload logic" doesn't return everything containing "logic". */
-	TArray<FSearchHit> BuildSearchHits(FSQLiteDatabase& Db, const FString& Query, const FString& Kind, int32 Limit, int32 Offset)
+	/**
+	 * Name-match re-rank: bm25 scores chunk BODIES, so an entity whose NAME is the query
+	 * ("IMC_SenseisRevenge") can lose to a big chunk that merely mentions the words. Boost each
+	 * hit by the fraction of query tokens present in its name (camel/underscore-split, case-
+	 * insensitive). Scores are negative (more negative = better), so boosting multiplies UP.
+	 */
+	void RerankByNameMatch(const FString& Query, TArray<FSearchHit>& Hits)
 	{
+		TArray<FString> Tokens;
+		for (const FString& T : GameIQText::WordTokens(Query))
+		{
+			if (T.Len() >= 3) { Tokens.Add(T.ToLower()); }
+		}
+		if (Tokens.Num() == 0) { return; }
+		for (FSearchHit& H : Hits)
+		{
+			const FString Name = H.Entity->GetStringField(TEXT("name"));
+			const FString Hay = (Name + TEXT(" ") + GameIQText::SplitCamel(Name.Replace(TEXT("_"), TEXT(" ")))).ToLower();
+			int32 Matched = 0;
+			for (const FString& T : Tokens)
+			{
+				if (Hay.Contains(T)) { ++Matched; }
+			}
+			H.Score *= 1.0 + 0.8 * (double)Matched / (double)Tokens.Num();
+		}
+		Hits.StableSort([](const FSearchHit& A, const FSearchHit& B) { return A.Score < B.Score; });
+	}
+
+	/** AND-first (precision), then OR (recall), then prefix-OR (partial words) — first tier
+	 *  with any hits wins, so "reload logic" doesn't return everything containing "logic".
+	 *  Overfetches, re-ranks by name match, then applies Offset/Limit. */
+	TArray<FSearchHit> BuildSearchHits(FSQLiteDatabase& Db, const FString& Query, const FString& Kind,
+		int32 Limit, int32 Offset, const FString& PathPrefix = TEXT(""))
+	{
+		const int32 Fetch = FMath::Min((Offset + Limit) * 3, 300);
+		auto RunTier = [&](const FString& Match) -> TArray<FSearchHit>
+		{
+			TArray<FSearchHit> Hits = RunFtsQuery(Db, Match, Kind, PathPrefix, Fetch, 0);
+			RerankByNameMatch(Query, Hits);
+			if (Offset > 0) { Hits.RemoveAt(0, FMath::Min(Offset, Hits.Num())); }
+			if (Hits.Num() > Limit) { Hits.SetNum(Limit); }
+			return Hits;
+		};
+
 		const FString AndQ = GameIQText::BuildFtsQuery(Query, TEXT("AND"));
 		if (AndQ.IsEmpty()) { return {}; }
-		TArray<FSearchHit> Hits = RunFtsQuery(Db, AndQ, Kind, Limit, Offset);
+		TArray<FSearchHit> Hits = RunTier(AndQ);
 		if (Hits.Num() > 0) { return Hits; }
 
 		const FString OrQ = GameIQText::BuildFtsQuery(Query, TEXT("OR"));
 		if (OrQ != AndQ)
 		{
-			Hits = RunFtsQuery(Db, OrQ, Kind, Limit, Offset);
+			Hits = RunTier(OrQ);
 			if (Hits.Num() > 0) { return Hits; }
 		}
-		return RunFtsQuery(Db, GameIQText::BuildFtsQuery(Query, TEXT("OR"), /*bPrefix=*/true), Kind, Limit, Offset);
+		return RunTier(GameIQText::BuildFtsQuery(Query, TEXT("OR"), /*bPrefix=*/true));
 	}
 
 	TSharedRef<FJsonObject> SearchHitJson(const FSearchHit& H)
@@ -415,7 +466,8 @@ void GameIQQuery::SetDbPathOverrideForTests(const FString& Path)
 	GDbPathOverride = Path;
 }
 
-FString GameIQQuery::Search(const FString& Query, const FString& Kind, int32 Limit, int32 Offset)
+FString GameIQQuery::Search(const FString& Query, const FString& Kind, int32 Limit, int32 Offset,
+	const FString& PathPrefix)
 {
 	FSQLiteDatabase Db;
 	FString OpenErr;
@@ -423,7 +475,7 @@ FString GameIQQuery::Search(const FString& Query, const FString& Kind, int32 Lim
 	ON_SCOPE_EXIT { Db.Close(); }; // FSQLiteDatabase asserts if destroyed while open
 
 	TArray<TSharedPtr<FJsonValue>> Results;
-	for (const FSearchHit& H : BuildSearchHits(Db, Query, Kind, Limit <= 0 ? 20 : Limit, FMath::Max(0, Offset)))
+	for (const FSearchHit& H : BuildSearchHits(Db, Query, Kind, Limit <= 0 ? 20 : Limit, FMath::Max(0, Offset), PathPrefix))
 	{
 		Results.Add(MakeShared<FJsonValueObject>(SearchHitJson(H)));
 	}
@@ -488,10 +540,21 @@ FString GameIQQuery::GetEntity(const FString& Id, int32 Cap)
 	TArray<TSharedPtr<FJsonValue>> Outgoing = ReadEdges(TEXT("SELECT * FROM edges WHERE src = ? LIMIT ?"));
 	TArray<TSharedPtr<FJsonValue>> Incoming = ReadEdges(TEXT("SELECT * FROM edges WHERE dst = ? LIMIT ?"));
 
-	// children (capped)
+	// children (capped) — round-robin by class (one of each class first, rare classes leading),
+	// so a 50-row window on a 500-actor level still shows every class instead of 50 rocks.
 	TArray<TSharedPtr<FJsonValue>> Children;
 	{
-		FSQLitePreparedStatement Stmt = Db.PrepareStatement(TEXT("SELECT * FROM entities WHERE parent = ? LIMIT ?"));
+		FSQLitePreparedStatement Stmt = Db.PrepareStatement(TEXT(
+			"SELECT * FROM ("
+			"  SELECT e.*,"
+			"    ROW_NUMBER() OVER (PARTITION BY COALESCE(json_extract(e.detail,'$.class'), e.kind) ORDER BY e.id) AS rr,"
+			"    COUNT(*) OVER (PARTITION BY COALESCE(json_extract(e.detail,'$.class'), e.kind)) AS clsN"
+			"  FROM entities e WHERE e.parent = ?"
+			") ORDER BY rr, clsN, id LIMIT ?"));
+		if (!Stmt.IsValid())
+		{
+			Stmt = Db.PrepareStatement(TEXT("SELECT * FROM entities WHERE parent = ? LIMIT ?"));
+		}
 		if (Stmt.IsValid())
 		{
 			Stmt.SetBindingValueByIndex(1, Id);
@@ -499,6 +562,28 @@ FString GameIQQuery::GetEntity(const FString& Id, int32 Cap)
 			while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
 			{
 				Children.Add(MakeShared<FJsonValueObject>(EntityJson(Stmt)));
+			}
+		}
+	}
+
+	// class → count rollup over ALL children (not just the capped window): the cheap answer to
+	// "what's in this level" without paging anything.
+	TArray<TSharedPtr<FJsonValue>> ChildrenByClass;
+	{
+		FSQLitePreparedStatement Stmt = Db.PrepareStatement(TEXT(
+			"SELECT COALESCE(json_extract(detail,'$.class'), kind) AS class, COUNT(*) AS count "
+			"FROM entities WHERE parent = ? GROUP BY class ORDER BY count DESC"));
+		if (Stmt.IsValid())
+		{
+			Stmt.SetBindingValueByIndex(1, Id);
+			while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+			{
+				TSharedRef<FJsonObject> Row = MakeShared<FJsonObject>();
+				Row->SetStringField(TEXT("class"), ColStr(Stmt, TEXT("class")));
+				int32 N = 0;
+				Stmt.GetColumnValueByName(TEXT("count"), N);
+				Row->SetNumberField(TEXT("count"), N);
+				ChildrenByClass.Add(MakeShared<FJsonValueObject>(Row));
 			}
 		}
 	}
@@ -519,12 +604,75 @@ FString GameIQQuery::GetEntity(const FString& Id, int32 Cap)
 	Detail->SetArrayField(TEXT("outgoing"), Outgoing);
 	Detail->SetArrayField(TEXT("incoming"), Incoming);
 	Detail->SetArrayField(TEXT("children"), Children);
+	if (ChildrenByClass.Num() > 0)
+	{
+		Detail->SetArrayField(TEXT("childrenByClass"), ChildrenByClass);
+	}
 	Detail->SetArrayField(TEXT("chunks"), Chunks);
 	Detail->SetObjectField(TEXT("counts"), Counts);
-	Detail->SetBoolField(TEXT("truncated"),
-		OutCount > Cap || InCount > Cap || ChildCount > Cap || ChunkCount > Cap);
+	const bool bTruncated = OutCount > Cap || InCount > Cap || ChildCount > Cap || ChunkCount > Cap;
+	Detail->SetBoolField(TEXT("truncated"), bTruncated);
+	if (bTruncated)
+	{
+		Detail->SetStringField(TEXT("note"), FString::Printf(
+			TEXT("arrays capped at %d (full totals in counts); children are round-robin by class — use Children(id, classFilter, offset) to page the rest"), Cap));
+	}
 
 	return Envelope(Db, MakeShared<FJsonValueObject>(Detail));
+}
+
+FString GameIQQuery::Children(const FString& Id, const FString& ClassFilter, int32 Limit, int32 Offset)
+{
+	FSQLiteDatabase Db;
+	FString OpenErr;
+	if (!OpenIndex(Db, OpenErr)) { return ErrorJson(OpenErr); }
+	ON_SCOPE_EXIT { Db.Close(); }; // FSQLiteDatabase asserts if destroyed while open
+
+	const int32 UseLimit = Limit <= 0 ? 50 : Limit;
+	const int32 UseOffset = FMath::Max(0, Offset);
+
+	int32 Total = 0;
+	{
+		FSQLitePreparedStatement Stmt = Db.PrepareStatement(TEXT(
+			"SELECT COUNT(*) AS n FROM entities "
+			"WHERE parent = ?1 AND (?2 = '' OR COALESCE(json_extract(detail,'$.class'), kind) LIKE '%' || ?2 || '%')"));
+		if (Stmt.IsValid())
+		{
+			Stmt.SetBindingValueByIndex(1, Id);
+			Stmt.SetBindingValueByIndex(2, ClassFilter);
+			if (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+			{
+				Stmt.GetColumnValueByName(TEXT("n"), Total);
+			}
+		}
+	}
+
+	TArray<TSharedPtr<FJsonValue>> Rows;
+	{
+		FSQLitePreparedStatement Stmt = Db.PrepareStatement(TEXT(
+			"SELECT * FROM entities "
+			"WHERE parent = ?1 AND (?2 = '' OR COALESCE(json_extract(detail,'$.class'), kind) LIKE '%' || ?2 || '%') "
+			"ORDER BY id LIMIT ?3 OFFSET ?4"));
+		if (Stmt.IsValid())
+		{
+			Stmt.SetBindingValueByIndex(1, Id);
+			Stmt.SetBindingValueByIndex(2, ClassFilter);
+			Stmt.SetBindingValueByIndex(3, UseLimit);
+			Stmt.SetBindingValueByIndex(4, UseOffset);
+			while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+			{
+				Rows.Add(MakeShared<FJsonValueObject>(EntityJson(Stmt)));
+			}
+		}
+	}
+
+	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetStringField(TEXT("parent"), Id);
+	Payload->SetStringField(TEXT("classFilter"), ClassFilter);
+	Payload->SetNumberField(TEXT("total"), Total);
+	Payload->SetNumberField(TEXT("offset"), UseOffset);
+	Payload->SetArrayField(TEXT("children"), Rows);
+	return Envelope(Db, MakeShared<FJsonValueObject>(Payload));
 }
 
 FString GameIQQuery::References(const FString& Id, const FString& Direction, int32 Depth,
@@ -813,6 +961,49 @@ FString GameIQQuery::Doctor()
 		Payload->SetArrayField(TEXT("byProducer"), SelectRows(Db,
 			TEXT("SELECT COALESCE(producer,'(none)') AS producer, COUNT(*) AS count FROM entities GROUP BY producer ORDER BY count DESC"),
 			{ TEXT("producer") }, { TEXT("count") }));
+
+		// Level coverage: actor totals stated in each level's summary chunk (assets stage) vs the
+		// level-actor entities actually indexed under that map. Listing fewer than total is by
+		// design (the entity cap), but ZERO indexed actors on a populated map means the map's deep
+		// extraction never ran — the exact failure that silently hid a level's lighting. "healthy"
+		// must not paper over that.
+		{
+			TArray<TSharedPtr<FJsonValue>> Levels;
+			FSQLitePreparedStatement Stmt = Db.PrepareStatement(TEXT(
+				"SELECT c.entity_id AS id, c.text AS text,"
+				" (SELECT COUNT(*) FROM entities k WHERE k.parent = c.entity_id) AS indexed"
+				" FROM chunks c WHERE c.kind = 'recipe-summary' AND c.text LIKE '%(Level)%Actors:%'"));
+			if (Stmt.IsValid())
+			{
+				while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+				{
+					const FString MapId = ColStr(Stmt, TEXT("id"));
+					const FString Text = ColStr(Stmt, TEXT("text"));
+					int32 Indexed = 0;
+					Stmt.GetColumnValueByName(TEXT("indexed"), Indexed);
+
+					int32 Actors = 0;
+					const int32 At = Text.Find(TEXT("Actors: "));
+					if (At != INDEX_NONE) { Actors = FCString::Atoi(*Text.Mid(At + 8)); }
+
+					TSharedRef<FJsonObject> Row = MakeShared<FJsonObject>();
+					Row->SetStringField(TEXT("map"), MapId);
+					Row->SetNumberField(TEXT("actors"), Actors);
+					Row->SetNumberField(TEXT("indexedActors"), Indexed);
+					Levels.Add(MakeShared<FJsonValueObject>(Row));
+					if (Actors > 0 && Indexed == 0)
+					{
+						Problems.Add(FString::Printf(
+							TEXT("%s reports %d actors but has no indexed level-actor entities — run GameIQ.Rebuild full"),
+							*MapId, Actors));
+					}
+				}
+			}
+			if (Levels.Num() > 0)
+			{
+				Payload->SetArrayField(TEXT("levels"), Levels);
+			}
+		}
 	}
 
 	Payload->SetField(TEXT("dbGeneration"), NullOrString(MetaValue(Db, TEXT("dbGeneration"))));

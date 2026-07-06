@@ -325,14 +325,33 @@ namespace
 			Mat->IsTwoSided() ? TEXT("yes") : TEXT("no"), TexNames.Num(), *FString::Join(TexNames, TEXT(", "))));
 	}
 
-	/** InputMappingContext — the key→action bindings (Enhanced Input). */
+	/** InputMappingContext — the key→action bindings (Enhanced Input), with each mapping's
+	 *  modifiers ([Negate,SwizzleAxis]) and triggers ((Pressed)) so the full control scheme is
+	 *  answerable from the index without loading the asset. */
 	void RecipeInputMappingContext(FOut& O, const UInputMappingContext* IMC, const FString& Id, const FString& Name)
 	{
+		auto ShortNames = [](const auto& Objects, const TCHAR* Prefix) -> FString
+		{
+			TArray<FString> Names;
+			for (const auto& Obj : Objects)
+			{
+				if (!Obj) { continue; }
+				FString N = Obj->GetClass()->GetName();
+				N.RemoveFromStart(Prefix);
+				Names.Add(N);
+			}
+			return FString::Join(Names, TEXT(","));
+		};
+
 		TArray<FString> Lines;
 		for (const FEnhancedActionKeyMapping& M : IMC->GetMappings())
 		{
 			const FString ActionName = M.Action ? M.Action->GetName() : TEXT("<none>");
-			Lines.Add(FString::Printf(TEXT("%s <- %s"), *ActionName, *M.Key.ToString()));
+			const FString Mods = ShortNames(M.Modifiers, TEXT("InputModifier"));
+			const FString Trigs = ShortNames(M.Triggers, TEXT("InputTrigger"));
+			Lines.Add(FString::Printf(TEXT("%s <- %s%s%s"), *ActionName, *M.Key.ToString(),
+				Mods.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" [%s]"), *Mods),
+				Trigs.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" (%s)"), *Trigs)));
 			if (M.Action)
 			{
 				O.Edges.Add(MakeShared<FJsonValueObject>(
@@ -525,13 +544,15 @@ namespace
 		ULevel* Level = World->PersistentLevel;
 		if (!Level) { return; }
 
+		// Pass 1 — collect and count. Selection happens AFTER counting so the entity cap is spent
+		// on class DIVERSITY (round-robin across classes, rarest first) instead of the first N in
+		// level order: 700 rocks must not starve the one sky/light/gameplay actor an agent asks
+		// about. (This was exactly how Ultra_Dynamic_Sky went missing from a 969-actor map.)
 		TMap<FString, int32> ClassCounts;
-		int32 Listed = 0;
+		TMap<FString, TArray<const AActor*>> ByClass;
 		int32 Total = 0;
 
-		// Emit one placed actor: a `level-actor` entity (with typed light/mesh detail), a
-		// `placed-in-level` edge, a searchable chunk, and a level→class "places" edge.
-		auto ExtractActor = [&](const AActor* Actor)
+		auto CollectActor = [&](const AActor* Actor)
 		{
 			if (!Actor) { return; }
 			++Total;
@@ -544,47 +565,10 @@ namespace
 				TEXT("WorldPartitionHLOD"), TEXT("WorldPartitionMiniMap"), TEXT("HLODActor") };
 			if (DerivedInfra.Contains(ClassName)) { return; }
 
-			// Link the level to the class it places: BP asset, or native C++ class.
-			if (const UClass* Cls = Actor->GetClass())
-			{
-				if (UObject* GenBy = Cls->ClassGeneratedBy)
-				{
-					O.Edges.Add(MakeShared<FJsonValueObject>(
-						GameIQ::MakeEdge(Id, AssetIdOf(GenBy), TEXT("references"), TEXT("places"))));
-				}
-				else
-				{
-					O.Edges.Add(MakeShared<FJsonValueObject>(
-						GameIQ::MakeEdge(Id, FString::Printf(TEXT("cpp:%s"), *ClassName), TEXT("references"), TEXT("places"))));
-				}
-			}
-
-			if (Listed < MaxActorEntitiesPerLevel)
-			{
-				const FString ActorLabel = Actor->GetActorNameOrLabel();
-				const FString ActorId = FString::Printf(TEXT("%s::actor::%s"), *Id, *Actor->GetName());
-				TSharedRef<FJsonObject> D = MakeShared<FJsonObject>();
-				D->SetStringField(TEXT("class"), ClassName);
-				D->SetStringField(TEXT("location"), Actor->GetActorLocation().ToString());
-				const FString Detail = ActorDetail(O, Actor, ActorId, D);
-
-				O.Entities.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEntity(
-					ActorId, TEXT("level-actor"), ActorLabel, Name, TEXT("asset"), Id,
-					FString::Printf(TEXT("%s (%s)"), *ActorLabel, *ClassName), D)));
-				O.Edges.Add(MakeShared<FJsonValueObject>(
-					GameIQ::MakeEdge(ActorId, Id, TEXT("placed-in-level"))));
-				// Per-actor chunk so placed actors are searchable by class/name. Include the camelCase-split
-				// class ("Directional Light") so a plain search for "light" / "mesh" / "camera" matches the
-				// compound class token (FTS indexes whole words).
-				O.Chunks.Add(MakeShared<FJsonValueObject>(GameIQ::MakeChunk(
-					FString::Printf(TEXT("%s#actor"), *ActorId), ActorId, TEXT("recipe-summary"),
-					FString::Printf(TEXT("%s (%s / %s) in %s%s"), *ActorLabel, *ClassName, *GameIQText::SplitCamel(ClassName), *Name,
-						Detail.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" — %s"), *Detail)))));
-				++Listed;
-			}
+			ByClass.FindOrAdd(ClassName).Add(Actor);
 		};
 
-		for (const AActor* Actor : Level->Actors) { ExtractActor(Actor); }
+		for (const AActor* Actor : Level->Actors) { CollectActor(Actor); }
 
 		// World Partition levels keep their real actors (lights, meshes, …) as One-File-Per-Actor
 		// packages under __ExternalActors__, which are NOT in Level->Actors — so a naive walk sees
@@ -608,10 +592,124 @@ namespace
 				ARM.Get().GetAssets(Filter, ExtAssets);
 				for (const FAssetData& AD : ExtAssets)
 				{
-					if (AActor* Actor = Cast<AActor>(AD.GetAsset())) { ExtractActor(Actor); ++External; }
+					if (AActor* Actor = Cast<AActor>(AD.GetAsset())) { CollectActor(Actor); ++External; }
 				}
 			}
 		}
+
+		// Pass 2 — one `places` edge per class (not per actor), and remember each class's target id
+		// so listed actors can carry an `instance-of` edge to their Blueprint/C++ class entity.
+		TMap<FString, FString> ClassTargetId;
+		for (const TPair<FString, TArray<const AActor*>>& P : ByClass)
+		{
+			if (P.Value.Num() == 0) { continue; }
+			const UClass* Cls = P.Value[0]->GetClass();
+			const FString TargetId = Cls->ClassGeneratedBy
+				? AssetIdOf(Cls->ClassGeneratedBy)
+				: FString::Printf(TEXT("cpp:%s"), *P.Key);
+			ClassTargetId.Add(P.Key, TargetId);
+			O.Edges.Add(MakeShared<FJsonValueObject>(
+				GameIQ::MakeEdge(Id, TargetId, TEXT("references"), TEXT("places"))));
+		}
+
+		// Emit one placed actor: a `level-actor` entity (with typed light/mesh detail), a
+		// `placed-in-level` edge, an `instance-of` edge to its class, and a searchable chunk.
+		auto EmitActor = [&](const AActor* Actor, const FString& ClassName)
+		{
+			const FString ActorLabel = Actor->GetActorNameOrLabel();
+			const FString ActorId = FString::Printf(TEXT("%s::actor::%s"), *Id, *Actor->GetName());
+			TSharedRef<FJsonObject> D = MakeShared<FJsonObject>();
+			D->SetStringField(TEXT("class"), ClassName);
+			D->SetStringField(TEXT("location"), Actor->GetActorLocation().ToString());
+			const FString Detail = ActorDetail(O, Actor, ActorId, D);
+
+			O.Entities.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEntity(
+				ActorId, TEXT("level-actor"), ActorLabel, Name, TEXT("asset"), Id,
+				FString::Printf(TEXT("%s (%s)"), *ActorLabel, *ClassName), D)));
+			O.Edges.Add(MakeShared<FJsonValueObject>(
+				GameIQ::MakeEdge(ActorId, Id, TEXT("placed-in-level"))));
+			if (const FString* ClsId = ClassTargetId.Find(ClassName))
+			{
+				O.Edges.Add(MakeShared<FJsonValueObject>(
+					GameIQ::MakeEdge(ActorId, *ClsId, TEXT("instance-of"))));
+			}
+			// Per-actor chunk so placed actors are searchable by class/name. Include the camelCase-split
+			// class ("Directional Light") so a plain search for "light" / "mesh" / "camera" matches the
+			// compound class token (FTS indexes whole words).
+			O.Chunks.Add(MakeShared<FJsonValueObject>(GameIQ::MakeChunk(
+				FString::Printf(TEXT("%s#actor"), *ActorId), ActorId, TEXT("recipe-summary"),
+				FString::Printf(TEXT("%s (%s / %s) in %s%s"), *ActorLabel, *ClassName, *GameIQText::SplitCamel(ClassName), *Name,
+					Detail.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" — %s"), *Detail)))));
+		};
+
+		// Round-robin across classes, rarest classes first: every class gets its first actor listed
+		// before any class gets its second, so the cap can never hide a whole class.
+		TArray<FString> Ordered;
+		ByClass.GetKeys(Ordered);
+		Ordered.Sort([&ByClass](const FString& A, const FString& B)
+		{
+			const int32 NA = ByClass[A].Num(), NB = ByClass[B].Num();
+			return NA != NB ? NA < NB : A < B;
+		});
+		int32 Listed = 0;
+		for (int32 Rank = 0; Listed < MaxActorEntitiesPerLevel; ++Rank)
+		{
+			bool bAnyThisRank = false;
+			for (const FString& ClassName : Ordered)
+			{
+				const TArray<const AActor*>& Bucket = ByClass[ClassName];
+				if (!Bucket.IsValidIndex(Rank)) { continue; }
+				bAnyThisRank = true;
+				EmitActor(Bucket[Rank], ClassName);
+				if (++Listed >= MaxActorEntitiesPerLevel) { break; }
+			}
+			if (!bAnyThisRank) { break; }
+		}
+
+		// Dedicated lighting/environment line so "how does lighting work in this map" resolves from
+		// the level summary alone. Class-name match plus label match (a LevelInstance named
+		// GraveYardLight is lighting even though its class isn't).
+		auto IsEnvName = [](const FString& S)
+		{
+			static const TCHAR* Pats[] = { TEXT("Light"), TEXT("Sky"), TEXT("Fog"), TEXT("PostProcess"),
+				TEXT("Cloud"), TEXT("Atmosphere"), TEXT("Weather"), TEXT("Lumen") };
+			for (const TCHAR* P : Pats) { if (S.Contains(P)) { return true; } }
+			return false;
+		};
+		TMap<FString, int32> EnvGroups;
+		for (const TPair<FString, TArray<const AActor*>>& P : ByClass)
+		{
+			const bool bEnvClass = IsEnvName(P.Key);
+			for (const AActor* Actor : P.Value)
+			{
+				FString Group;
+				if (bEnvClass)
+				{
+					Group = P.Key;
+				}
+				else
+				{
+					FString Label = Actor->GetActorNameOrLabel();
+					while (Label.Len() > 0 && (FChar::IsDigit(Label[Label.Len() - 1]) || Label[Label.Len() - 1] == TEXT('_')))
+					{
+						Label.LeftChopInline(1);
+					}
+					if (!IsEnvName(Label)) { continue; }
+					Group = FString::Printf(TEXT("%s (%s)"), *Label, *P.Key);
+				}
+				EnvGroups.FindOrAdd(Group)++;
+			}
+		}
+		EnvGroups.ValueSort([](int32 A, int32 B) { return A > B; });
+		TArray<FString> EnvParts;
+		for (const TPair<FString, int32>& P : EnvGroups)
+		{
+			if (EnvParts.Num() >= 16) { break; }
+			EnvParts.Add(P.Value > 1 ? FString::Printf(TEXT("%s x%d"), *P.Key, P.Value) : P.Key);
+		}
+		const FString EnvLine = EnvParts.Num() > 0
+			? FString::Printf(TEXT("\nLighting & environment: %s"), *FString::Join(EnvParts, TEXT(", ")))
+			: FString();
 
 		ClassCounts.ValueSort([](int32 A, int32 B) { return A > B; });
 		TArray<FString> CountLines;
@@ -623,10 +721,10 @@ namespace
 		const FString WpNote = External > 0
 			? FString::Printf(TEXT(" (World Partition: %d external actors resolved)"), External) : FString();
 		const FString CapNote = Total > MaxActorEntitiesPerLevel
-			? FString::Printf(TEXT(" (%d listed as entities, all counted below)"), MaxActorEntitiesPerLevel)
+			? FString::Printf(TEXT(" (%d listed as entities, round-robin by class — every class represented; all counted below)"), MaxActorEntitiesPerLevel)
 			: FString();
-		AddSummary(O, Id, FString::Printf(TEXT("%s (Level)\nActors: %d in %d classes%s%s\n%s"),
-			*Name, Total, ClassCounts.Num(), *WpNote, *CapNote, *FString::Join(CountLines, TEXT(", "))));
+		AddSummary(O, Id, FString::Printf(TEXT("%s (Level)\nActors: %d in %d classes%s%s%s\n%s"),
+			*Name, Total, ClassCounts.Num(), *WpNote, *CapNote, *EnvLine, *FString::Join(CountLines, TEXT(", "))));
 	}
 
 	/** Asset classes whose bespoke recipe needs the UObject loaded. Everything else goes through
