@@ -2,11 +2,16 @@
 
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
+#include "GameIQCppParse.h"
+#include "GameIQQuery.h"
 #include "GameIQStore.h"
 #include "GameIQTextUtil.h"
 #include "HAL/FileManager.h"
 #include "Misc/AutomationTest.h"
 #include "Misc/Paths.h"
+#include "Misc/ScopeExit.h"
+#include "Serialization/JsonReader.h"
+#include "Serialization/JsonSerializer.h"
 #include "SQLiteDatabase.h"
 
 #if WITH_DEV_AUTOMATION_TESTS
@@ -231,6 +236,179 @@ bool FGameIQTextUtilTest::RunTest(const FString& Parameters)
 	const FString Aux = GameIQText::BuildAuxTokens(
 		TEXT("asset:/Game/Test/BP_PlayerCharacter"), TEXT("BP_PlayerCharacter (Blueprint)"));
 	TestTrue(TEXT("aux splits identifier"), Aux.Contains(TEXT("Player Character")));
+	return true;
+}
+
+namespace GameIQTestUtil
+{
+	/** Parse a query-layer JSON response and return its "result" value (nullptr on failure). */
+	TSharedPtr<FJsonValue> ParseResult(const FString& Json)
+	{
+		TSharedPtr<FJsonObject> Obj;
+		const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Json);
+		if (!FJsonSerializer::Deserialize(Reader, Obj) || !Obj.IsValid()) { return nullptr; }
+		return Obj->TryGetField(TEXT("result"));
+	}
+
+	FString HitEntityId(const TSharedPtr<FJsonValue>& Hit)
+	{
+		const TSharedPtr<FJsonObject>* O = nullptr;
+		if (!Hit.IsValid() || !Hit->TryGetObject(O)) { return FString(); }
+		const TSharedPtr<FJsonObject>* E = nullptr;
+		if (!(*O)->TryGetObjectField(TEXT("entity"), E)) { return FString(); }
+		return (*E)->GetStringField(TEXT("id"));
+	}
+}
+
+/**
+ * Kind-weighted ranking: a placed actor whose property dump repeats the query term must not
+ * outrank a real asset/blueprint entity that matches it once. This is the regression test for
+ * the "player controls" failure: Ultra_Dynamic_Weather's "Player Camera Location" dump used to
+ * beat every input asset on raw bm25.
+ */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGameIQQueryRankingTest, "GameIQ.Query.KindWeightedRanking",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGameIQQueryRankingTest::RunTest(const FString& Parameters)
+{
+	using namespace GameIQTestUtil;
+	const FString DbPath = TempDbPath(TEXT("ranking.db"));
+
+	FGameIQStore Store;
+	if (!TestTrue(TEXT("open"), Store.OpenAtPath(DbPath))) { return false; }
+	Store.IngestProducer(TEXT("test"),
+		{
+			Entity(TEXT("asset:/Game/Maps/L::actor::Weather"), TEXT("level-actor"), TEXT("Weather")),
+			Entity(TEXT("asset:/Game/Input/IMC_Controls"), TEXT("asset"), TEXT("IMC_Controls")),
+		},
+		{},
+		{
+			// bm25 alone would rank the term-spamming actor dump first.
+			Chunk(TEXT("a1"), TEXT("asset:/Game/Maps/L::actor::Weather"),
+				TEXT("player camera location player camera rotation player weather player position")),
+			Chunk(TEXT("a2"), TEXT("asset:/Game/Input/IMC_Controls"),
+				TEXT("player input mapping context")),
+		});
+	Store.Close();
+
+	GameIQQuery::SetDbPathOverrideForTests(DbPath);
+	ON_SCOPE_EXIT { GameIQQuery::SetDbPathOverrideForTests(FString()); };
+
+	const TSharedPtr<FJsonValue> Result = ParseResult(GameIQQuery::Search(TEXT("player"), FString(), 10, 0));
+	const TArray<TSharedPtr<FJsonValue>>* Hits = nullptr;
+	if (!TestTrue(TEXT("search returns array"), Result.IsValid() && Result->TryGetArray(Hits))) { return false; }
+	if (!TestEqual(TEXT("both entities hit"), Hits->Num(), 2)) { return false; }
+	TestEqual(TEXT("asset outranks level-actor dump"),
+		HitEntityId((*Hits)[0]), FString(TEXT("asset:/Game/Input/IMC_Controls")));
+	return true;
+}
+
+/** Explain seed diversity: one chatty entity kind must not fill every seed slot. */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGameIQQueryExplainDiversityTest, "GameIQ.Query.ExplainSeedDiversity",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGameIQQueryExplainDiversityTest::RunTest(const FString& Parameters)
+{
+	using namespace GameIQTestUtil;
+	const FString DbPath = TempDbPath(TEXT("diversity.db"));
+
+	FGameIQStore Store;
+	if (!TestTrue(TEXT("open"), Store.OpenAtPath(DbPath))) { return false; }
+	TArray<TSharedPtr<FJsonValue>> Entities, Chunks;
+	for (int32 i = 0; i < 10; ++i)
+	{
+		const FString Id = FString::Printf(TEXT("asset:/Game/Maps/L::actor::A%d"), i);
+		Entities.Add(Entity(*Id, TEXT("level-actor"), *FString::Printf(TEXT("A%d"), i)));
+		// Repeat the term so every actor outscores the blueprint on raw bm25.
+		Chunks.Add(Chunk(*FString::Printf(TEXT("c%d"), i), *Id,
+			TEXT("player camera player location player rotation")));
+	}
+	Entities.Add(Entity(TEXT("asset:/Game/BP_Hero"), TEXT("blueprint"), TEXT("BP_Hero")));
+	Chunks.Add(Chunk(TEXT("hero"), TEXT("asset:/Game/BP_Hero"), TEXT("hero blueprint with player input")));
+	Store.IngestProducer(TEXT("test"), Entities, {}, Chunks);
+	Store.Close();
+
+	GameIQQuery::SetDbPathOverrideForTests(DbPath);
+	ON_SCOPE_EXIT { GameIQQuery::SetDbPathOverrideForTests(FString()); };
+
+	const TSharedPtr<FJsonValue> Result = ParseResult(GameIQQuery::Explain(TEXT("player")));
+	const TSharedPtr<FJsonObject>* Payload = nullptr;
+	if (!TestTrue(TEXT("explain returns object"), Result.IsValid() && Result->TryGetObject(Payload))) { return false; }
+	const TArray<TSharedPtr<FJsonValue>>* Seeds = nullptr;
+	if (!TestTrue(TEXT("seeds array"), (*Payload)->TryGetArrayField(TEXT("seeds"), Seeds))) { return false; }
+
+	bool bHasBlueprint = false;
+	for (const TSharedPtr<FJsonValue>& S : *Seeds)
+	{
+		if (HitEntityId(S) == TEXT("asset:/Game/BP_Hero")) { bHasBlueprint = true; }
+	}
+	TestTrue(TEXT("blueprint seeded despite 10 stronger level-actor hits"), bHasBlueprint);
+	return true;
+}
+
+/** .cpp parsing: definitions (incl. ctor init lists) yield bodies, call sites don't, and
+ *  Enhanced Input BindAction wiring is extracted with property/trigger/handler intact. */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGameIQCppParseTest, "GameIQ.Cpp.BodyAndBindingParse",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGameIQCppParseTest::RunTest(const FString& Parameters)
+{
+	const FString Cpp = TEXT(R"cpp(
+#include "MyCharacter.h"
+
+AMyCharacter::AMyCharacter()
+	: Super(FObjectInitializer::Get())
+{
+	PrimaryActorTick.bCanEverTick = true;
+}
+
+void AMyCharacter::BeginPlay()
+{
+	Super::BeginPlay();
+	const bool B = bFlag ? AMyCharacter::StaticHelper(1) : false;
+}
+
+void AMyCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)
+{
+	if (UEnhancedInputComponent* Input = Cast<UEnhancedInputComponent>(PlayerInputComponent))
+	{
+		Input->BindAction(MovementAction, ETriggerEvent::Triggered, this, &AMyCharacter::Move);
+		Input->BindAction(JumpAction, ETriggerEvent::Started, this, &AMyCharacter::Jump);
+		Input->BindAction(JumpAction, ETriggerEvent::Completed, this, &AMyCharacter::StopJump);
+	}
+}
+
+void AMyCharacter::Move(const FInputActionValue& Value)
+{
+	AddMovementInput(GetActorForwardVector(), Value.Get<float>());
+}
+)cpp");
+
+	TSet<FString> Known;
+	Known.Add(TEXT("AMyCharacter"));
+	TArray<GameIQCpp::FCppBody> Bodies;
+	TArray<GameIQCpp::FInputBindingSite> Bindings;
+	GameIQCpp::ParseCppBodies(Cpp, Known, Bodies, Bindings);
+
+	TArray<FString> Names;
+	for (const GameIQCpp::FCppBody& B : Bodies) { Names.Add(B.Func); }
+	TestTrue(TEXT("ctor body found (init list)"), Names.Contains(TEXT("AMyCharacter")));
+	TestTrue(TEXT("BeginPlay body found"), Names.Contains(TEXT("BeginPlay")));
+	TestTrue(TEXT("Move body found"), Names.Contains(TEXT("Move")));
+	TestFalse(TEXT("ternary call site is not a definition"), Names.Contains(TEXT("StaticHelper")));
+	TestEqual(TEXT("definition count"), Bodies.Num(), 4); // ctor, BeginPlay, SetupPlayerInputComponent, Move
+
+	for (const GameIQCpp::FCppBody& B : Bodies)
+	{
+		if (B.Func == TEXT("Move"))
+		{
+			TestTrue(TEXT("body text captured"), B.Body.Contains(TEXT("AddMovementInput")));
+		}
+	}
+
+	if (!TestEqual(TEXT("three bindings"), Bindings.Num(), 3)) { return false; }
+	TestEqual(TEXT("bind prop"), Bindings[0].Prop, FString(TEXT("MovementAction")));
+	TestEqual(TEXT("bind trigger"), Bindings[0].Trigger, FString(TEXT("Triggered")));
+	TestEqual(TEXT("bind class"), Bindings[0].ClassName, FString(TEXT("AMyCharacter")));
+	TestEqual(TEXT("bind handler"), Bindings[0].Handler, FString(TEXT("Move")));
+	TestEqual(TEXT("completed pair kept as separate call site"), Bindings[2].Handler, FString(TEXT("StopJump")));
 	return true;
 }
 

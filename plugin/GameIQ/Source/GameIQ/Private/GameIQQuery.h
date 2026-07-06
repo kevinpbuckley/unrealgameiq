@@ -47,4 +47,8 @@ namespace GameIQQuery
 	/** Design/build drift (issue #6): where a doc section states a `key = value` that contradicts the
 	 *  extracted value on the implementation entity it describes. */
 	FString Drift(int32 Limit = 200);
+
+	/** Tests only: point the query layer at a specific DB file instead of the project index.
+	 *  Pass empty to restore the default. */
+	void SetDbPathOverrideForTests(const FString& Path);
 }

@@ -3,9 +3,9 @@
 #include "GameIQCodeCommandlet.h"
 
 #include "Dom/JsonObject.h"
+#include "GameIQCppParse.h"
 #include "GameIQFileWalk.h"
 #include "GameIQJson.h"
-#include "Internationalization/Regex.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 
@@ -13,100 +13,9 @@ DEFINE_LOG_CATEGORY_STATIC(LogGameIQCode, Log, All);
 
 namespace
 {
-	struct FProp { FString Name; FString Type; };
-	struct FParsedClass
-	{
-		FString Macro, Name, Base, File;
-		TArray<FString> Functions;
-		TArray<FProp> Properties;
-	};
-
-	/** Strip the UE source prefix (A/U/F/I/S/T/E + uppercase) so ids match the reflection name. */
-	FString ReflectionName(const FString& Ident)
-	{
-		if (Ident.Len() >= 2 && FChar::IsUpper(Ident[1]))
-		{
-			const TCHAR C = Ident[0];
-			if (C == 'A' || C == 'U' || C == 'F' || C == 'I' || C == 'S' || C == 'T' || C == 'E')
-			{
-				return Ident.Mid(1);
-			}
-		}
-		return Ident;
-	}
-
-	/** TObjectPtr<UFoo> / UFoo* / TArray<UBar> → the inner UE type identifier, or empty. */
-	FString InnerTypeName(const FString& Type)
-	{
-		FString Base;
-		FRegexMatcher Tmpl(FRegexPattern(TEXT("<\\s*([A-Za-z_]\\w*)")), Type);
-		if (Tmpl.FindNext())
-		{
-			Base = Tmpl.GetCaptureGroup(1);
-		}
-		else
-		{
-			Base = Type.Replace(TEXT("*"), TEXT("")).Replace(TEXT("&"), TEXT(""));
-		}
-		FRegexMatcher Id(FRegexPattern(TEXT("[A-Za-z_]\\w*")), Base);
-		FString Last;
-		while (Id.FindNext()) { Last = Id.GetCaptureGroup(0); } // trailing identifier
-		return Last;
-	}
-
-	/** Matching `{ ... }` starting at/after `From`; returns open index (and sets OutClose), or -1. */
-	int32 FindBlock(const FString& Text, int32 From, int32& OutClose)
-	{
-		const int32 Open = Text.Find(TEXT("{"), ESearchCase::CaseSensitive, ESearchDir::FromStart, From);
-		if (Open < 0) { return -1; }
-		int32 Depth = 0;
-		for (int32 i = Open; i < Text.Len(); ++i)
-		{
-			if (Text[i] == '{') { ++Depth; }
-			else if (Text[i] == '}') { if (--Depth == 0) { OutClose = i; return Open; } }
-		}
-		return -1;
-	}
-
-	void ParseFile(const FString& Text, const FString& File, TArray<FParsedClass>& Out)
-	{
-		FRegexMatcher Reflected(FRegexPattern(TEXT("(UCLASS|USTRUCT|UINTERFACE)\\s*\\(")), Text);
-		while (Reflected.FindNext())
-		{
-			const int32 Idx = Reflected.GetMatchBeginning();
-			const FString Macro = Reflected.GetCaptureGroup(1);
-			const FString After = Text.Mid(Idx, 4000);
-
-			FRegexMatcher Decl(FRegexPattern(
-				TEXT("\\)\\s*(?:class|struct)\\s+(?:[A-Z0-9_]+_API\\s+)?([A-Za-z_]\\w*)\\b(?:\\s*:\\s*public\\s+([A-Za-z_]\\w*))?")), After);
-			if (!Decl.FindNext()) { continue; }
-
-			const int32 DeclAbs = Idx + Decl.GetMatchBeginning();
-			int32 Close = 0;
-			const int32 Open = FindBlock(Text, DeclAbs, Close);
-			if (Open < 0) { continue; }
-			const FString Body = Text.Mid(Open, Close - Open + 1);
-
-			FParsedClass C;
-			C.Macro = Macro;
-			C.Name = Decl.GetCaptureGroup(1);
-			C.Base = Decl.GetCaptureGroup(2); // empty if absent
-			C.File = File;
-
-			FRegexMatcher Fn(FRegexPattern(TEXT("UFUNCTION\\s*\\([\\s\\S]*?\\)\\s*[\\s\\S]*?\\b([A-Za-z_]\\w*)\\s*\\(")), Body);
-			while (Fn.FindNext()) { C.Functions.Add(Fn.GetCaptureGroup(1)); }
-
-			FRegexMatcher Prop(FRegexPattern(TEXT("UPROPERTY\\s*\\([\\s\\S]*?\\)\\s*([A-Za-z_][\\w:<>,\\s\\*&]*?)\\b([A-Za-z_]\\w*)\\s*(?:;|=|\\{)")), Body);
-			while (Prop.FindNext())
-			{
-				const FString Type = Prop.GetCaptureGroup(1).TrimStartAndEnd();
-				if (Type.IsEmpty()) { continue; }
-				C.Properties.Add(FProp{ Prop.GetCaptureGroup(2), Type });
-			}
-
-			Out.Add(MoveTemp(C));
-		}
-	}
+	// Function bodies are indexed for retrieval ("where is the dodge logic"), not as a source
+	// mirror — cap keeps one pathological function from dominating the FTS index.
+	constexpr int32 MaxBodyChunkChars = 2400;
 }
 
 UGameIQCodeCommandlet::UGameIQCodeCommandlet()
@@ -116,6 +25,8 @@ UGameIQCodeCommandlet::UGameIQCodeCommandlet()
 
 int32 UGameIQCodeCommandlet::Main(const FString& /*Params*/)
 {
+	using namespace GameIQCpp;
+
 	const FString Root = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir());
 
 	TArray<FParsedClass> All;
@@ -124,14 +35,16 @@ int32 UGameIQCodeCommandlet::Main(const FString& /*Params*/)
 		FString Text;
 		if (!FFileHelper::LoadFileToString(Text, *File)) { continue; }
 		if (!Text.Contains(TEXT("UCLASS")) && !Text.Contains(TEXT("USTRUCT")) && !Text.Contains(TEXT("UINTERFACE"))) { continue; }
-		ParseFile(Text, File, All);
+		ParseHeader(Text, File, All);
 	}
 
-	// Canonical (prefix-less) reflection names of every parsed type, for resolving property refs.
-	TSet<FString> Known;
-	for (const FParsedClass& C : All) { Known.Add(ReflectionName(C.Name)); }
+	// Canonical (prefix-less) reflection names of every parsed type, for resolving property refs;
+	// source names (with prefix) gate the .cpp definition pass below.
+	TSet<FString> Known, KnownSource;
+	for (const FParsedClass& C : All) { Known.Add(ReflectionName(C.Name)); KnownSource.Add(C.Name); }
 
 	TArray<TSharedPtr<FJsonValue>> Entities, Edges, Chunks;
+	TSet<FString> FunctionIds; // header-pass functions, so the .cpp pass doesn't re-emit entities
 	for (const FParsedClass& C : All)
 	{
 		const FString Rel = GameIQWalk::RelPath(Root, C.File);
@@ -173,6 +86,7 @@ int32 UGameIQCodeCommandlet::Main(const FString& /*Params*/)
 		for (const FString& Fn : C.Functions)
 		{
 			const FString Fid = FString::Printf(TEXT("cpp:%s::%s"), *Canonical, *Fn);
+			FunctionIds.Add(Fid);
 			Entities.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEntity(
 				Fid, TEXT("cpp-function"), Fn, Rel, TEXT("code"), Id,
 				FString::Printf(TEXT("%s::%s()"), *C.Name, *Fn), nullptr)));
@@ -204,10 +118,69 @@ int32 UGameIQCodeCommandlet::Main(const FString& /*Params*/)
 			FString::Printf(TEXT("%s\n%s"), *Header, *FString::Join(MemberLines, TEXT("\n"))))));
 	}
 
+	// ---- .cpp pass: function bodies + Enhanced Input wiring. Header UFUNCTION scraping never
+	// sees plain-method input handlers (Move/Look/Attack…), so this pass also CREATES their
+	// cpp-function entities; bodies become `cpp-body` chunks and BindAction call sites become
+	// property → handler `binds-input` edges. ----
+	int32 NumBodies = 0, NumBindings = 0;
+	TSet<FString> BodyChunkIds, BindingKeys;
+	for (const FString& File : GameIQWalk::WalkFiles(Root, { TEXT(".cpp") }))
+	{
+		FString Text;
+		if (!FFileHelper::LoadFileToString(Text, *File) || !Text.Contains(TEXT("::"))) { continue; }
+
+		TArray<FCppBody> Bodies;
+		TArray<FInputBindingSite> Bindings;
+		ParseCppBodies(Text, KnownSource, Bodies, Bindings);
+		const FString Rel = GameIQWalk::RelPath(Root, File);
+
+		for (const FCppBody& B : Bodies)
+		{
+			const FString Canonical = ReflectionName(B.ClassName);
+			const FString Fid = FString::Printf(TEXT("cpp:%s::%s"), *Canonical, *B.Func);
+			const FString ChunkId = Fid + TEXT("#body");
+			if (BodyChunkIds.Contains(ChunkId)) { continue; } // overloads share an id: first wins
+			BodyChunkIds.Add(ChunkId);
+
+			if (!FunctionIds.Contains(Fid))
+			{
+				FunctionIds.Add(Fid);
+				Entities.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEntity(
+					Fid, TEXT("cpp-function"), B.Func, Rel, TEXT("code"),
+					FString::Printf(TEXT("cpp:%s"), *Canonical),
+					FString::Printf(TEXT("%s::%s()"), *B.ClassName, *B.Func), nullptr)));
+			}
+
+			FString BodyText = B.Body;
+			if (BodyText.Len() > MaxBodyChunkChars)
+			{
+				BodyText = BodyText.Left(MaxBodyChunkChars) + TEXT("\n… (truncated)");
+			}
+			Chunks.Add(MakeShared<FJsonValueObject>(GameIQ::MakeChunk(
+				ChunkId, Fid, TEXT("cpp-body"),
+				FString::Printf(TEXT("%s::%s\n%s"), *B.ClassName, *B.Func, *BodyText))));
+			++NumBodies;
+		}
+
+		for (const FInputBindingSite& Bind : Bindings)
+		{
+			const FString Canonical = ReflectionName(Bind.ClassName);
+			const FString Key = FString::Printf(TEXT("%s|%s|%s"), *Canonical, *Bind.Prop, *Bind.Handler);
+			if (BindingKeys.Contains(Key)) { continue; } // Triggered/Completed pairs → one edge
+			BindingKeys.Add(Key);
+			Edges.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEdge(
+				FString::Printf(TEXT("cpp:%s::%s"), *Canonical, *Bind.Prop),
+				FString::Printf(TEXT("cpp:%s::%s"), *Canonical, *Bind.Handler),
+				TEXT("binds-input"), Bind.Trigger)));
+			++NumBindings;
+		}
+	}
+
 	const FString OutDir = FPaths::Combine(Root, TEXT(".gameiq"), TEXT("extract"));
 	IFileManager::Get().MakeDirectory(*OutDir, true);
 	GameIQ::WriteOutput(OutDir, TEXT("cpp.json"), TEXT("gameiq-cpp@0.1.0"), Entities, Edges, Chunks);
-	UE_LOG(LogGameIQCode, Display, TEXT("Game IQ code: %d classes → %d entities, %d edges, %d chunks → cpp.json"),
-		All.Num(), Entities.Num(), Edges.Num(), Chunks.Num());
+	UE_LOG(LogGameIQCode, Display,
+		TEXT("Game IQ code: %d classes, %d bodies, %d input bindings → %d entities, %d edges, %d chunks → cpp.json"),
+		All.Num(), NumBodies, NumBindings, Entities.Num(), Edges.Num(), Chunks.Num());
 	return 0;
 }

@@ -15,8 +15,11 @@ DEFINE_LOG_CATEGORY_STATIC(LogGameIQQuery, Log, All);
 
 namespace
 {
+	FString GDbPathOverride; // tests only — see SetDbPathOverrideForTests
+
 	FString IndexDbPath()
 	{
+		if (!GDbPathOverride.IsEmpty()) { return GDbPathOverride; }
 		// ProjectDir() is relative to the engine binary at runtime; sqlite resolves against the
 		// process cwd, so hand it an absolute path.
 		const FString Root = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir());
@@ -182,6 +185,7 @@ namespace
 	{
 		static const TMap<FString, int32> Severity = {
 			{ TEXT("inherits"), 10 }, { TEXT("implements"), 9 }, { TEXT("calls"), 8 },
+			{ TEXT("binds-input"), 7 }, // breaking an input binding breaks player controls
 			{ TEXT("uses-skeleton"), 8 }, { TEXT("uses-material"), 7 }, { TEXT("uses-texture"), 5 },
 			{ TEXT("overrides-parameter"), 6 }, { TEXT("casts-to"), 6 }, { TEXT("placed-in-level"), 5 },
 			{ TEXT("plays-on"), 4 }, { TEXT("depends-on"), 4 }, { TEXT("references"), 3 },
@@ -199,6 +203,13 @@ namespace
 	 * One FTS pass: dedupe to each entity's best-scoring chunk (window function), push the kind
 	 * filter and pagination into SQL, and rank text hits above aux (split-identifier) hits via
 	 * bm25 column weights.
+	 *
+	 * bm25 is negative (more negative = better), so a multiplier < 1 demotes and > 1 boosts.
+	 * Kind weights fix the "player controls" failure mode: placed-actor property dumps are the
+	 * largest, keyword-densest chunks in the index ("Player Camera Location" × every weather
+	 * actor) and drowned the real input/blueprint/code entities on intent-shaped queries.
+	 * cpp-body chunks are demoted below summaries for the same reason: a long function body
+	 * mentioning a term shouldn't outrank the entity that IS that term.
 	 */
 	TArray<FSearchHit> RunFtsQuery(FSQLiteDatabase& Db, const FString& Match, const FString& Kind, int32 Limit, int32 Offset)
 	{
@@ -206,9 +217,12 @@ namespace
 		FSQLitePreparedStatement Stmt = Db.PrepareStatement(TEXT(
 			"WITH hits AS ("
 			"  SELECT c.id AS chunkId, c.entity_id AS entityId, c.kind AS chunkKind,"
-			"         bm25(chunks_fts, 1.0, 0.6) AS score,"
+			"         bm25(chunks_fts, 1.0, 0.6)"
+			"           * (CASE ce.kind WHEN 'level-actor' THEN 0.35 ELSE 1.0 END)"
+			"           * (CASE c.kind WHEN 'cpp-body' THEN 0.7 ELSE 1.0 END) AS score,"
 			"         snippet(chunks_fts, 0, '[', ']', ' ... ', 12) AS snip"
 			"  FROM chunks_fts JOIN chunks c ON c.rowid = chunks_fts.rowid"
+			"  JOIN entities ce ON ce.id = c.entity_id"
 			"  WHERE chunks_fts MATCH ?1"
 			"), best AS ("
 			"  SELECT *, ROW_NUMBER() OVER (PARTITION BY entityId ORDER BY score) AS rn FROM hits"
@@ -394,6 +408,11 @@ namespace
 		}
 		return N;
 	}
+}
+
+void GameIQQuery::SetDbPathOverrideForTests(const FString& Path)
+{
+	GDbPathOverride = Path;
 }
 
 FString GameIQQuery::Search(const FString& Query, const FString& Kind, int32 Limit, int32 Offset)
@@ -610,7 +629,27 @@ FString GameIQQuery::Explain(const FString& Topic, int32 Limit)
 	ON_SCOPE_EXIT { Db.Close(); };
 
 	const int32 Seeds = Limit <= 0 ? 8 : Limit;
-	TArray<FSearchHit> Hits = BuildSearchHits(Db, Topic, FString(), Seeds, 0);
+
+	// Overfetch, then cap seeds per entity kind: on intent-shaped topics one chatty kind
+	// (e.g. dozens of placed actors) would otherwise fill every seed slot and the bundle
+	// never reaches the blueprint/code/asset entities that actually explain the system.
+	// Score order is preserved within the cap; leftover slots backfill from the overflow.
+	TArray<FSearchHit> Ranked = BuildSearchHits(Db, Topic, FString(), Seeds * 3, 0);
+	const int32 MaxPerKind = FMath::Max(2, Seeds / 3);
+	TArray<FSearchHit> Hits, Overflow;
+	TMap<FString, int32> PerKind;
+	for (const FSearchHit& H : Ranked)
+	{
+		if (Hits.Num() >= Seeds) { break; }
+		int32& N = PerKind.FindOrAdd(H.Entity->GetStringField(TEXT("kind")));
+		if (N < MaxPerKind) { ++N; Hits.Add(H); }
+		else { Overflow.Add(H); }
+	}
+	for (const FSearchHit& H : Overflow)
+	{
+		if (Hits.Num() >= Seeds) { break; }
+		Hits.Add(H);
+	}
 
 	TArray<TSharedPtr<FJsonValue>> SeedJson;
 	TSet<FString> SeedIds;

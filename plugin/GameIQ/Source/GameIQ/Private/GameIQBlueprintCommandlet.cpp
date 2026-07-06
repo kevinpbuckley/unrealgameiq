@@ -275,7 +275,37 @@ void GameIQBlueprint::ExtractBlueprint(
 	const FString ParentName = BP->ParentClass ? BP->ParentClass->GetName() : FString();
 	// The class default object holds each variable's actual default value (reflects value edits).
 	const UObject* CDO = BP->GeneratedClass ? BP->GeneratedClass->GetDefaultObject() : nullptr;
-	TArray<FString> VarLines, CompLines, IfaceLines;
+	TArray<FString> VarLines, CompLines, IfaceLines, InputLines;
+
+	// Input wiring: class-default InputAction / InputMappingContext object properties — including
+	// C++-inherited ones NewVariables can't see (that's where a hero BP's bindings usually live).
+	// Property-attributed `binds-input` edges make "what asset feeds DodgeAction" a graph walk
+	// instead of a guess; class names are compared as strings to avoid an EnhancedInput module dep.
+	if (CDO)
+	{
+		for (TFieldIterator<FObjectProperty> It(CDO->GetClass()); It; ++It)
+		{
+			const FObjectProperty* ObjProp = *It;
+			bool bInputType = false;
+			for (const UClass* C = ObjProp->PropertyClass; C; C = C->GetSuperClass())
+			{
+				const FString ClassName = C->GetName();
+				if (ClassName == TEXT("InputAction") || ClassName == TEXT("InputMappingContext"))
+				{
+					bInputType = true;
+					break;
+				}
+			}
+			if (!bInputType) { continue; }
+			const UObject* Value = ObjProp->GetObjectPropertyValue_InContainer(CDO);
+			if (!Value) { continue; }
+			const FString Pkg = Value->GetPackage()->GetName();
+			if (!Pkg.StartsWith(TEXT("/"))) { continue; }
+			Edges.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEdge(
+				BpId, FString::Printf(TEXT("asset:%s"), *Pkg), TEXT("binds-input"), ObjProp->GetName())));
+			InputLines.Add(FString::Printf(TEXT("%s = %s"), *ObjProp->GetName(), *Value->GetName()));
+		}
+	}
 
 	for (const FBPVariableDescription& Var : BP->NewVariables)
 	{
@@ -356,6 +386,7 @@ void GameIQBlueprint::ExtractBlueprint(
 	if (VarLines.Num() > 0)   { S += TEXT("Variables: ")  + FString::Join(VarLines, TEXT(", "))  + TEXT("\n"); }
 	if (CompLines.Num() > 0)  { S += TEXT("Components: ") + FString::Join(CompLines, TEXT(", ")) + TEXT("\n"); }
 	if (IfaceLines.Num() > 0) { S += TEXT("Implements: ") + FString::Join(IfaceLines, TEXT(", ")) + TEXT("\n"); }
+	if (InputLines.Num() > 0) { S += TEXT("Input: ")      + FString::Join(InputLines, TEXT(", ")) + TEXT("\n"); }
 	Chunks.Add(MakeShared<FJsonValueObject>(GameIQ::MakeChunk(
 		FString::Printf(TEXT("%s#structure"), *BpId), BpId, TEXT("recipe-summary"), S)));
 }
