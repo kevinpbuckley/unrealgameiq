@@ -114,6 +114,15 @@ static void GenerateGameIQAgentConfig(const TArray<FString>& Args, FOutputDevice
 
 	const FString BeginMarker = TEXT("<!-- BEGIN GameIQ agent guidance -->");
 	const FString EndMarker = TEXT("<!-- END GameIQ agent guidance -->");
+
+	// Older bundled samples carried the guidance markers themselves; strip any embedded copies so
+	// the block (wrapped in markers below) never nests them — nested markers break the refresh
+	// logic, which replaces from the first BEGIN to the first END and strands the extras.
+	SampleContent.ReplaceInline(*BeginMarker, TEXT(""));
+	SampleContent.ReplaceInline(*EndMarker, TEXT(""));
+	SampleContent.TrimStartAndEndInline();
+	SampleContent += TEXT("\n");
+
 	const FString ProjectRoot = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir());
 	IFileManager& FileManager = IFileManager::Get();
 

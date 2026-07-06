@@ -1,32 +1,70 @@
-<!-- BEGIN GameIQ agent guidance -->
 # Unreal Game IQ agent guide
 
 This project includes the Unreal Game IQ plugin, which builds an in-editor index of assets, Blueprints, config, C++ and dependency relationships for fast architectural questions.
 
+## How to call GameIQ
+
+**Fastest path — direct Python** (inside `execute_python_code` or the editor Python console). Every
+query is a static method on `unreal.GameIQService`; each returns a **JSON string** whose payload is
+under the `"result"` key:
+
+```python
+import unreal, json
+hits = json.loads(unreal.GameIQService.search("player input", "blueprint"))["result"]
+ent  = json.loads(unreal.GameIQService.get_entity(hits[0]["entity"]["id"]))["result"]
+print(ent["chunks"][0]["text"])   # entity record also has: outgoing, incoming, children, counts
+```
+
+Python signatures (defaults apply — a bare `search("query")` searches all kinds):
+
+- `search(query, kind="", limit=20, offset=0)` — hybrid full-text search (stemmed, camelCase-aware)
+- `get_entity(id)` — full record: entity fields, in/out edges, children, chunks
+- `references(id, direction="both", depth=1, edge_type="", kind="", offset=0)` — graph walk
+- `impact(id, limit=200)` — transitive inbound dependents ranked by severity
+- `explain(topic)` — context bundle: top hits plus their graph neighborhood
+- `project_stats(facet="overview")` — facets: `overview`, `kinds`, `edges`, `unused`, `largest-deps`, `authority`, `doc-types`
+- `drift()` — doc-stated `property = value` claims that contradict the extracted implementation
+- `coverage(doc_type="")` — which stated design intent is backed by a real implementation
+- `doctor()` — index health check; use to tell "empty project" apart from "broken index" before trusting empty results
+
+**Via MCP `call_tool` or `unreal.ToolsetRegistry.execute_tool`** the toolset name is
+`GameIQ.GameIQService` (tools: `Search`, `GetEntity`, `References`, `Impact`, `Explain`,
+`ProjectStats`, `Drift`, `Coverage`, `Doctor`). At this layer `Search` **requires** `kind` (pass `""`
+for all kinds) and `References` requires `edgeType` + `kind`. Results arrive as
+`{"returnValue": "<json string>"}` — parse twice:
+
+```python
+res = unreal.ToolsetRegistry.execute_tool("GameIQ.GameIQService", "Search",
+                                          json.dumps({"query": "player input", "kind": ""}))
+data = json.loads(json.loads(res.get_value_as_json_string())["returnValue"])["result"]
+```
+
+## Entity kinds and id formats
+
+- Kinds (for `kind` filters): `asset`, `blueprint`, `level-actor`, `bp-function`, `bp-component`,
+  `bp-variable`, `cpp-class`, `cpp-function`, `cpp-property`, `cpp-struct`, `config-section`, `plugin`.
+  A wrong kind returns an empty list silently — when unsure pass `""`.
+- Entity id formats: `asset:/Game/Path/Name` (assets and Blueprints),
+  `cpp:ClassName` / `cpp:ClassName::FunctionName` (C++),
+  `asset:/Game/Path/BP_Name::GraphName` (Blueprint graphs/functions).
+  Search results include the exact id — copy it into `get_entity` / `references` / `impact`.
+
 ## How to use GameIQ effectively
 
 - Prefer GameIQ for project-wide questions before falling back to manual file searching.
-- Use the GameIQ toolset when the user asks about systems, dependencies, ownership, or where a feature lives.
-- If the request is about a specific asset, Blueprint, or subsystem, start with Search and then GetEntity.
-- For dependency and impact questions, use References and Impact.
-- For a fuller system summary, use Explain.
-- For project-level health or unused-asset questions, use ProjectStats.
-
-## Available GameIQ queries
-
-- Search: hybrid text search across the indexed project model.
-- GetEntity: retrieve the full entity record, chunks, edges, and child entities for one item.
-- References: find what uses an entity or what it uses.
-- Impact: find likely breakage or downstream dependents if an entity changes.
-- Explain: assemble a compact context bundle for a system or topic.
-- ProjectStats: summarize the project index, dependency hotspots, and unused-asset candidates.
+- If the request is about a specific asset, Blueprint, or subsystem, start with `search` and then `get_entity`.
+- For dependency and impact questions, use `references` and `impact`.
+- For a fuller system summary, use `explain`.
+- For project-level health or unused-asset questions, use `project_stats`.
+- For design-doc vs implementation questions, use `drift` and `coverage`.
+- If a query unexpectedly returns nothing, run `doctor` before concluding the thing doesn't exist.
 
 ## Working conventions
 
-- The index is built from the project’s .gameiq directory and updated live as assets are saved.
+- The index is built from the project's .gameiq directory and updated live as assets are saved.
 - If results look stale or missing, rebuild it: in a running editor, run the console command `GameIQ.Rebuild` (full) or `GameIQ.ReindexDocs` (docs/images/external sources only, faster), or click Tools ▸ Game IQ ▸ Rebuild Index. Headless (editor closed), run the `GameIQBuild` commandlet via UnrealEditor-Cmd with `-run=GameIQBuild`. All three report progress via editor notifications and the Output Log (`LogGameIQRunner`).
 - When the user asks for architecture, ownership, or "where is X implemented?", use GameIQ before broad manual search.
-- When the user asks for likely breakage or impact from changing something, use Impact.
+- When the user asks for likely breakage or impact from changing something, use `impact`.
 
 ## Example prompts
 
@@ -39,4 +77,4 @@ This project includes the Unreal Game IQ plugin, which builds an in-editor index
 
 - GameIQ works best when the plugin is enabled and the index has been built.
 - If the index is missing, tell the user that a rebuild may be needed before answering dependency-focused questions.
-<!-- END GameIQ agent guidance -->
+- This guide block is regenerated by the console command `GameIQ.GenerateAgentConfig` — edit the plugin's `Content/samples/AGENTS.md.sample`, not this block.
