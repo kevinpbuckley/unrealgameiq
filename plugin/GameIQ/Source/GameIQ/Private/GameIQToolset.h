@@ -24,9 +24,10 @@ class UGameIQService : public UToolsetDefinition
 
 public:
 	/** Full-text search over the whole index (stemmed, camelCase-aware — "player" matches
-	 *  BP_PlayerCharacter); `Kind` optionally filters to one entity kind (e.g. "blueprint",
-	 *  "asset", "level-actor"); `Offset` pages through results. `PathPrefix` scopes hits to one
-	 *  content path (e.g. "/Game/Coursera" — matches asset ids and file paths). Returns a JSON string. */
+	 *  BP_PlayerCharacter; name-match and reference-count weighted); `Kind` optionally filters to
+	 *  one entity kind (e.g. "blueprint", "asset", "level-actor"); `Offset` pages through results.
+	 *  `PathPrefix` scopes hits to one content path (e.g. "/Game/Coursera" — matches asset ids and
+	 *  file paths). Returns a JSON string. */
 	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "GameIQ")
 	static FString Search(const FString& Query, const FString& Kind = TEXT(""), int32 Limit = 20, int32 Offset = 0,
 		const FString& PathPrefix = TEXT(""));

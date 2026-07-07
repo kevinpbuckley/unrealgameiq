@@ -17,8 +17,10 @@ namespace GameIQQuery
 	 *  camelCase-aware via the aux column); optional `Kind` filters to one entity kind.
 	 *  `Offset` pages through results. `PathPrefix` scopes hits to one content path (e.g.
 	 *  "/Game/Coursera") — matches asset ids and entity paths. Hits are re-ranked by how much
-	 *  of the query appears in the entity NAME, and bulk asset classes (textures, material
-	 *  instances) are demoted so they can't drown intent-shaped queries. */
+	 *  of the query appears in the entity NAME and by inbound reference count (log-scale, so
+	 *  the asset the project leans on outranks an equal text match nothing uses), and bulk
+	 *  asset classes (textures, material instances) are demoted so they can't drown
+	 *  intent-shaped queries. */
 	FString Search(const FString& Query, const FString& Kind, int32 Limit = 20, int32 Offset = 0,
 		const FString& PathPrefix = TEXT(""));
 

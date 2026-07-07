@@ -198,7 +198,7 @@ namespace
 
 	// ---- structured builders (shared so `explain` can reuse search + references) --------------
 
-	struct FSearchHit { TSharedRef<FJsonObject> Entity; double Score; FString Snippet; FString ChunkKind; };
+	struct FSearchHit { TSharedRef<FJsonObject> Entity; double Score; FString Snippet; FString ChunkKind; int32 InboundRefs = 0; };
 
 	/**
 	 * One FTS pass: dedupe to each entity's best-scoring chunk (window function), push the kind
@@ -236,7 +236,8 @@ namespace
 			"), best AS ("
 			"  SELECT *, ROW_NUMBER() OVER (PARTITION BY entityId ORDER BY score) AS rn FROM hits"
 			") "
-			"SELECT b.chunkId, b.chunkKind, b.score, b.snip, e.* "
+			"SELECT b.chunkId, b.chunkKind, b.score, b.snip,"
+			"       (SELECT COUNT(*) FROM edges x WHERE x.dst = e.id) AS inRefs, e.* "
 			"FROM best b JOIN entities e ON e.id = b.entityId "
 			"WHERE b.rn = 1 AND (?2 = '' OR e.kind = ?2) "
 			"AND (?5 = '' OR e.id LIKE 'asset:' || ?5 || '%' OR e.path LIKE ?5 || '%') "
@@ -255,35 +256,44 @@ namespace
 		{
 			double Score = 0.0;
 			Stmt.GetColumnValueByName(TEXT("score"), Score);
-			Out.Add(FSearchHit{ EntityJson(Stmt), Score, ColStr(Stmt, TEXT("snip")), ColStr(Stmt, TEXT("chunkKind")) });
+			int32 InRefs = 0;
+			Stmt.GetColumnValueByName(TEXT("inRefs"), InRefs);
+			Out.Add(FSearchHit{ EntityJson(Stmt), Score, ColStr(Stmt, TEXT("snip")), ColStr(Stmt, TEXT("chunkKind")), InRefs });
 		}
 		return Out;
 	}
 
 	/**
-	 * Name-match re-rank: bm25 scores chunk BODIES, so an entity whose NAME is the query
-	 * ("IMC_SenseisRevenge") can lose to a big chunk that merely mentions the words. Boost each
-	 * hit by the fraction of query tokens present in its name (camel/underscore-split, case-
-	 * insensitive). Scores are negative (more negative = better), so boosting multiplies UP.
+	 * Post-fetch re-rank, two signals bm25 can't see (scores are negative — more negative =
+	 * better — so boosting multiplies UP):
+	 * - Name match: bm25 scores chunk BODIES, so an entity whose NAME is the query
+	 *   ("IMC_SenseisRevenge") can lose to a big chunk that merely mentions the words. Boost by
+	 *   the fraction of query tokens in the name (camel/underscore-split, case-insensitive).
+	 * - Reference weight: between comparable text matches, the entity the project actually leans
+	 *   on should win — the IMC eleven hero blueprints bind over the one the bird pawn uses.
+	 *   Log-scale (11 refs ≈ 1.43x, 100 ≈ 1.8x) so hub assets can't steamroll text relevance.
 	 */
-	void RerankByNameMatch(const FString& Query, TArray<FSearchHit>& Hits)
+	void RerankHits(const FString& Query, TArray<FSearchHit>& Hits)
 	{
 		TArray<FString> Tokens;
 		for (const FString& T : GameIQText::WordTokens(Query))
 		{
 			if (T.Len() >= 3) { Tokens.Add(T.ToLower()); }
 		}
-		if (Tokens.Num() == 0) { return; }
 		for (FSearchHit& H : Hits)
 		{
-			const FString Name = H.Entity->GetStringField(TEXT("name"));
-			const FString Hay = (Name + TEXT(" ") + GameIQText::SplitCamel(Name.Replace(TEXT("_"), TEXT(" ")))).ToLower();
-			int32 Matched = 0;
-			for (const FString& T : Tokens)
+			if (Tokens.Num() > 0)
 			{
-				if (Hay.Contains(T)) { ++Matched; }
+				const FString Name = H.Entity->GetStringField(TEXT("name"));
+				const FString Hay = (Name + TEXT(" ") + GameIQText::SplitCamel(Name.Replace(TEXT("_"), TEXT(" ")))).ToLower();
+				int32 Matched = 0;
+				for (const FString& T : Tokens)
+				{
+					if (Hay.Contains(T)) { ++Matched; }
+				}
+				H.Score *= 1.0 + 0.8 * (double)Matched / (double)Tokens.Num();
 			}
-			H.Score *= 1.0 + 0.8 * (double)Matched / (double)Tokens.Num();
+			H.Score *= 1.0 + 0.12 * FMath::Log2(1.0 + (double)FMath::Max(0, H.InboundRefs));
 		}
 		Hits.StableSort([](const FSearchHit& A, const FSearchHit& B) { return A.Score < B.Score; });
 	}
@@ -298,7 +308,7 @@ namespace
 		auto RunTier = [&](const FString& Match) -> TArray<FSearchHit>
 		{
 			TArray<FSearchHit> Hits = RunFtsQuery(Db, Match, Kind, PathPrefix, Fetch, 0);
-			RerankByNameMatch(Query, Hits);
+			RerankHits(Query, Hits);
 			if (Offset > 0) { Hits.RemoveAt(0, FMath::Min(Offset, Hits.Num())); }
 			if (Hits.Num() > Limit) { Hits.SetNum(Limit); }
 			return Hits;
@@ -325,6 +335,7 @@ namespace
 		R->SetNumberField(TEXT("score"), H.Score);
 		R->SetStringField(TEXT("snippet"), H.Snippet);
 		R->SetStringField(TEXT("matchedChunkKind"), H.ChunkKind);
+		R->SetNumberField(TEXT("inboundRefs"), H.InboundRefs);
 		return R;
 	}
 

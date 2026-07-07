@@ -413,6 +413,57 @@ void AMyCharacter::Move(const FInputActionValue& Value)
 }
 
 /**
+ * Reference-weighted ranking: between two entities with identical text matches, the one the
+ * project actually references (e.g. the IMC eleven hero blueprints bind) must outrank the one
+ * nothing uses (the bird pawn's IMC).
+ */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGameIQQueryRefWeightTest, "GameIQ.Query.ReferenceWeightedRanking",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGameIQQueryRefWeightTest::RunTest(const FString& Parameters)
+{
+	using namespace GameIQTestUtil;
+	const FString DbPath = TempDbPath(TEXT("refweight.db"));
+
+	FGameIQStore Store;
+	if (!TestTrue(TEXT("open"), Store.OpenAtPath(DbPath))) { return false; }
+	TArray<TSharedPtr<FJsonValue>> Edges;
+	for (int32 i = 0; i < 8; ++i)
+	{
+		Edges.Add(Edge(*FString::Printf(TEXT("asset:/Game/Heroes/BP_Hero%d"), i),
+			TEXT("asset:/Game/Input/IMC_Popular"), TEXT("binds-input")));
+	}
+	Store.IngestProducer(TEXT("test"),
+		{
+			// Insertion order favors the lonely one so the test fails without the boost.
+			Entity(TEXT("asset:/Game/Input/IMC_Lonely"), TEXT("asset"), TEXT("IMC_Lonely")),
+			Entity(TEXT("asset:/Game/Input/IMC_Popular"), TEXT("asset"), TEXT("IMC_Popular")),
+		},
+		Edges,
+		{
+			// Identical chunk text: bm25 and the name boost tie; only references differ.
+			Chunk(TEXT("c1"), TEXT("asset:/Game/Input/IMC_Lonely"), TEXT("player input mapping context")),
+			Chunk(TEXT("c2"), TEXT("asset:/Game/Input/IMC_Popular"), TEXT("player input mapping context")),
+		});
+	Store.Close();
+
+	GameIQQuery::SetDbPathOverrideForTests(DbPath);
+	ON_SCOPE_EXIT { GameIQQuery::SetDbPathOverrideForTests(FString()); };
+
+	const TSharedPtr<FJsonValue> Result = ParseResult(GameIQQuery::Search(TEXT("player input"), FString(), 10, 0));
+	const TArray<TSharedPtr<FJsonValue>>* Hits = nullptr;
+	if (!TestTrue(TEXT("search returns array"), Result.IsValid() && Result->TryGetArray(Hits))) { return false; }
+	if (!TestEqual(TEXT("both entities hit"), Hits->Num(), 2)) { return false; }
+	TestEqual(TEXT("referenced asset outranks unreferenced twin"),
+		HitEntityId((*Hits)[0]), FString(TEXT("asset:/Game/Input/IMC_Popular")));
+	const TSharedPtr<FJsonObject>* Top = nullptr;
+	if (TestTrue(TEXT("hit object"), (*Hits)[0]->TryGetObject(Top)))
+	{
+		TestEqual(TEXT("inboundRefs reported"), (int32)(*Top)->GetNumberField(TEXT("inboundRefs")), 8);
+	}
+	return true;
+}
+
+/**
  * Children paging + class rollup: a level's capped children must round-robin across classes
  * (never 50 rocks), GetEntity must report a full childrenByClass rollup, and Children(id, filter)
  * must page one class. Regression test for the "969-actor map hid its one sky actor" failure.

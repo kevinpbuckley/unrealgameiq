@@ -18,7 +18,8 @@ print(ent["chunks"][0]["text"])   # entity record also has: outgoing, incoming, 
 Python signatures (defaults apply — a bare `search("query")` searches all kinds):
 
 - `search(query, kind="", limit=20, offset=0, path_prefix="")` — hybrid full-text search (stemmed,
-  camelCase-aware, name-match boosted); `path_prefix` (e.g. `"/Game/Maps"`) scopes hits to one content path
+  camelCase-aware, boosted by name match and inbound reference count); `path_prefix` (e.g. `"/Game/Maps"`)
+  scopes hits to one content path
 - `get_entity(id)` — full record: entity fields, in/out edges, children (round-robin by class, with a
   `childrenByClass` rollup), chunks; `counts` holds full totals when arrays are capped
 - `children(id, class_filter="", limit=50, offset=0)` — page an entity's children; `class_filter`
