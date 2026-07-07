@@ -412,6 +412,78 @@ void AMyCharacter::Move(const FInputActionValue& Value)
 	return true;
 }
 
+/** Best-effort call extraction: the four unambiguous shapes resolve against indexed functions
+ *  (incl. through the ancestor chain), and comments/strings/unknown receivers never produce
+ *  callees. Also covers param capture in ParseCppBodies and param-type resolution. */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGameIQCppCallExtractTest, "GameIQ.Cpp.CallExtraction",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGameIQCppCallExtractTest::RunTest(const FString& Parameters)
+{
+	using namespace GameIQCpp;
+
+	// ParseCppBodies captures the raw parameter list.
+	{
+		TSet<FString> Known;
+		Known.Add(TEXT("AMyChar"));
+		TArray<FCppBody> Bodies;
+		TArray<FInputBindingSite> Bindings;
+		ParseCppBodies(TEXT("void AMyChar::Foo(AWeapon* Weapon, int32 Count)\n{\n\tWeapon->Equip();\n}\n"),
+			Known, Bodies, Bindings);
+		if (!TestEqual(TEXT("one body"), Bodies.Num(), 1)) { return false; }
+		TestEqual(TEXT("params captured"), Bodies[0].Params.TrimStartAndEnd(),
+			FString(TEXT("AWeapon* Weapon, int32 Count")));
+	}
+
+	// ParseParamTypes: known types resolve (incl. template inner), defaults are stripped.
+	{
+		TSet<FString> KnownCanonical;
+		KnownCanonical.Add(TEXT("Weapon"));
+		TMap<FString, FString> Out;
+		ParseParamTypes(TEXT("USceneComponent* InParent, AWeapon* Weapon, const FString& Name = TEXT(\"x\"), TArray<AWeapon*> Extra"),
+			KnownCanonical, Out);
+		TestEqual(TEXT("two resolvable params"), Out.Num(), 2);
+		TestEqual(TEXT("pointer param"), Out.FindRef(TEXT("Weapon")), FString(TEXT("Weapon")));
+		TestEqual(TEXT("template inner param"), Out.FindRef(TEXT("Extra")), FString(TEXT("Weapon")));
+	}
+
+	FCallResolver R;
+	R.BaseOf.Add(TEXT("Character"), TEXT("BaseCharacter"));
+	R.FunctionsOf.Add(TEXT("Character"), { TEXT("Equip"), TEXT("PickupWeapon"), TEXT("PlayEquipMontage") });
+	R.FunctionsOf.Add(TEXT("BaseCharacter"), { TEXT("AttachWeaponToSocket") });
+	R.FunctionsOf.Add(TEXT("Weapon"), { TEXT("Equip"), TEXT("Drop") });
+	R.PropTypeOf.FindOrAdd(TEXT("Character")).Add(TEXT("EquippedWeapon"), TEXT("Weapon"));
+
+	TMap<FString, FString> ParamTypes;
+	ParamTypes.Add(TEXT("Weapon"), TEXT("Weapon"));
+
+	const FString Body = TEXT(R"cpp({
+	// PickupWeapon(in a comment) must not match
+	const FString S = TEXT("Drop(in a string) must not match");
+	PickupWeapon(OverlappingWeapon);                       // bare, own class
+	AttachWeaponToSocket(EquippedWeapon, FName("Sock"));   // bare, inherited
+	Super::AttachWeaponToSocket(nullptr, Name);            // Super::
+	ACharacter::PlayEquipMontage(Name);                    // qualified
+	this->Equip();                                         // this->
+	EquippedWeapon->Drop();                                // UPROPERTY-typed receiver
+	Weapon->Equip(GetMesh(), Name, this, this);            // parameter-typed receiver
+	Other->Drop();                                         // unknown receiver: dropped
+	GetOwner()->Equip();                                   // chained receiver: dropped
+	UnknownFn(1);                                          // not indexed: dropped
+})cpp");
+
+	TSet<FString> Callees;
+	ExtractCalls(Body, TEXT("Character"), ParamTypes, R, Callees);
+
+	TestTrue(TEXT("bare own-class call"), Callees.Contains(TEXT("Character::PickupWeapon")));
+	TestTrue(TEXT("bare inherited call resolves to declaring class"), Callees.Contains(TEXT("BaseCharacter::AttachWeaponToSocket")));
+	TestTrue(TEXT("qualified call"), Callees.Contains(TEXT("Character::PlayEquipMontage")));
+	TestTrue(TEXT("this-> call"), Callees.Contains(TEXT("Character::Equip")));
+	TestTrue(TEXT("property-typed member call"), Callees.Contains(TEXT("Weapon::Drop")));
+	TestTrue(TEXT("parameter-typed member call"), Callees.Contains(TEXT("Weapon::Equip")));
+	TestEqual(TEXT("no comment/string/unknown-receiver callees"), Callees.Num(), 6);
+	return true;
+}
+
 /**
  * Reference-weighted ranking: between two entities with identical text matches, the one the
  * project actually references (e.g. the IMC eleven hero blueprints bind) must outrank the one

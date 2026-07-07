@@ -62,6 +62,10 @@ data = json.loads(json.loads(res.get_value_as_json_string())["returnValue"])["re
   the summary chunk carries actor totals, a per-class rollup, and a "Lighting & environment" line —
   then `children(map_id, class_filter)` to drill into one class.
 - For dependency and impact questions, use `references` and `impact`.
+- C++ `calls` edges are **best-effort static extraction** (same-class, `Super::`, qualified, and
+  property/parameter-typed calls; dynamic dispatch, delegates, and calls through local variables are
+  not modeled — the response carries a `note` saying so on `cpp:*` ids). Treat missing C++ callers
+  as "unknown", not "none": for exhaustive C++ flow tracing, follow up with a grep of `Source/`.
 - For a fuller system summary, use `explain`.
 - For project-level health or unused-asset questions, use `project_stats`.
 - For design-doc vs implementation questions, use `drift` and `coverage`.

@@ -125,6 +125,8 @@ int32 UGameIQCodeCommandlet::Main(const FString& /*Params*/)
 	// property → handler `binds-input` edges. ----
 	int32 NumBodies = 0, NumBindings = 0;
 	TSet<FString> BodyChunkIds, BindingKeys;
+	TArray<FCppBody> AllBodies; // kept whole: the call-graph pass needs every body AND every function id
+	TArray<FString> AllBodyRels;
 	for (const FString& File : GameIQWalk::WalkFiles(Root, { TEXT(".cpp") }))
 	{
 		FString Text;
@@ -135,32 +137,10 @@ int32 UGameIQCodeCommandlet::Main(const FString& /*Params*/)
 		ParseCppBodies(Text, KnownSource, Bodies, Bindings);
 		const FString Rel = GameIQWalk::RelPath(Root, File);
 
-		for (const FCppBody& B : Bodies)
+		for (FCppBody& B : Bodies)
 		{
-			const FString Canonical = ReflectionName(B.ClassName);
-			const FString Fid = FString::Printf(TEXT("cpp:%s::%s"), *Canonical, *B.Func);
-			const FString ChunkId = Fid + TEXT("#body");
-			if (BodyChunkIds.Contains(ChunkId)) { continue; } // overloads share an id: first wins
-			BodyChunkIds.Add(ChunkId);
-
-			if (!FunctionIds.Contains(Fid))
-			{
-				FunctionIds.Add(Fid);
-				Entities.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEntity(
-					Fid, TEXT("cpp-function"), B.Func, Rel, TEXT("code"),
-					FString::Printf(TEXT("cpp:%s"), *Canonical),
-					FString::Printf(TEXT("%s::%s()"), *B.ClassName, *B.Func), nullptr)));
-			}
-
-			FString BodyText = B.Body;
-			if (BodyText.Len() > MaxBodyChunkChars)
-			{
-				BodyText = BodyText.Left(MaxBodyChunkChars) + TEXT("\n… (truncated)");
-			}
-			Chunks.Add(MakeShared<FJsonValueObject>(GameIQ::MakeChunk(
-				ChunkId, Fid, TEXT("cpp-body"),
-				FString::Printf(TEXT("%s::%s\n%s"), *B.ClassName, *B.Func, *BodyText))));
-			++NumBodies;
+			AllBodyRels.Add(Rel);
+			AllBodies.Add(MoveTemp(B));
 		}
 
 		for (const FInputBindingSite& Bind : Bindings)
@@ -177,6 +157,91 @@ int32 UGameIQCodeCommandlet::Main(const FString& /*Params*/)
 		}
 	}
 
+	for (int32 BodyIdx = 0; BodyIdx < AllBodies.Num(); ++BodyIdx)
+	{
+		const FCppBody& B = AllBodies[BodyIdx];
+		const FString& Rel = AllBodyRels[BodyIdx];
+		const FString Canonical = ReflectionName(B.ClassName);
+		const FString Fid = FString::Printf(TEXT("cpp:%s::%s"), *Canonical, *B.Func);
+		const FString ChunkId = Fid + TEXT("#body");
+		if (BodyChunkIds.Contains(ChunkId)) { continue; } // overloads share an id: first wins
+		BodyChunkIds.Add(ChunkId);
+
+		if (!FunctionIds.Contains(Fid))
+		{
+			FunctionIds.Add(Fid);
+			Entities.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEntity(
+				Fid, TEXT("cpp-function"), B.Func, Rel, TEXT("code"),
+				FString::Printf(TEXT("cpp:%s"), *Canonical),
+				FString::Printf(TEXT("%s::%s()"), *B.ClassName, *B.Func), nullptr)));
+		}
+
+		FString BodyText = B.Body;
+		if (BodyText.Len() > MaxBodyChunkChars)
+		{
+			BodyText = BodyText.Left(MaxBodyChunkChars) + TEXT("\n… (truncated)");
+		}
+		Chunks.Add(MakeShared<FJsonValueObject>(GameIQ::MakeChunk(
+			ChunkId, Fid, TEXT("cpp-body"),
+			FString::Printf(TEXT("%s::%s\n%s"), *B.ClassName, *B.Func, *BodyText))));
+		++NumBodies;
+	}
+
+	// ---- call-graph pass: best-effort `calls` edges. Runs last because the callee universe
+	// (FunctionIds) is only complete once headers AND bodies have been seen. Both endpoints of
+	// every edge are indexed functions, so nothing dangles; unresolvable calls (locals, chains,
+	// engine APIs) are dropped — the query layer labels the graph partial. ----
+	int32 NumCalls = 0;
+	{
+		FCallResolver Resolver;
+		for (const FParsedClass& C : All)
+		{
+			const FString Canonical = ReflectionName(C.Name);
+			if (!C.Base.IsEmpty())
+			{
+				const FString BaseCanonical = ReflectionName(C.Base);
+				if (Known.Contains(BaseCanonical)) { Resolver.BaseOf.Add(Canonical, BaseCanonical); }
+			}
+			for (const FProp& P : C.Properties)
+			{
+				const FString T = ReflectionName(InnerTypeName(P.Type));
+				if (!T.IsEmpty() && Known.Contains(T))
+				{
+					Resolver.PropTypeOf.FindOrAdd(Canonical).Add(P.Name, T);
+				}
+			}
+		}
+		for (const FString& Fid : FunctionIds) // "cpp:Class::Fn"
+		{
+			FString Cls, Fn;
+			if (Fid.Mid(4).Split(TEXT("::"), &Cls, &Fn))
+			{
+				Resolver.FunctionsOf.FindOrAdd(Cls).Add(Fn);
+			}
+		}
+
+		TSet<FString> CallKeys;
+		for (const FCppBody& B : AllBodies)
+		{
+			const FString CallerCls = ReflectionName(B.ClassName);
+			const FString CallerId = FString::Printf(TEXT("cpp:%s::%s"), *CallerCls, *B.Func);
+			TMap<FString, FString> ParamTypes;
+			ParseParamTypes(B.Params, Known, ParamTypes);
+			TSet<FString> Callees;
+			ExtractCalls(B.Body, CallerCls, ParamTypes, Resolver, Callees);
+			for (const FString& Callee : Callees)
+			{
+				const FString CalleeId = FString::Printf(TEXT("cpp:%s"), *Callee);
+				if (CalleeId == CallerId) { continue; } // self-recursion is noise
+				const FString Key = CallerId + TEXT("|") + CalleeId;
+				if (CallKeys.Contains(Key)) { continue; }
+				CallKeys.Add(Key);
+				Edges.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEdge(CallerId, CalleeId, TEXT("calls"))));
+				++NumCalls;
+			}
+		}
+	}
+
 	const FString OutDir = FPaths::Combine(Root, TEXT(".gameiq"), TEXT("extract"));
 	IFileManager::Get().MakeDirectory(*OutDir, true);
 	GameIQ::WriteOutput(OutDir, TEXT("cpp.json"), TEXT("gameiq-cpp@0.1.0"), Entities, Edges, Chunks);
@@ -184,7 +249,7 @@ int32 UGameIQCodeCommandlet::Main(const FString& /*Params*/)
 	// against it to decide whether an automatic C++-only reindex is needed (GameIQSaveHook).
 	GameIQCppFingerprint::Write(Root, GameIQCppFingerprint::Compute(Root));
 	UE_LOG(LogGameIQCode, Display,
-		TEXT("Game IQ code: %d classes, %d bodies, %d input bindings → %d entities, %d edges, %d chunks → cpp.json"),
-		All.Num(), NumBodies, NumBindings, Entities.Num(), Edges.Num(), Chunks.Num());
+		TEXT("Game IQ code: %d classes, %d bodies, %d input bindings, %d call edges → %d entities, %d edges, %d chunks → cpp.json"),
+		All.Num(), NumBodies, NumBindings, NumCalls, Entities.Num(), Edges.Num(), Chunks.Num());
 	return 0;
 }

@@ -143,13 +143,28 @@ namespace
 		return Out;
 	}
 
-	/** Wrap a payload as the MCP server does: {"result": payload, "index": ageNote}. */
-	FString Envelope(FSQLiteDatabase& Db, const TSharedRef<FJsonValue>& Payload)
+	/** Wrap a payload as the MCP server does: {"result": payload, "index": ageNote}. `Note` rides
+	 *  at the root so array payloads (References) can carry a caveat without a shape change. */
+	FString Envelope(FSQLiteDatabase& Db, const TSharedRef<FJsonValue>& Payload, const FString& Note = FString())
 	{
 		TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
 		Root->SetField(TEXT("result"), Payload);
 		Root->SetObjectField(TEXT("index"), IndexNote(Db));
+		if (!Note.IsEmpty()) { Root->SetStringField(TEXT("note"), Note); }
 		return Serialize(Root);
+	}
+
+	/** The C++ call graph is partial by construction (static extraction; no dynamic dispatch,
+	 *  delegates, or local-variable calls) — without this note an empty References/Impact result
+	 *  on a cpp entity reads as "nothing depends on it", which has real footgun potential. */
+	FString CppGraphCaveat(const FString& Id)
+	{
+		return Id.StartsWith(TEXT("cpp:"))
+			? TEXT("C++ 'calls' edges are best-effort static extraction (same-class, Super::, "
+			       "qualified, and property/parameter-typed calls); dynamic dispatch, delegates, "
+			       "and calls through local variables are not modeled. Treat missing C++ callers "
+			       "as 'unknown', not 'none' — confirm with a grep of Source/.")
+			: FString();
 	}
 
 	FString ErrorJson(const FString& Message)
@@ -700,7 +715,7 @@ FString GameIQQuery::References(const FString& Id, const FString& Direction, int
 	{
 		Results.Add(MakeShared<FJsonValueObject>(RefRowJson(R)));
 	}
-	return Envelope(Db, MakeShared<FJsonValueArray>(Results));
+	return Envelope(Db, MakeShared<FJsonValueArray>(Results), CppGraphCaveat(Id));
 }
 
 FString GameIQQuery::Impact(const FString& Id, int32 MaxDepth, int32 Limit)
@@ -777,6 +792,8 @@ FString GameIQQuery::Impact(const FString& Id, int32 MaxDepth, int32 Limit)
 	Payload->SetNumberField(TEXT("totalDependents"), TotalDependents);
 	Payload->SetObjectField(TEXT("byKind"), ByKindJson);
 	Payload->SetBoolField(TEXT("truncated"), TotalDependents > OutCap || TotalDependents >= InternalCap);
+	const FString Caveat = CppGraphCaveat(Id);
+	if (!Caveat.IsEmpty()) { Payload->SetStringField(TEXT("note"), Caveat); }
 	return Envelope(Db, MakeShared<FJsonValueObject>(Payload));
 }
 
