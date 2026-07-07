@@ -34,21 +34,27 @@ The plugin does everything in-process:
 
 ## Quick start
 
-### 1. Deploy the plugin into a project
+### 1. Install the plugin
+
+Clone this repo into your project's `Plugins/` folder:
 
 ```powershell
-pwsh scripts/deploy.ps1 -Project <path-to-project-dir>
+cd <YourProject>/Plugins
+git clone https://github.com/kevinpbuckley/unrealgameiq.git
 ```
 
-Then build the editor target (e.g. via your project's build script) so `UnrealEditor-GameIQ.dll`
-is compiled. The plugin enables its dependencies (`SQLiteCore`, `ToolsetRegistry`, `EnhancedInput`).
+Unreal discovers the nested `.uplugin` automatically — no need to move anything. Enable
+**Unreal Game IQ** in Edit → Plugins if needed, then build the editor target so
+`UnrealEditor-GameIQ.dll` is compiled. The plugin enables its dependencies (`SQLiteCore`,
+`ToolsetRegistry`, `EnhancedInput`). (Alternative: `pwsh scripts/deploy.ps1 -Project <path>`
+copies just `plugin/GameIQ/` into the project without the git nesting.)
 
 ### 2. Build the index
 
-**Once, headless** (editor closed):
+**Once, headless** (editor closed), from your project root:
 
 ```powershell
-pwsh scripts/build-index.ps1 -Project <path-to-project-dir>
+pwsh Plugins/unrealgameiq/scripts/build-index.ps1 -Project .
 ```
 
 This runs the `GameIQBuild` commandlet — every extractor plus the SQLite ingest — in a single editor
@@ -106,12 +112,12 @@ The editor-less config/C++ walk indexes the whole project tree, including third-
 To keep the index focused on *your* game, add a `gameiq.config.json` at the project root:
 
 ```json
-{ "exclude": ["Plugins/VibeUE", "Plugins/SomeMarketplacePlugin"] }
+{ "exclude": ["Plugins/unrealgameiq", "Plugins/SomeMarketplacePlugin"] }
 ```
 
-Entries match a directory name (`VibeUE`) or a project-relative path (`Plugins/VibeUE`). Game IQ's own
-plugin is always excluded. You can also edit the list in the editor under
-**Project Settings → Plugins → Game IQ**.
+Entries match a directory name (`VibeUE`) or a project-relative path (`Plugins/VibeUE`). Add
+`Plugins/unrealgameiq` (or all of `Plugins`) so Game IQ's own source stays out of your index.
+You can also edit the list in the editor under **Project Settings → Plugins → Game IQ**.
 
 ## Status
 
