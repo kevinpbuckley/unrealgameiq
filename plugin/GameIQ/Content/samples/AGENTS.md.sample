@@ -69,8 +69,8 @@ data = json.loads(json.loads(res.get_value_as_json_string())["returnValue"])["re
 
 ## Working conventions
 
-- The index is built from the project's .gameiq directory and updated live as assets are saved.
-- If results look stale or missing, rebuild it: in a running editor, run the console command `GameIQ.Rebuild` (full) or `GameIQ.ReindexDocs` (docs/images/external sources only, faster), or click Tools ▸ Game IQ ▸ Rebuild Index. Headless (editor closed), run the `GameIQBuild` commandlet via UnrealEditor-Cmd with `-run=GameIQBuild`. All three report progress via editor notifications and the Output Log (`LogGameIQRunner`).
+- The index is built from the project's .gameiq directory and updated live as assets are saved. C++ refreshes itself too: on editor startup and after Live Coding patches, changed sources trigger a background code-only reindex (toggle: Project Settings ▸ Plugins ▸ Game IQ ▸ Auto Reindex Cpp) — so `cpp:*` entities normally match the working tree without manual rebuilds.
+- If results look stale or missing, rebuild: in a running editor, run the console command `GameIQ.Rebuild` (full), `GameIQ.ReindexDocs` (docs/images/external sources only), or `GameIQ.ReindexCode` (C++ only), or click Tools ▸ Game IQ ▸ Rebuild Index. Headless (editor closed), run the `GameIQBuild` commandlet via UnrealEditor-Cmd with `-run=GameIQBuild`. All report progress via editor notifications and the Output Log (`LogGameIQRunner`).
 - When the user asks for architecture, ownership, or "where is X implemented?", use GameIQ before broad manual search.
 - When the user asks for likely breakage or impact from changing something, use `impact`.
 

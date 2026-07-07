@@ -17,6 +17,12 @@ struct FAssetData;
  * extracts + patches SQLite on the next editor tick(s) — extraction and the DB write happen
  * OFF the save critical path, so saving never stalls on Game IQ. Deletes/renames patch
  * immediately (no extraction, just a subtree drop). No full rebuild, no watcher, no Node.
+ *
+ * C++ has no save event to hook (source edits happen outside the editor), so code freshness is
+ * checked at the two moments new code can appear: editor startup and Live Coding patch complete.
+ * A stat-only fingerprint of the source tree (GameIQCppFingerprint) is compared against the one
+ * stamped by the last code extraction; on mismatch a background C++-only reindex (GameIQCppBuild)
+ * launches via the shared build runner. Governed by UGameIQSettings::bAutoReindexCpp.
  */
 UCLASS()
 class UGameIQSaveHookSubsystem : public UEditorSubsystem
@@ -42,6 +48,9 @@ private:
 	/** Apply a subtree-drop patch (delete/rename) directly — cheap, no extraction. */
 	void DropSubtree(const FString& EntityId);
 
+	/** Compare the source-tree fingerprint with the last code extraction's; reindex C++ on mismatch. */
+	void CheckCppFreshness();
+
 	/** Saved packages waiting for extraction (deduped; insertion-ordered). */
 	TArray<FString> PendingPackages;
 	TSet<FString> PendingSet;
@@ -50,4 +59,11 @@ private:
 	FDelegateHandle SaveHandle;
 	FDelegateHandle RemovedHandle;
 	FDelegateHandle RenamedHandle;
+
+	/** One-shot startup delay before the first C++ freshness check. */
+	FTSTicker::FDelegateHandle StartupCppCheckHandle;
+	/** Live Coding patch-complete subscription (bound only when Live Coding is compiled in). */
+	FDelegateHandle LiveCodingHandle;
+	/** Guards overlapping fingerprint walks (startup and a Live Coding patch can coincide). */
+	bool bCppCheckInFlight = false;
 };

@@ -35,6 +35,15 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Indexing")
 	FString DocsDirectory;
 
+	/**
+	 * Keep the C++ side of the index fresh automatically: on editor startup (and after each Live
+	 * Coding patch) Game IQ compares the source tree against the fingerprint of the last code
+	 * extraction and runs a background C++-only reindex when they differ. Disable to refresh code
+	 * only via GameIQ.Rebuild / GameIQ.ReindexCode.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Indexing")
+	bool bAutoReindexCpp = true;
+
 	//~ UDeveloperSettings — surface under the "Plugins" category
 	virtual FName GetCategoryName() const override { return TEXT("Plugins"); }
 

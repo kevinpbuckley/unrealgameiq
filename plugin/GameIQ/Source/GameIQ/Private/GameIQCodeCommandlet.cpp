@@ -3,6 +3,7 @@
 #include "GameIQCodeCommandlet.h"
 
 #include "Dom/JsonObject.h"
+#include "GameIQCppFingerprint.h"
 #include "GameIQCppParse.h"
 #include "GameIQFileWalk.h"
 #include "GameIQJson.h"
@@ -179,6 +180,9 @@ int32 UGameIQCodeCommandlet::Main(const FString& /*Params*/)
 	const FString OutDir = FPaths::Combine(Root, TEXT(".gameiq"), TEXT("extract"));
 	IFileManager::Get().MakeDirectory(*OutDir, true);
 	GameIQ::WriteOutput(OutDir, TEXT("cpp.json"), TEXT("gameiq-cpp@0.1.0"), Entities, Edges, Chunks);
+	// Stamp the source fingerprint this extraction saw — the editor's staleness check compares
+	// against it to decide whether an automatic C++-only reindex is needed (GameIQSaveHook).
+	GameIQCppFingerprint::Write(Root, GameIQCppFingerprint::Compute(Root));
 	UE_LOG(LogGameIQCode, Display,
 		TEXT("Game IQ code: %d classes, %d bodies, %d input bindings → %d entities, %d edges, %d chunks → cpp.json"),
 		All.Num(), NumBodies, NumBindings, Entities.Num(), Edges.Num(), Chunks.Num());

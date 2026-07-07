@@ -242,6 +242,20 @@ static FAutoConsoleCommand GameIQReindexDocsCommand(
 	FConsoleCommandDelegate::CreateStatic(GameIQReindexDocsConsoleCommand)
 );
 
+static void GameIQReindexCodeConsoleCommand()
+{
+	FGameIQBuildRunner::Get().StartBuild(TEXT("GameIQCppBuild"),
+		NSLOCTEXT("GameIQModule", "ConsoleReindexCodeStarted", "Game IQ: reindexing C++ in the background…"));
+}
+
+static FAutoConsoleCommand GameIQReindexCodeCommand(
+	TEXT("GameIQ.ReindexCode"),
+	TEXT("Reindex only Game IQ C++ entities (code extractor, producer-scoped ingest, link refresh), ")
+	TEXT("leaving asset/Blueprint/docs entities untouched. Also runs automatically on editor startup and ")
+	TEXT("after Live Coding patches when sources changed (Project Settings > Plugins > Game IQ)."),
+	FConsoleCommandDelegate::CreateStatic(GameIQReindexCodeConsoleCommand)
+);
+
 void FGameIQModule::StartupModule()
 {
 	UE_LOG(LogGameIQ, Log, TEXT("Game IQ module started. Run `-run=GameIQBuild` to build the index."));

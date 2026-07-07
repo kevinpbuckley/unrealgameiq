@@ -5,16 +5,24 @@
 #include "AssetRegistry/AssetData.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/IAssetRegistry.h"
+#include "Async/Async.h"
 #include "Dom/JsonObject.h"
 #include "Engine/Blueprint.h"
 #include "GameIQAssetCommandlet.h"
 #include "GameIQBlueprintCommandlet.h"
+#include "GameIQBuildRunner.h"
+#include "GameIQCppFingerprint.h"
 #include "GameIQJson.h"
+#include "GameIQSettings.h"
 #include "GameIQStore.h"
 #include "Misc/Paths.h"
 #include "Modules/ModuleManager.h"
 #include "UObject/Package.h"
 #include "UObject/UObjectHash.h"
+
+#if WITH_LIVE_CODING
+#include "ILiveCodingModule.h"
+#endif
 
 DEFINE_LOG_CATEGORY_STATIC(LogGameIQHook, Log, All);
 
@@ -55,7 +63,29 @@ void UGameIQSaveHookSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	RemovedHandle = ARM.Get().OnAssetRemoved().AddUObject(this, &UGameIQSaveHookSubsystem::OnAssetRemoved);
 	RenamedHandle = ARM.Get().OnAssetRenamed().AddUObject(this, &UGameIQSaveHookSubsystem::OnAssetRenamed);
 
-	UE_LOG(LogGameIQHook, Log, TEXT("Game IQ save hook active — saves, deletes, and renames patch the index incrementally (deferred off the save path)."));
+	// C++ freshness: no save event exists for source edits, so check at the two moments new code
+	// can appear — shortly after startup (a recompiled editor means sources may have changed) and
+	// after each Live Coding patch. Delayed a few seconds so the check never competes with boot.
+	StartupCppCheckHandle = FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+		[WeakThis = TWeakObjectPtr<UGameIQSaveHookSubsystem>(this)](float) -> bool
+		{
+			if (UGameIQSaveHookSubsystem* This = WeakThis.Get())
+			{
+				This->StartupCppCheckHandle.Reset();
+				This->CheckCppFreshness();
+			}
+			return false; // one-shot
+		}), 5.0f);
+
+#if WITH_LIVE_CODING
+	if (ILiveCodingModule* LiveCoding = FModuleManager::GetModulePtr<ILiveCodingModule>(LIVE_CODING_MODULE_NAME))
+	{
+		LiveCodingHandle = LiveCoding->GetOnPatchCompleteDelegate().AddUObject(
+			this, &UGameIQSaveHookSubsystem::CheckCppFreshness);
+	}
+#endif
+
+	UE_LOG(LogGameIQHook, Log, TEXT("Game IQ save hook active — saves, deletes, and renames patch the index incrementally (deferred off the save path); C++ freshness is checked on startup and Live Coding patches."));
 }
 
 void UGameIQSaveHookSubsystem::Deinitialize()
@@ -65,6 +95,21 @@ void UGameIQSaveHookSubsystem::Deinitialize()
 		FTSTicker::GetCoreTicker().RemoveTicker(TickerHandle);
 		TickerHandle.Reset();
 	}
+	if (StartupCppCheckHandle.IsValid())
+	{
+		FTSTicker::GetCoreTicker().RemoveTicker(StartupCppCheckHandle);
+		StartupCppCheckHandle.Reset();
+	}
+#if WITH_LIVE_CODING
+	if (LiveCodingHandle.IsValid())
+	{
+		if (ILiveCodingModule* LiveCoding = FModuleManager::GetModulePtr<ILiveCodingModule>(LIVE_CODING_MODULE_NAME))
+		{
+			LiveCoding->GetOnPatchCompleteDelegate().Remove(LiveCodingHandle);
+		}
+		LiveCodingHandle.Reset();
+	}
+#endif
 	UPackage::PackageSavedWithContextEvent.Remove(SaveHandle);
 	if (FAssetRegistryModule* ARM = FModuleManager::GetModulePtr<FAssetRegistryModule>(TEXT("AssetRegistry")))
 	{
@@ -246,4 +291,40 @@ void UGameIQSaveHookSubsystem::DropSubtree(const FString& EntityId)
 		Store.Patch({ EntityId }, {}, {}, {}, HookAssetsProducer);
 		Store.Close();
 	}
+}
+
+void UGameIQSaveHookSubsystem::CheckCppFreshness()
+{
+	if (bCppCheckInFlight) { return; }
+	if (!GetDefault<UGameIQSettings>()->bAutoReindexCpp) { return; }
+
+	const FString Root = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir());
+	// No index, or the code stage has never run → nothing to keep fresh. A first full build is a
+	// deliberate user action (GameIQ.Rebuild), not something to launch behind their back.
+	if (!FPaths::FileExists(FPaths::Combine(Root, TEXT(".gameiq"), TEXT("index.db")))) { return; }
+	if (!FPaths::FileExists(GameIQCppFingerprint::CppJsonPath(Root))) { return; }
+	if (FGameIQBuildRunner::Get().IsBuilding()) { return; }
+
+	// The fingerprint is stat-only but still walks the whole source tree — keep it off the game
+	// thread; only the compare + build kick hop back.
+	bCppCheckInFlight = true;
+	TWeakObjectPtr<UGameIQSaveHookSubsystem> WeakThis(this);
+	Async(EAsyncExecution::Thread, [WeakThis, Root]()
+	{
+		const FString Current = GameIQCppFingerprint::Compute(Root);
+		const FString Stored = GameIQCppFingerprint::ReadStored(Root);
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, Current, Stored]()
+		{
+			UGameIQSaveHookSubsystem* This = WeakThis.Get();
+			if (!This) { return; }
+			This->bCppCheckInFlight = false;
+			// An empty Stored (pre-fingerprint index) counts as stale: the reindex it triggers
+			// stamps the first fingerprint, so this self-heals one build later.
+			if (Current == Stored) { return; }
+			if (FGameIQBuildRunner::Get().IsBuilding()) { return; }
+			UE_LOG(LogGameIQHook, Display, TEXT("Game IQ: C++ sources changed since the last code extraction — reindexing code in the background."));
+			FGameIQBuildRunner::Get().StartBuild(TEXT("GameIQCppBuild"),
+				NSLOCTEXT("GameIQ", "AutoReindexCppStarted", "Game IQ: C++ changed — reindexing code in the background…"));
+		});
+	});
 }

@@ -45,6 +45,12 @@ public class GameIQ : ModuleRules
 				"WorkspaceMenuStructure", // Tools category for the dockable tab
 				"FileUtilities",   // FZipArchiveReader (over bundled libzip) — read DOCX word/document.xml (issue #5)
 			});
+
+			if (Target.bWithLiveCoding)
+			{
+				// auto C++ reindex after a Live Coding patch (ILiveCodingModule::GetOnPatchCompleteDelegate)
+				PrivateIncludePathModuleNames.Add("LiveCoding");
+			}
 		}
 	}
 }
