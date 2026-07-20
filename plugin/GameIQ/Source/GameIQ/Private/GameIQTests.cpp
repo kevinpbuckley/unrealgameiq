@@ -3,6 +3,7 @@
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "GameIQCppParse.h"
+#include "GameIQDocText.h"
 #include "GameIQQuery.h"
 #include "GameIQStore.h"
 #include "GameIQTextUtil.h"
@@ -75,6 +76,34 @@ namespace GameIQTestUtil
 		Db.Close();
 		return N;
 	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGameIQHtmlDocParseTest, "GameIQ.Docs.HtmlParsing",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGameIQHtmlDocParseTest::RunTest(const FString& Parameters)
+{
+	const FString Html = TEXT("<!doctype html><html><head><title>Combat &amp; Abilities</title>")
+		TEXT("<style>.hidden{display:none}</style><script>ignoreMe()</script></head><body>")
+		TEXT("<section><h2>Damage Model</h2><p>Armor reduces damage.</p></section>")
+		TEXT("<h3>Status Effects</h3><ul><li>Burn</li><li>Freeze</li></ul></body></html>");
+	const GameIQDocText::FParsed Parsed = GameIQDocText::Parse(Html, TEXT("html"));
+
+	TestTrue(TEXT("HTML is supported"), Parsed.bSupported);
+	TestEqual(TEXT("format is HTML"), Parsed.Format, FString(TEXT("html")));
+	TestEqual(TEXT("title falls back to the HTML title element"), Parsed.Title, FString(TEXT("Combat & Abilities")));
+	TestEqual(TEXT("headings create sections"), Parsed.Sections.Num(), 2);
+	if (Parsed.Sections.Num() == 2)
+	{
+		TestEqual(TEXT("H2 heading is retained"), Parsed.Sections[0].Heading, FString(TEXT("Damage Model")));
+		TestTrue(TEXT("paragraph text is searchable"), Parsed.Sections[0].Body.Contains(TEXT("Armor reduces damage.")));
+		TestEqual(TEXT("H3 heading is retained"), Parsed.Sections[1].Heading, FString(TEXT("Status Effects")));
+		TestTrue(TEXT("list text is searchable"), Parsed.Sections[1].Body.Contains(TEXT("Burn")) && Parsed.Sections[1].Body.Contains(TEXT("Freeze")));
+	}
+	const FString CombinedText = GameIQDocText::HtmlToText(Html);
+	TestFalse(TEXT("scripts are omitted"), CombinedText.Contains(TEXT("ignoreMe")));
+	TestFalse(TEXT("styles are omitted"), CombinedText.Contains(TEXT("display:none")));
+	return true;
 }
 
 /**

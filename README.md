@@ -18,7 +18,9 @@ The plugin does everything in-process:
 
 - **Extract** — commandlets read the project (Asset Registry graph, per-asset recipes, Blueprint
   pseudocode, `.ini`/`.uproject` config, C++ headers *and* function bodies, design docs
-  (.md/.txt/.pdf/.docx), images, and exported external docs) into `<project>/.gameiq/extract/*.json`.
+  (`.md`/`.txt`/`.html`/`.htm`/`.pdf`/`.docx`), images, and exported external docs) into
+  `<project>/.gameiq/extract/*.json`. HTML headings become searchable document sections; scripts,
+  styles, comments, and markup are omitted from the indexed text.
 - **Store & query** — a SQLite index (`.gameiq/index.db`, FTS5) via UE's `SQLiteCore`, with the query
   engine (`search`/`get_entity`/`children`/`references`/`impact`/`explain`/`project_stats`/`drift`/
   `coverage`/`doctor`) ported to C++.

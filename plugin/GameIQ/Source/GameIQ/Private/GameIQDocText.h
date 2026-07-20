@@ -162,6 +162,8 @@ namespace GameIQDocText
 		S = RegexReplaceAll(S, TEXT("(?i)<script[\\s\\S]*?</script>"), TEXT(" "));
 		S = RegexReplaceAll(S, TEXT("(?i)<style[\\s\\S]*?</style>"), TEXT(" "));
 		S = RegexReplaceAll(S, TEXT("<!--[\\s\\S]*?-->"), TEXT(" "));
+		// Metadata is handled separately by Parse(); don't index title/meta text as body content.
+		S = RegexReplaceAll(S, TEXT("(?i)<head[\\s\\S]*?</head>"), TEXT(" "));
 		// headings → ATX so the markdown parser picks them up
 		for (int32 L = 1; L <= 6; ++L)
 		{
@@ -170,7 +172,7 @@ namespace GameIQDocText
 			S = RegexReplaceAll(S, FString::Printf(TEXT("(?i)</h%d>"), L), TEXT("\n"));
 		}
 		// common block elements → line breaks
-		S = RegexReplaceAll(S, TEXT("(?i)<(br|/p|/div|/li|/tr)[^>]*>"), TEXT("\n"));
+		S = RegexReplaceAll(S, TEXT("(?i)<(br|/p|/div|/li|/tr|/section|/article|/header|/footer|/table|/ul|/ol)[^>]*>"), TEXT("\n"));
 		S = RegexReplaceAll(S, TEXT("(?i)<li[^>]*>"), TEXT("\n- "));
 		// strip all remaining tags
 		S = RegexReplaceAll(S, TEXT("<[^>]+>"), TEXT(""));
@@ -224,6 +226,17 @@ namespace GameIQDocText
 		{
 			Out.Format = TEXT("html");
 			ParseMarkdown(HtmlToText(RawContent), Out);
+			// Design-doc generators commonly put the document name only in <title> and begin the
+			// visible body at H2. Preserve that useful name instead of falling back to the filename.
+			if (Out.Title.IsEmpty())
+			{
+				const FRegexPattern TitlePattern(TEXT("(?i)<title[^>]*>([\\s\\S]*?)</title>"));
+				FRegexMatcher TitleMatcher(TitlePattern, RawContent);
+				if (TitleMatcher.FindNext())
+				{
+					Out.Title = DecodeEntities(RegexReplaceAll(TitleMatcher.GetCaptureGroup(1), TEXT("<[^>]+>"), TEXT(""))).TrimStartAndEnd();
+				}
+			}
 		}
 		else if (Ext == TEXT("rtf"))
 		{

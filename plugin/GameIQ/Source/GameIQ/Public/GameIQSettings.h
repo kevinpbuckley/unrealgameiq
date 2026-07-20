@@ -27,7 +27,7 @@ public:
 	TArray<FString> ExcludeDirectories;
 
 	/**
-	 * Folder the in-repo docs stage scans for design docs (.md, .txt, .pdf, …), project-relative
+	 * Folder the in-repo docs stage scans for design docs (.md, .txt, .html/.htm, .pdf, …), project-relative
 	 * (e.g. "Docs") or absolute. Empty = the whole project tree (legacy behavior). Point it at a
 	 * dedicated docs folder to stop READMEs, tool notes and vendored text from entering the index.
 	 * Written to <Project>/gameiq.config.json as `docsPath`.
