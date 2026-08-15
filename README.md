@@ -6,12 +6,14 @@ See [design.md](design.md) for the full design.
 
 ## What this repo is
 
-A single, all-C++ Unreal Engine 5.8 editor plugin — no Node, no external runtime:
+A single, all-C++ Unreal Engine 5.8 editor plugin — no Node, no external runtime. The repository
+root is also the deployable Unreal plugin root:
 
 ```
-plugin/
-  GameIQ/   # the UE plugin (contents == <Game>/Plugins/GameIQ/)
-scripts/    # deploy.ps1 (copy plugin into a project), build-index.ps1, reindex-docs.ps1
+GameIQ.uplugin
+Source/GameIQ/
+Content/
+scripts/           # deployment and index helpers
 ```
 
 The plugin does everything in-process:
@@ -42,21 +44,21 @@ Clone this repo into your project's `Plugins/` folder:
 
 ```powershell
 cd <YourProject>/Plugins
-git clone https://github.com/kevinpbuckley/unrealgameiq.git
+git clone https://github.com/kevinpbuckley/unrealgameiq.git GameIQ
 ```
 
-Unreal discovers the nested `.uplugin` automatically — no need to move anything. Enable
+This produces the conventional `<YourProject>/Plugins/GameIQ/GameIQ.uplugin` layout. Enable
 **Unreal Game IQ** in Edit → Plugins if needed, then build the editor target so
 `UnrealEditor-GameIQ.dll` is compiled. The plugin enables its dependencies (`SQLiteCore`,
 `ToolsetRegistry`, `EnhancedInput`). (Alternative: `pwsh scripts/deploy.ps1 -Project <path>`
-copies just `plugin/GameIQ/` into the project without the git nesting.)
+copies the plugin payload into another project without its Git metadata or development files.)
 
 ### 2. Build the index
 
 **Once, headless** (editor closed), from your project root:
 
 ```powershell
-pwsh Plugins/unrealgameiq/scripts/build-index.ps1 -Project .
+pwsh Plugins/GameIQ/scripts/build-index.ps1 -Project .
 ```
 
 This runs the `GameIQBuild` commandlet — every extractor plus the SQLite ingest — in a single editor
@@ -114,11 +116,11 @@ The editor-less config/C++ walk indexes the whole project tree, including third-
 To keep the index focused on *your* game, add a `gameiq.config.json` at the project root:
 
 ```json
-{ "exclude": ["Plugins/unrealgameiq", "Plugins/SomeMarketplacePlugin"] }
+{ "exclude": ["Plugins/GameIQ", "Plugins/SomeMarketplacePlugin"] }
 ```
 
 Entries match a directory name (`VibeUE`) or a project-relative path (`Plugins/VibeUE`). Add
-`Plugins/unrealgameiq` (or all of `Plugins`) so Game IQ's own source stays out of your index.
+`Plugins/GameIQ` (or all of `Plugins`) so Game IQ's own source stays out of your index.
 You can also edit the list in the editor under **Project Settings → Plugins → Game IQ**.
 
 ## Status

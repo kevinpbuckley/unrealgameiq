@@ -204,7 +204,7 @@ UE 5.8 ships (Experimental, `EditorOnly`, off by default) a **`ToolsetRegistry`*
 
 **Decision (superseded — see update): Game IQ shipped as an all-C++ UE plugin; the Node core was removed.** The original design was a standalone Node/TypeScript core (CLI + stdio MCP + SQLite) with the plugin as one extraction backend. It was first extended with the toolset as a *second* front-end, then — once every capability was ported to C++ and verified at parity — the Node side was deleted entirely (2026-07). The whole pipeline now lives inside Unreal:
 
-- **Serve — native toolset `UGameIQService : UToolsetDefinition`** (`plugin/GameIQ`, registered via `UToolsetRegistry::RegisterToolsetClass` on `PostEngineInit`) — zero-setup for anyone on the native UE MCP / VibeUE. Its `AICallable` functions — the full query surface: `Search`, `GetEntity`, `References`, `Impact`, `Explain`, `ProjectStats` — are answered **in-process** by the C++ query engine (`GameIQQuery`) reading `.gameiq/index.db` via UE's **SQLiteCore** (FTS5). No Node spawn, no per-call editor-API round-trips, so it returns project data faster than probing the editor with many calls. Verified live on ThirdPerson58 via `describe_toolset` and `call_tool`.
+- **Serve — native toolset `UGameIQService : UToolsetDefinition`** (the root-level GameIQ plugin, registered via `UToolsetRegistry::RegisterToolsetClass` on `PostEngineInit`) — zero-setup for anyone on the native UE MCP / VibeUE. Its `AICallable` functions — the full query surface: `Search`, `GetEntity`, `References`, `Impact`, `Explain`, `ProjectStats` — are answered **in-process** by the C++ query engine (`GameIQQuery`) reading `.gameiq/index.db` via UE's **SQLiteCore** (FTS5). No Node spawn, no per-call editor-API round-trips, so it returns project data faster than probing the editor with many calls. Verified live on ThirdPerson58 via `describe_toolset` and `call_tool`.
 - **Build & update — `FGameIQStore`** (C++ store+ingest). The **save hook** patches the index directly on save/delete/rename (`FGameIQStore::Patch` — verified: a Blueprint variable value change reflects in the toolset immediately). The **`GameIQIndex` commandlet** ingests the extract JSONs (producer-scoped merge), and **`GameIQBuild`** runs every extractor + ingest in one editor boot. The full C++ build reproduces the old Node build exactly (2245 entities on ThirdPerson58).
 - **Editor-less extractors ported** — `GameIQConfig` (`.ini`/`.uproject`/`.uplugin`) and `GameIQCode` (C++ header reflection: UCLASS/USTRUCT/UINTERFACE + UFUNCTION/UPROPERTY, regex + brace-matching) are now commandlets. Entity ids and coverage match the former TS extractors byte-for-byte (config = 26 entities, same `config:<rel>#<section>` ids; `gameiq.config.json` excludes honored).
 - **DB journal:** rollback journal (`journal_mode=DELETE`) — and it turns out this is **forced, not chosen**: UE's SQLiteCore registers a custom VFS at **iVersion 1 with no shared-memory (xShm*) methods** (`SQLiteEmbeddedPlatform.cpp` — "we do not provide an implementation for shared memory"), so **`PRAGMA journal_mode=WAL` silently no-ops** under UE. (A 2026-07 attempt to switch to WAL discovered this: the pragma "succeeds" and the DB stays in legacy mode.) Cross-process contention (save hook vs. rebuild ingest vs. queries) is handled by `busy_timeout=3000` plus a bounded `BEGIN IMMEDIATE` retry loop in the store; writes are short transactions. `FSQLiteDatabase` asserts if destroyed while open, so every handle closes on all paths (`ON_SCOPE_EXIT`).
@@ -259,14 +259,15 @@ Game IQ is **an all-C++ Unreal Engine 5.8 editor plugin** — one artifact, no e
 
 ```
 unreal-game-iq/
-  plugin/
-    GameIQ/      # contents == <Game>/Plugins/GameIQ/ ; .uplugin + Source/ (all C++)
-  scripts/       # deploy.ps1 (copy plugin into a project) + build-index.ps1 (GameIQBuild)
+  GameIQ.uplugin
+  Source/GameIQ/ # all C++ plugin source
+  Content/       # agent-guide sample
+  scripts/       # deploy.ps1 + build-index.ps1 (GameIQBuild)
   design.md / README.md
 ```
 
-- **Only `plugin/GameIQ/` maps into a game**, at `<Game>/Plugins/GameIQ/` — a clean plugin folder (`.uplugin`, `Source/`, `Resources/`), editor-only so nothing cooks into a packaged game.
-- **Delivery:** `deploy.ps1` copies the plugin into a project's `Plugins/` and enables it; `build-index.ps1` runs `GameIQBuild`. Marketplace zip / submodule are future options.
+- **The repository root is the plugin root** and maps directly to `<Game>/Plugins/GameIQ/`. The module is editor-only, so nothing cooks into a packaged game.
+- **Delivery:** clone the repository directly as `<Game>/Plugins/GameIQ`, or use `deploy.ps1` to copy only the plugin payload and enable it. `build-index.ps1` runs `GameIQBuild`. Marketplace packaging remains a future option.
 
 ## 11. Prior art & building blocks
 
@@ -305,7 +306,7 @@ All public materials follow the existing convention: Unreal® is a trademark of 
 Snapshot of shipped vs. planned so the vision above doesn't read as done. Verified end-to-end on **ThirdPerson58 (UE 5.8)**: extract → index → MCP → agent.
 
 **Shipped**
-- Single all-C++ UE plugin (`plugin/GameIQ`): extractor commandlets, `FGameIQStore` (SQLite+FTS5 store + producer-scoped ingest), `GameIQQuery` (query engine), `UGameIQService` (native toolset); `scripts/deploy.ps1` + `build-index.ps1`. No Node — the former TS core was ported to C++ and removed (§6.5).
+- Single root-level all-C++ UE plugin: extractor commandlets, `FGameIQStore` (SQLite+FTS5 store + producer-scoped ingest), `GameIQQuery` (query engine), `UGameIQService` (native toolset); `scripts/deploy.ps1` + `build-index.ps1`. No Node — the former TS core was ported to C++ and removed (§6.5).
 - **Editor-less:** C++ header reflection parse, config/`.ini`/`.uproject` parse, directory-exclude config (§5.5).
 - **Commandlets:** `GameIQExport` (Tier 0 registry graph), `GameIQAssets` (Tier 1: static/skeletal mesh, texture, skeleton, data table, material, **Input Mapping Context/Action**, **level actor inventory with light/mesh detail**, generic reflection fallback for the rest), `GameIQBlueprints` (Tier 2 pseudocode + variables/components/interfaces).
 - **Edges:** `depends-on`, `references`, `inherits`, `implements`, `calls`, `uses-material`, `uses-texture`, `uses-skeleton`, `placed-in-level`.

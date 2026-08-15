@@ -1,11 +1,11 @@
 # Game IQ generated index (gitignored inside target projects too)
 .gameiq/
 
-# UE plugin build artifacts (when plugin/GameIQ is compiled in a project)
-plugin/**/Binaries/
-plugin/**/Intermediate/
-plugin/**/Saved/
-plugin/**/DerivedDataCache/
+# UE plugin build artifacts
+Binaries/
+Intermediate/
+Saved/
+DerivedDataCache/
 
 # OS / editor
 .DS_Store

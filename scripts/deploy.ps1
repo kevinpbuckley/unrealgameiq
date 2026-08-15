@@ -1,19 +1,23 @@
 <#
 .SYNOPSIS
-  Deploy the Game IQ UE plugin into a project, then optionally build, extract, and index.
+  Deploy the root-level Game IQ plugin into an Unreal project.
 
 .DESCRIPTION
-  Automates the loop: copy plugin/GameIQ -> <Project>/Plugins/GameIQ, enable it in the
-  .uproject, build the editor target, run the extraction commandlets, and build the index.
-  Engine is auto-discovered from the .uproject's EngineAssociation.
+  Copies the plugin payload into <Project>/Plugins/GameIQ, enables it in the .uproject,
+  and can optionally build the editor target and create the initial Game IQ index.
+  Engine location is resolved from the project's EngineAssociation.
 
 .PARAMETER Project
-  Path to the target project root (folder containing the .uproject).
+  Path to the target project root (the folder containing its .uproject).
 
-.PARAMETER Build    Build the <Name>Editor target after deploying (UBT).
-.PARAMETER Extract  Run the GameIQExport + GameIQBlueprints commandlets (needs the editor closed).
-.PARAMETER Index    Run `gameiq index` to ingest the extractor output into .gameiq/index.db.
-.PARAMETER All      Shorthand for -Build -Extract -Index.
+.PARAMETER Build
+  Build the <ProjectName>Editor target after deployment.
+
+.PARAMETER Index
+  Run the all-in-one GameIQBuild commandlet. The legacy -Extract name remains an alias.
+
+.PARAMETER All
+  Shorthand for -Build -Index.
 
 .EXAMPLE
   ./scripts/deploy.ps1 -Project E:\Repo\ThirdPerson58 -All
@@ -21,135 +25,110 @@
 param(
     [Parameter(Mandatory = $true)][string]$Project,
     [switch]$Build,
-    [switch]$Extract,
-    [switch]$Index,
+    [Alias("Extract")][switch]$Index,
     [switch]$All
 )
 
 $ErrorActionPreference = "Stop"
-if ($All) { $Build = $true; $Extract = $true; $Index = $true }
+if ($All) { $Build = $true; $Index = $true }
 
-$repoRoot   = Split-Path $PSScriptRoot -Parent
-$pluginSrc  = Join-Path $repoRoot "plugin\GameIQ"
+$repoRoot = Split-Path $PSScriptRoot -Parent
 $projectRoot = (Resolve-Path $Project).Path
-
 $uproject = Get-ChildItem -Path $projectRoot -Filter "*.uproject" -File | Select-Object -First 1
-if (-not $uproject) { Write-Host "ERROR: no .uproject in $projectRoot" -ForegroundColor Red; exit 1 }
+if (-not $uproject) { throw "No .uproject found in $projectRoot" }
+
 $projectName = $uproject.BaseName
 $projectPath = $uproject.FullName
+$pluginDst = Join-Path $projectRoot "Plugins\GameIQ"
 
 Write-Host "=== Game IQ deploy ===" -ForegroundColor Cyan
-Write-Host "Plugin : $pluginSrc"  -ForegroundColor Gray
+Write-Host "Source : $repoRoot" -ForegroundColor Gray
 Write-Host "Project: $projectPath" -ForegroundColor Yellow
 
-# --- 1. copy plugin (keep any existing Binaries/Intermediate for incremental builds) ---
-$pluginDst = Join-Path $projectRoot "Plugins\GameIQ"
-Write-Host "Copying plugin -> $pluginDst" -ForegroundColor Yellow
-robocopy $pluginSrc $pluginDst /E /XD Binaries Intermediate /NFL /NDL /NJH /NJS /NP | Out-Null
-if ($LASTEXITCODE -ge 8) { Write-Host "ERROR: robocopy failed ($LASTEXITCODE)" -ForegroundColor Red; exit 1 }
-$global:LASTEXITCODE = 0  # robocopy 1-7 are success
+# Copy only the deployable plugin payload. Keep target build artifacts for incremental builds.
+New-Item -ItemType Directory -Force -Path $pluginDst | Out-Null
+Copy-Item -Force (Join-Path $repoRoot "GameIQ.uplugin") $pluginDst
+foreach ($directory in @("Source", "Content", "Resources", "Config")) {
+    $source = Join-Path $repoRoot $directory
+    if (-not (Test-Path $source)) { continue }
 
-# --- 2. enable GameIQ in the .uproject ---
-$json = Get-Content $projectPath -Raw | ConvertFrom-Json
-$plugins = @($json.Plugins)
-if (-not ($plugins | Where-Object { $_.Name -eq "GameIQ" })) {
-    $entry = [pscustomobject]@{ Name = "GameIQ"; Enabled = $true; TargetAllowList = @("Editor") }
-    $json.Plugins = $plugins + $entry
-    ($json | ConvertTo-Json -Depth 10) | Set-Content $projectPath -Encoding utf8
-    Write-Host "Enabled GameIQ in $($uproject.Name)" -ForegroundColor Green
-} else {
-    Write-Host "GameIQ already enabled in $($uproject.Name)" -ForegroundColor Gray
+    $destination = Join-Path $pluginDst $directory
+    robocopy $source $destination /MIR /XD Binaries Intermediate Saved DerivedDataCache /NFL /NDL /NJH /NJS /NP | Out-Null
+    if ($LASTEXITCODE -ge 8) { throw "robocopy failed for $directory ($LASTEXITCODE)" }
+    $global:LASTEXITCODE = 0
 }
 
-# --- engine discovery (from EngineAssociation) ---
-function Resolve-Engine([string]$assoc) {
-    foreach ($hive in @("HKCU:\SOFTWARE\Epic Games\Unreal Engine\Builds")) {
-        try { $b = Get-ItemProperty $hive -ErrorAction SilentlyContinue; if ($b.$assoc) { return $b.$assoc } } catch {}
+# Enable GameIQ without duplicating an existing project entry.
+$projectJson = Get-Content $projectPath -Raw | ConvertFrom-Json
+$plugins = @($projectJson.Plugins)
+$entry = $plugins | Where-Object { $_.Name -eq "GameIQ" } | Select-Object -First 1
+if ($entry) {
+    $entry.Enabled = $true
+    Write-Host "GameIQ already present; ensured it is enabled." -ForegroundColor Gray
+} else {
+    $projectJson.Plugins = $plugins + [pscustomobject]@{
+        Name = "GameIQ"
+        Enabled = $true
+        TargetAllowList = @("Editor")
     }
+    Write-Host "Enabled GameIQ in $($uproject.Name)." -ForegroundColor Green
+}
+($projectJson | ConvertTo-Json -Depth 20) | Set-Content $projectPath -Encoding utf8
+
+function Resolve-Engine([string]$Association) {
     try {
-        $r = Get-ItemProperty "HKLM:\SOFTWARE\EpicGames\Unreal Engine\$assoc" -ErrorAction SilentlyContinue
-        if ($r.InstalledDirectory) { return $r.InstalledDirectory }
+        $builds = Get-ItemProperty "HKCU:\SOFTWARE\Epic Games\Unreal Engine\Builds" -ErrorAction SilentlyContinue
+        if ($builds.$Association) { return $builds.$Association }
     } catch {}
-    foreach ($c in @("E:\Program Files\Epic Games\UE_$assoc", "C:\Program Files\Epic Games\UE_$assoc", "D:\Program Files\Epic Games\UE_$assoc")) {
-        if (Test-Path $c) { return $c }
+
+    try {
+        $release = Get-ItemProperty "HKLM:\SOFTWARE\EpicGames\Unreal Engine\$Association" -ErrorAction SilentlyContinue
+        if ($release.InstalledDirectory) { return $release.InstalledDirectory }
+    } catch {}
+
+    foreach ($candidate in @(
+        "E:\Program Files\Epic Games\UE_$Association",
+        "C:\Program Files\Epic Games\UE_$Association",
+        "D:\Program Files\Epic Games\UE_$Association"
+    )) {
+        if (Test-Path $candidate) { return $candidate }
     }
     return $null
 }
 
 $enginePath = $null
-if ($Build -or $Extract) {
-    $assoc = ($json.EngineAssociation)
-    $enginePath = Resolve-Engine $assoc
-    if (-not $enginePath) { Write-Host "ERROR: could not find UE '$assoc'" -ForegroundColor Red; exit 1 }
+if ($Build -or $Index) {
+    $enginePath = Resolve-Engine $projectJson.EngineAssociation
+    if (-not $enginePath) { throw "Could not locate Unreal Engine '$($projectJson.EngineAssociation)'" }
     Write-Host "Engine : $enginePath" -ForegroundColor Yellow
 }
 
-# --- 3. build the editor target ---
 if ($Build) {
     $buildBat = Join-Path $enginePath "Engine\Build\BatchFiles\Build.bat"
     Write-Host "Building ${projectName}Editor..." -ForegroundColor Yellow
-    & $buildBat "${projectName}Editor" Win64 Development $projectPath -waitmutex
-    if ($LASTEXITCODE -ne 0) { Write-Host "Build failed ($LASTEXITCODE)" -ForegroundColor Red; exit 1 }
+    & $buildBat "${projectName}Editor" Win64 Development "-project=$projectPath" -waitmutex
+    if ($LASTEXITCODE -ne 0) { throw "Build failed ($LASTEXITCODE)" }
     Write-Host "Build OK" -ForegroundColor Green
 }
 
-# --- 4. run extraction commandlets (editor must be closed) ---
-# KNOWN ISSUE (not fully solved): commandlets intermittently exit before writing their
-# output — most often the first run(s) after a rebuild. Suspected lock/timing contention
-# (lingering ShaderCompileWorker children, DDC/AssetRegistry cache state); it is NOT
-# reliably fixed by kill+settle alone. Mitigations here: kill+settle before each attempt,
-# retry, NEVER delete the last-good output (trust file freshness, not the non-zero exit
-# code), and write each attempt's full UE log to $extractDir\logs so a failure is
-# diagnosable. A clean warm re-run usually succeeds. Root cause still needs a captured
-# cold-run log — see the logs this writes.
-if ($Extract) {
-    $cmdExe = Join-Path $enginePath "Engine\Binaries\Win64\UnrealEditor-Cmd.exe"
-    $extractDir = Join-Path $projectRoot ".gameiq\extract"
-
-    function Clear-UEProcesses {
-        $stale = Get-Process | Where-Object { $_.ProcessName -like "UnrealEditor*" -or $_.ProcessName -like "ShaderCompileWorker*" }
-        if ($stale) {
-            $stale | ForEach-Object { taskkill /F /PID $_.Id /T 2>$null | Out-Null }
-            Start-Sleep 5  # let child processes fully die and release locks before the next launch
-        }
-    }
-
-    $expected = [ordered]@{ "GameIQExport" = "registry.json"; "GameIQBlueprints" = "blueprints.json"; "GameIQAssets" = "assets.json" }
-    foreach ($run in $expected.Keys) {
-        $outFile = Join-Path $extractDir $expected[$run]
-        # Don't delete the last-good output — a transient failure shouldn't destroy it.
-        # Success = the file exists AND was (re)written after we started this attempt.
-        $logDir = Join-Path $extractDir "logs"
-        New-Item -ItemType Directory -Force -Path $logDir | Out-Null
-        foreach ($attempt in 1..3) {
-            Clear-UEProcesses  # settle before each attempt (mitigation, not a guaranteed fix)
-            $startTime = Get-Date
-            $logFile = Join-Path $logDir "$run-attempt$attempt.log"
-            Write-Host "Running commandlet: $run (attempt $attempt) -> $logFile" -ForegroundColor Yellow
-            # -unattended: without it the commandlet can block on a modal dialog and hang.
-            # -abslog writes the full UE log to a file so a failing run is diagnosable afterwards.
-            # NB: quote "-run=$run" — an unquoted -run=$run does NOT expand the variable in
-            # PowerShell native-arg passing, so UE received the literal "$run" and reported
-            # "$runCommandlet ... could not find the class". This was the real "flakiness".
-            & $cmdExe $projectPath "-run=$run" -unattended -nopause -nosplash -abslog="$logFile" 2>&1 | Out-Null
-            if ((Test-Path $outFile) -and ((Get-Item $outFile).LastWriteTime -ge $startTime)) { break }
-            Write-Host "  $($expected[$run]) not freshly written; retrying (see $logFile)..." -ForegroundColor DarkYellow
-        }
-        if ((Test-Path $outFile) -and ((Get-Item $outFile).LastWriteTime -ge $startTime)) {
-            Write-Host "  wrote $($expected[$run])" -ForegroundColor Green
-        } else {
-            Write-Host "  WARNING: $run did not freshly write $($expected[$run]) (keeping any prior copy)" -ForegroundColor Red
-        }
-    }
-    Clear-UEProcesses  # leave no stragglers holding locks for the next run
-}
-
-# --- 5. build the index ---
 if ($Index) {
-    Write-Host "Indexing..." -ForegroundColor Yellow
-    Push-Location $repoRoot
-    try { & node --import tsx "packages\core\src\cli\index.ts" index --project $projectRoot }
-    finally { Pop-Location }
+    if (Get-Process UnrealEditor -ErrorAction SilentlyContinue) {
+        throw "Close Unreal Editor before running GameIQBuild."
+    }
+
+    $commandlet = Join-Path $enginePath "Engine\Binaries\Win64\UnrealEditor-Cmd.exe"
+    $marker = Join-Path $projectRoot ".gameiq\last-build.json"
+    $started = Get-Date
+    Write-Host "Building Game IQ index..." -ForegroundColor Yellow
+    & $commandlet $projectPath -run=GameIQBuild -unattended -nopause -nosplash -stdout |
+        Select-String -Pattern "LogGameIQ" | ForEach-Object { $_.Line }
+
+    if (-not (Test-Path $marker) -or (Get-Item $marker).LastWriteTime -lt $started) {
+        throw "GameIQBuild did not write a fresh result marker: $marker"
+    }
+    $result = Get-Content $marker -Raw | ConvertFrom-Json
+    if (-not $result.success) { throw "GameIQBuild reported failure; inspect its stage logs." }
+    Write-Host "Index OK" -ForegroundColor Green
 }
 
-Write-Host "=== Done ===" -ForegroundColor Green
+Write-Host "=== Done ===" -ForegroundColor Cyan
