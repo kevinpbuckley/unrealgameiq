@@ -550,11 +550,18 @@ namespace
 		// about. (This was exactly how Ultra_Dynamic_Sky went missing from a 969-actor map.)
 		TMap<FString, int32> ClassCounts;
 		TMap<FString, TArray<const AActor*>> ByClass;
+		TSet<const AActor*> Seen;
 		int32 Total = 0;
+		int32 SkippedInfra = 0;
 
 		auto CollectActor = [&](const AActor* Actor)
 		{
 			if (!Actor) { return; }
+			// OFPA actors can already be resident in Level->Actors — without this guard they were
+			// counted twice while their identical entity id upserted to one row, inflating the
+			// summary total against indexedActors (issue #15).
+			if (Seen.Contains(Actor)) { return; }
+			Seen.Add(Actor);
 			++Total;
 			const FString ClassName = Actor->GetClass()->GetName();
 			ClassCounts.FindOrAdd(ClassName)++;
@@ -563,7 +570,7 @@ namespace
 			// per-actor entity — it's derived, not authored, and would bury real actors under the cap.
 			static const TSet<FString> DerivedInfra = {
 				TEXT("WorldPartitionHLOD"), TEXT("WorldPartitionMiniMap"), TEXT("HLODActor") };
-			if (DerivedInfra.Contains(ClassName)) { return; }
+			if (DerivedInfra.Contains(ClassName)) { ++SkippedInfra; return; }
 
 			ByClass.FindOrAdd(ClassName).Add(Actor);
 		};
@@ -723,8 +730,13 @@ namespace
 		const FString CapNote = Total > MaxActorEntitiesPerLevel
 			? FString::Printf(TEXT(" (%d listed as entities, round-robin by class — every class represented; all counted below)"), MaxActorEntitiesPerLevel)
 			: FString();
-		AddSummary(O, Id, FString::Printf(TEXT("%s (Level)\nActors: %d in %d classes%s%s%s\n%s"),
-			*Name, Total, ClassCounts.Num(), *WpNote, *CapNote, *EnvLine, *FString::Join(CountLines, TEXT(", "))));
+		// Machine-readable skip accounting — doctor() reads this so an HLOD-heavy WP map stops
+		// presenting as a silent 75-of-141 indexing shortfall (issue #15).
+		const FString InfraNote = SkippedInfra > 0
+			? FString::Printf(TEXT(" (%d infra actors counted, not indexed: HLOD/minimap)"), SkippedInfra)
+			: FString();
+		AddSummary(O, Id, FString::Printf(TEXT("%s (Level)\nActors: %d in %d classes%s%s%s%s\n%s"),
+			*Name, Total, ClassCounts.Num(), *WpNote, *CapNote, *InfraNote, *EnvLine, *FString::Join(CountLines, TEXT(", "))));
 	}
 
 	/** Asset classes whose bespoke recipe needs the UObject loaded. Everything else goes through
