@@ -195,6 +195,81 @@ namespace
 		return Stmt.Step() == ESQLitePreparedStatementStepResult::Row;
 	}
 
+	/** True when the first character looks like a UE reflection prefix on a PascalCase name. */
+	bool HasReflectionPrefix(const FString& Name)
+	{
+		if (Name.Len() < 2 || !FChar::IsUpper(Name[1])) { return false; }
+		const TCHAR P = Name[0];
+		return P == 'A' || P == 'U' || P == 'F' || P == 'I' || P == 'S' || P == 'T' || P == 'E';
+	}
+
+	/** Resolve an id to its stored form, tolerating UE-prefixed C++ names (issue #11).
+	 *  Producers store cpp ids with the reflection prefix stripped ("cpp:EnemyAIController"), but
+	 *  agents naturally query with the code spelling ("cpp:AEnemyAIController") — which used to
+	 *  resolve to nothing SILENTLY and read as "no references". Returns empty when no form exists. */
+	FString ResolveEntityId(FSQLiteDatabase& Db, const FString& Id)
+	{
+		if (EntityExists(Db, Id)) { return Id; }
+		if (!Id.StartsWith(TEXT("cpp:"))) { return FString(); }
+
+		const FString Body = Id.Mid(4);
+		FString Head = Body;
+		FString Tail; // "::Function" suffix, kept verbatim
+		const int32 Sep = Body.Find(TEXT("::"));
+		if (Sep != INDEX_NONE) { Head = Body.Left(Sep); Tail = Body.Mid(Sep); }
+
+		// Forward alias — the load-bearing one: strip the reflection prefix to the stored form.
+		if (HasReflectionPrefix(Head))
+		{
+			const FString Candidate = TEXT("cpp:") + Head.Mid(1) + Tail;
+			if (EntityExists(Db, Candidate)) { return Candidate; }
+		}
+		// Reverse: names the extractor declined to strip are stored prefixed — probe those.
+		for (const TCHAR* Prefix : { TEXT("A"), TEXT("U"), TEXT("F"), TEXT("I"), TEXT("S"), TEXT("T"), TEXT("E") })
+		{
+			const FString Candidate = FString(TEXT("cpp:")) + Prefix + Head + Tail;
+			if (EntityExists(Db, Candidate)) { return Candidate; }
+		}
+		return FString();
+	}
+
+	/** Nearest-name suggestions for a missed id (issue #12) — agents act on an inline did-you-mean
+	 *  where they demonstrably never act on "run doctor" guide prose. */
+	TArray<TSharedPtr<FJsonValue>> DidYouMean(FSQLiteDatabase& Db, const FString& Id)
+	{
+		TArray<TSharedPtr<FJsonValue>> Out;
+		FString Name = Id;
+		int32 Pos = INDEX_NONE;
+		if (Name.FindLastChar(TEXT(':'), Pos)) { Name = Name.Mid(Pos + 1); }
+		if (Name.FindLastChar(TEXT('/'), Pos)) { Name = Name.Mid(Pos + 1); }
+		if (HasReflectionPrefix(Name)) { Name = Name.Mid(1); }
+		if (Name.IsEmpty()) { return Out; }
+
+		FSQLitePreparedStatement Stmt = Db.PrepareStatement(
+			TEXT("SELECT id FROM entities WHERE name LIKE '%' || ?1 || '%' ORDER BY length(name) LIMIT 5"));
+		if (!Stmt.IsValid()) { return Out; }
+		Stmt.SetBindingValueByIndex(1, Name);
+		while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+		{
+			FString FoundId;
+			Stmt.GetColumnValueByIndex(0, FoundId);
+			Out.Add(MakeShared<FJsonValueString>(FoundId));
+		}
+		return Out;
+	}
+
+	/** Uniform not-found response: {"result":{"error":..., "didYouMean":[...]}, ...} — replaces the
+	 *  old truthy-but-empty shells that let a typo'd or prefixed id read as "zero references". */
+	FString NotFoundEnvelope(FSQLiteDatabase& Db, const FString& Id)
+	{
+		TSharedRef<FJsonObject> NotFound = MakeShared<FJsonObject>();
+		NotFound->SetStringField(TEXT("error"), FString::Printf(TEXT("entity not found: %s"), *Id));
+		TArray<TSharedPtr<FJsonValue>> Suggestions = DidYouMean(Db, Id);
+		if (Suggestions.Num() > 0) { NotFound->SetArrayField(TEXT("didYouMean"), Suggestions); }
+		return Envelope(Db, MakeShared<FJsonValueObject>(NotFound),
+			TEXT("Unknown entity id — take exact ids from search results. If the whole index looks empty, run doctor()."));
+	}
+
 	/** Severity per edge type (mirror of query.ts SEVERITY): heavier = worse to break. */
 	int32 EdgeSeverity(const FString& Type)
 	{
@@ -213,7 +288,16 @@ namespace
 
 	// ---- structured builders (shared so `explain` can reuse search + references) --------------
 
-	struct FSearchHit { TSharedRef<FJsonObject> Entity; double Score; FString Snippet; FString ChunkKind; int32 InboundRefs = 0; };
+	struct FSearchHit { TSharedRef<FJsonObject> Entity; double Score; FString Snippet; FString ChunkKind; int32 InboundRefs = 0; int32 ExternalRefs = 0; };
+
+	/** Top-level content folder of a path: "/Game/NiagaraExamples/..." -> "/Game/NiagaraExamples".
+	 *  Non-/Game paths (C++ files, docs, config) return empty = exempt from the island penalty. */
+	FString RootFolderOf(const FString& Path)
+	{
+		if (!Path.StartsWith(TEXT("/Game/"))) { return FString(); }
+		const int32 Next = Path.Find(TEXT("/"), ESearchCase::CaseSensitive, ESearchDir::FromStart, 6);
+		return Next == INDEX_NONE ? Path : Path.Left(Next);
+	}
 
 	/**
 	 * One FTS pass: dedupe to each entity's best-scoring chunk (window function), push the kind
@@ -275,6 +359,31 @@ namespace
 			Stmt.GetColumnValueByName(TEXT("inRefs"), InRefs);
 			Out.Add(FSearchHit{ EntityJson(Stmt), Score, ColStr(Stmt, TEXT("snip")), ColStr(Stmt, TEXT("chunkKind")), InRefs });
 		}
+
+		// External-reference count per hit (issue #13): inbound edges whose SOURCE lives outside the
+		// entity's own top-level content folder. Sample packs reference each other heavily but are
+		// referenced by nothing outside their folder — that distinction powers the island penalty.
+		for (FSearchHit& H : Out)
+		{
+			if (H.InboundRefs <= 0) { continue; }
+			const FString Root = RootFolderOf(H.Entity->GetStringField(TEXT("path")));
+			if (Root.IsEmpty()) { H.ExternalRefs = H.InboundRefs; continue; }
+			// LEFT JOIN: an edge whose source entity is missing (dangling) counts as external —
+			// unknown origin must not look like intra-pack chatter. The folder test checks the
+			// source's id as well as its path: level-actor entities store only the level NAME as
+			// path, but their asset id embeds the real content folder.
+			FSQLitePreparedStatement ExtStmt = Db.PrepareStatement(TEXT(
+				"SELECT COUNT(*) AS n FROM edges x LEFT JOIN entities se ON se.id = x.src "
+				"WHERE x.dst = ?1 AND (se.id IS NULL OR NOT ("
+				"COALESCE(se.path, '') LIKE ?2 || '%' OR se.id LIKE 'asset:' || ?2 || '%'))"));
+			if (!ExtStmt.IsValid()) { H.ExternalRefs = H.InboundRefs; continue; }
+			ExtStmt.SetBindingValueByIndex(1, H.Entity->GetStringField(TEXT("id")));
+			ExtStmt.SetBindingValueByIndex(2, Root);
+			if (ExtStmt.Step() == ESQLitePreparedStatementStepResult::Row)
+			{
+				ExtStmt.GetColumnValueByName(TEXT("n"), H.ExternalRefs);
+			}
+		}
 		return Out;
 	}
 
@@ -308,7 +417,17 @@ namespace
 				}
 				H.Score *= 1.0 + 0.8 * (double)Matched / (double)Tokens.Num();
 			}
-			H.Score *= 1.0 + 0.12 * FMath::Log2(1.0 + (double)FMath::Max(0, H.InboundRefs));
+			// Weight by EXTERNAL references — being leaned on from outside your own folder is the
+			// signal; intra-pack chatter is not (issue #13).
+			H.Score *= 1.0 + 0.12 * FMath::Log2(1.0 + (double)FMath::Max(0, H.ExternalRefs));
+			// Island penalty: MANY inbound references, none from outside its own root folder — the
+			// shape of bundled sample packs (NiagaraExamples et al) that outranked real gameplay
+			// assets. The >= 3 floor keeps a lightly-referenced legit asset from ranking below an
+			// unreferenced one. Scores are negative (more negative = better), so < 1 demotes.
+			if (H.InboundRefs >= 3 && H.ExternalRefs == 0)
+			{
+				H.Score *= 0.55;
+			}
 		}
 		Hits.StableSort([](const FSearchHit& A, const FSearchHit& B) { return A.Score < B.Score; });
 	}
@@ -351,6 +470,7 @@ namespace
 		R->SetStringField(TEXT("snippet"), H.Snippet);
 		R->SetStringField(TEXT("matchedChunkKind"), H.ChunkKind);
 		R->SetNumberField(TEXT("inboundRefs"), H.InboundRefs);
+		R->SetNumberField(TEXT("externalRefs"), H.ExternalRefs);
 		return R;
 	}
 
@@ -508,19 +628,27 @@ FString GameIQQuery::Search(const FString& Query, const FString& Kind, int32 Lim
 	return Envelope(Db, MakeShared<FJsonValueArray>(Results));
 }
 
-FString GameIQQuery::GetEntity(const FString& Id, int32 Cap)
+FString GameIQQuery::GetEntity(const FString& InId, int32 Cap)
 {
 	FSQLiteDatabase Db;
 	FString OpenErr;
 	if (!OpenIndex(Db, OpenErr)) { return ErrorJson(OpenErr); }
 	ON_SCOPE_EXIT { Db.Close(); }; // FSQLiteDatabase asserts if destroyed while open
 
+	const FString Id = ResolveEntityId(Db, InId); // tolerates UE-prefixed cpp names (issue #11)
+	if (Id.IsEmpty())
+	{
+		return NotFoundEnvelope(Db, InId);
+	}
+
 	TSharedPtr<FJsonObject> Entity = LoadEntity(Db, Id);
 	if (!Entity.IsValid())
 	{
-		TSharedRef<FJsonObject> NotFound = MakeShared<FJsonObject>();
-		NotFound->SetStringField(TEXT("error"), FString::Printf(TEXT("entity not found: %s"), *Id));
-		return Envelope(Db, MakeShared<FJsonValueObject>(NotFound));
+		return NotFoundEnvelope(Db, InId);
+	}
+	if (Id != InId)
+	{
+		Entity->SetStringField(TEXT("resolvedFrom"), InId);
 	}
 
 	// chunks (capped)
@@ -647,12 +775,18 @@ FString GameIQQuery::GetEntity(const FString& Id, int32 Cap)
 	return Envelope(Db, MakeShared<FJsonValueObject>(Detail));
 }
 
-FString GameIQQuery::Children(const FString& Id, const FString& ClassFilter, int32 Limit, int32 Offset)
+FString GameIQQuery::Children(const FString& InId, const FString& ClassFilter, int32 Limit, int32 Offset)
 {
 	FSQLiteDatabase Db;
 	FString OpenErr;
 	if (!OpenIndex(Db, OpenErr)) { return ErrorJson(OpenErr); }
 	ON_SCOPE_EXIT { Db.Close(); }; // FSQLiteDatabase asserts if destroyed while open
+
+	const FString Id = ResolveEntityId(Db, InId); // tolerates UE-prefixed cpp names (issue #11)
+	if (Id.IsEmpty())
+	{
+		return NotFoundEnvelope(Db, InId);
+	}
 
 	const int32 UseLimit = Limit <= 0 ? 50 : Limit;
 	const int32 UseOffset = FMath::Max(0, Offset);
@@ -701,13 +835,19 @@ FString GameIQQuery::Children(const FString& Id, const FString& ClassFilter, int
 	return Envelope(Db, MakeShared<FJsonValueObject>(Payload));
 }
 
-FString GameIQQuery::References(const FString& Id, const FString& Direction, int32 Depth,
+FString GameIQQuery::References(const FString& InId, const FString& Direction, int32 Depth,
 	const FString& EdgeType, const FString& Kind, int32 Limit, int32 Offset)
 {
 	FSQLiteDatabase Db;
 	FString OpenErr;
 	if (!OpenIndex(Db, OpenErr)) { return ErrorJson(OpenErr); }
 	ON_SCOPE_EXIT { Db.Close(); };
+
+	const FString Id = ResolveEntityId(Db, InId); // tolerates UE-prefixed cpp names (issue #11)
+	if (Id.IsEmpty())
+	{
+		return NotFoundEnvelope(Db, InId);
+	}
 
 	TArray<TSharedPtr<FJsonValue>> Results;
 	for (const FRefRow& R : BuildReferences(Db, Id, Direction, Depth <= 0 ? 1 : Depth, EdgeType, Kind,
@@ -718,12 +858,18 @@ FString GameIQQuery::References(const FString& Id, const FString& Direction, int
 	return Envelope(Db, MakeShared<FJsonValueArray>(Results), CppGraphCaveat(Id));
 }
 
-FString GameIQQuery::Impact(const FString& Id, int32 MaxDepth, int32 Limit)
+FString GameIQQuery::Impact(const FString& InId, int32 MaxDepth, int32 Limit)
 {
 	FSQLiteDatabase Db;
 	FString OpenErr;
 	if (!OpenIndex(Db, OpenErr)) { return ErrorJson(OpenErr); }
 	ON_SCOPE_EXIT { Db.Close(); };
+
+	const FString Id = ResolveEntityId(Db, InId); // tolerates UE-prefixed cpp names (issue #11)
+	if (Id.IsEmpty())
+	{
+		return NotFoundEnvelope(Db, InId);
+	}
 
 	const int32 DepthCap = MaxDepth <= 0 ? 4 : MaxDepth;
 	const int32 OutCap = Limit <= 0 ? 200 : Limit;
@@ -1014,16 +1160,42 @@ FString GameIQQuery::Doctor()
 					const int32 At = Text.Find(TEXT("Actors: "));
 					if (At != INDEX_NONE) { Actors = FCString::Atoi(*Text.Mid(At + 8)); }
 
+					// Deliberately-skipped WP infrastructure (HLOD/minimap), written by the
+					// extractor — without it an HLOD-heavy map reads as a silent shortfall (issue #15).
+					int32 SkippedInfra = 0;
+					const int32 SkipAt = Text.Find(TEXT(" infra actors counted, not indexed"));
+					if (SkipAt != INDEX_NONE)
+					{
+						int32 NumStart = SkipAt;
+						while (NumStart > 0 && FChar::IsDigit(Text[NumStart - 1]))
+						{
+							--NumStart;
+						}
+						SkippedInfra = FCString::Atoi(*Text.Mid(NumStart, SkipAt - NumStart));
+					}
+
 					TSharedRef<FJsonObject> Row = MakeShared<FJsonObject>();
 					Row->SetStringField(TEXT("map"), MapId);
 					Row->SetNumberField(TEXT("actors"), Actors);
 					Row->SetNumberField(TEXT("indexedActors"), Indexed);
+					if (SkippedInfra > 0)
+					{
+						Row->SetNumberField(TEXT("skippedInfraActors"), SkippedInfra);
+					}
 					Levels.Add(MakeShared<FJsonValueObject>(Row));
 					if (Actors > 0 && Indexed == 0)
 					{
 						Problems.Add(FString::Printf(
 							TEXT("%s reports %d actors but has no indexed level-actor entities — run GameIQ.Rebuild full"),
 							*MapId, Actors));
+					}
+					else if (Indexed > 0 && Actors - SkippedInfra > Indexed && Actors <= 500)
+					{
+						// A partial shortfall used to pass as "healthy" (the 500-entity cap
+						// legitimately truncates bigger maps; below it, a gap is real).
+						Problems.Add(FString::Printf(
+							TEXT("%s reports %d actors (%d skipped infra) but only %d indexed level-actor entities — run GameIQ.Rebuild full"),
+							*MapId, Actors, SkippedInfra, Indexed));
 					}
 				}
 			}
