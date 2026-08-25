@@ -24,8 +24,8 @@ The plugin does everything in-process:
   `<project>/.gameiq/extract/*.json`. HTML headings become searchable document sections; scripts,
   styles, comments, and markup are omitted from the indexed text.
 - **Store & query** — a SQLite index (`.gameiq/index.db`, FTS5) via UE's `SQLiteCore`, with the query
-  engine (`search`/`get_entity`/`children`/`references`/`impact`/`explain`/`project_stats`/`drift`/
-  `coverage`/`doctor`) ported to C++.
+  engine (`search`/`get_entity`/`children`/`references`/`impact`/`explain`/`get_blueprint_context`/
+  `export_graph`/`snapshots`/`changes`/`project_stats`/`drift`/`coverage`/`doctor`) ported to C++.
 - **Serve** — `UGameIQService`, a `UToolsetDefinition` registered on UE 5.8's native `ToolsetRegistry`,
   so GameIQ's queries appear on Epic's MCP endpoint for any agent already on the built-in UE MCP or
   VibeUE — zero extra setup, answered in-process.
@@ -100,7 +100,11 @@ agent on the native UE MCP (or VibeUE) can call it with no setup:
 | `Children` | page an entity's children with a class filter (e.g. every Light in a level) |
 | `References` | who uses this / what this uses (`Direction`, `Depth`, `EdgeType` filter) |
 | `Impact` | what could break if this changes (severity-ranked dependents) |
-| `Explain` | assembled context bundle for a system/topic |
+| `Explain` | character-budgeted context bundle; detail, kind, depth, and JSON/Markdown controls |
+| `GetBlueprintContext` | compact Blueprint identity and prioritized pseudocode/recipe chunks by id or path |
+| `ExportGraph` | deterministic bounded graph in Mermaid, Graphviz DOT, or structured JSON |
+| `CreateSnapshot` / `ListSnapshots` / `DeleteSnapshot` | manage named, consistent local index snapshots |
+| `Changes` | semantic entity, Blueprint logic, and relationship changes between snapshots/current |
 | `ProjectStats` | counts, unused-asset candidates, largest dependencies, authority ranking |
 | `Drift` | doc-stated `property = value` claims that contradict the implementation |
 | `Coverage` | which stated design intent is backed by a real implementation |
@@ -109,6 +113,29 @@ agent on the native UE MCP (or VibeUE) can call it with no setup:
 From Python it mirrors VibeUE's services, e.g.
 `unreal.GameIQService.search("reload ammo", "blueprint")`.
 Example: *"which meshes use this skeleton?"* → `References` with `EdgeType: "uses-skeleton"`, `Direction: "in"`.
+
+Use a context pack when an agent needs portable system or Blueprint context without repeated calls:
+
+```python
+import unreal
+context = unreal.GameIQService.explain("combat damage", "standard", 20000, "blueprint,cpp-class", 2, "markdown")
+blueprint = unreal.GameIQService.get_blueprint_context("/Game/Combat/BP_Damage", "logic", 12000, "json")
+diagram = unreal.GameIQService.export_graph("combat damage", "mermaid", "both", 2, "", "", 75)
+```
+
+For reviewable agent work, snapshot before the mutation and compare after GameIQ's normal save-hook
+freshness boundary:
+
+```python
+import json, unreal
+before = json.loads(unreal.GameIQService.create_snapshot("before combat task", '{"run":"combat-42"}'))
+snapshot_id = before["result"]["id"]
+# ...perform, save, compile, and verify changes...
+changes = unreal.GameIQService.changes(snapshot_id, "current", "", "/Game/Combat", 200, 0)
+```
+
+Snapshots stay local under `.gameiq/snapshots`; `Changes` reports full counts, paging/truncation,
+timestamps, and semantic provenance. VibeUE's run journal can attach the snapshot id and change report.
 
 ### Excluding directories (config)
 
