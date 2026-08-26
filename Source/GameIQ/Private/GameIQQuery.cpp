@@ -605,11 +605,67 @@ namespace
 		}
 		return N;
 	}
+
+	TSet<FString> CsvSet(const FString& Csv)
+	{
+		TSet<FString> Values;
+		TArray<FString> Parts;
+		Csv.ParseIntoArray(Parts, TEXT(","), true);
+		for (FString Part : Parts)
+		{
+			Part.TrimStartAndEndInline();
+			if (!Part.IsEmpty()) { Values.Add(Part.ToLower()); }
+		}
+		return Values;
+	}
+
+	bool Allowed(const TSet<FString>& Values, const FString& Value)
+	{
+		return Values.Num() == 0 || Values.Contains(Value.ToLower());
+	}
+
+	TSharedRef<FJsonObject> CompactEntity(const TSharedRef<FJsonObject>& Entity, bool bSummaryOnly)
+	{
+		if (!bSummaryOnly) { return Entity; }
+		TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+		for (const TCHAR* Field : { TEXT("id"), TEXT("kind"), TEXT("name"), TEXT("path"), TEXT("summary"), TEXT("authority") })
+		{
+			const TSharedPtr<FJsonValue>* Value = Entity->Values.Find(Field);
+			if (Value) { Out->SetField(Field, *Value); }
+		}
+		return Out;
+	}
+
+	FString ResolveEntityIdOrPath(FSQLiteDatabase& Db, const FString& IdOrPath)
+	{
+		const FString Exact = ResolveEntityId(Db, IdOrPath);
+		if (!Exact.IsEmpty()) { return Exact; }
+		FSQLitePreparedStatement Stmt = Db.PrepareStatement(TEXT(
+			"SELECT id FROM entities WHERE path = ?1 OR id = 'asset:' || ?1 "
+			"ORDER BY CASE WHEN kind = 'blueprint' THEN 0 ELSE 1 END, id LIMIT 1"));
+		if (!Stmt.IsValid()) { return FString(); }
+		Stmt.SetBindingValueByIndex(1, IdOrPath);
+		return Stmt.Step() == ESQLitePreparedStatementStepResult::Row ? ColStr(Stmt, TEXT("id")) : FString();
+	}
+
+	FString GraphEscape(FString Text)
+	{
+		Text.ReplaceInline(TEXT("\\"), TEXT("\\\\"));
+		Text.ReplaceInline(TEXT("\""), TEXT("\\\""));
+		Text.ReplaceInline(TEXT("\r"), TEXT(" "));
+		Text.ReplaceInline(TEXT("\n"), TEXT(" "));
+		return Text;
+	}
 }
 
 void GameIQQuery::SetDbPathOverrideForTests(const FString& Path)
 {
 	GDbPathOverride = Path;
+}
+
+FString GameIQQuery::GetDbPathForServices()
+{
+	return IndexDbPath();
 }
 
 FString GameIQQuery::Search(const FString& Query, const FString& Kind, int32 Limit, int32 Offset,
@@ -943,25 +999,36 @@ FString GameIQQuery::Impact(const FString& InId, int32 MaxDepth, int32 Limit)
 	return Envelope(Db, MakeShared<FJsonValueObject>(Payload));
 }
 
-FString GameIQQuery::Explain(const FString& Topic, int32 Limit)
+FString GameIQQuery::Explain(const FString& Topic, int32 Limit, const FString& DetailLevel,
+	int32 MaxChars, const FString& KindsCsv, int32 Depth, const FString& Format)
 {
+	if (MaxChars < 512) { return ErrorJson(TEXT("max_chars must be at least 512")); }
+	if (!Format.Equals(TEXT("json"), ESearchCase::IgnoreCase) && !Format.Equals(TEXT("markdown"), ESearchCase::IgnoreCase))
+	{
+		return ErrorJson(TEXT("format must be json or markdown"));
+	}
 	FSQLiteDatabase Db;
 	FString OpenErr;
 	if (!OpenIndex(Db, OpenErr)) { return ErrorJson(OpenErr); }
 	ON_SCOPE_EXIT { Db.Close(); };
 
-	const int32 Seeds = Limit <= 0 ? 8 : Limit;
+	const int32 Seeds = FMath::Clamp(Limit <= 0 ? 8 : Limit, 1, 50);
+	const int32 Budget = FMath::Max(512, MaxChars);
+	const FString Detail = DetailLevel.ToLower();
+	const bool bSummaryOnly = Detail == TEXT("summary");
+	const TSet<FString> Kinds = CsvSet(KindsCsv);
 
 	// Overfetch, then cap seeds per entity kind: on intent-shaped topics one chatty kind
 	// (e.g. dozens of placed actors) would otherwise fill every seed slot and the bundle
 	// never reaches the blueprint/code/asset entities that actually explain the system.
 	// Score order is preserved within the cap; leftover slots backfill from the overflow.
-	TArray<FSearchHit> Ranked = BuildSearchHits(Db, Topic, FString(), Seeds * 3, 0);
+	TArray<FSearchHit> Ranked = BuildSearchHits(Db, Topic, FString(), Seeds * 5, 0);
 	const int32 MaxPerKind = FMath::Max(2, Seeds / 3);
 	TArray<FSearchHit> Hits, Overflow;
 	TMap<FString, int32> PerKind;
 	for (const FSearchHit& H : Ranked)
 	{
+		if (!Allowed(Kinds, H.Entity->GetStringField(TEXT("kind")))) { continue; }
 		if (Hits.Num() >= Seeds) { break; }
 		int32& N = PerKind.FindOrAdd(H.Entity->GetStringField(TEXT("kind")));
 		if (N < MaxPerKind) { ++N; Hits.Add(H); }
@@ -977,7 +1044,7 @@ FString GameIQQuery::Explain(const FString& Topic, int32 Limit)
 	TSet<FString> SeedIds;
 	for (const FSearchHit& H : Hits)
 	{
-		SeedJson.Add(MakeShared<FJsonValueObject>(SearchHitJson(H)));
+		SeedJson.Add(MakeShared<FJsonValueObject>(bSummaryOnly ? CompactEntity(H.Entity, true) : SearchHitJson(H)));
 		SeedIds.Add(H.Entity->GetStringField(TEXT("id")));
 	}
 
@@ -986,20 +1053,312 @@ FString GameIQQuery::Explain(const FString& Topic, int32 Limit)
 	for (const FSearchHit& H : Hits)
 	{
 		const FString SeedId = H.Entity->GetStringField(TEXT("id"));
-		for (const FRefRow& R : BuildReferences(Db, SeedId, TEXT("both"), 1, FString(), FString(), 200, 0))
+		for (const FRefRow& R : BuildReferences(Db, SeedId, TEXT("both"), FMath::Clamp(Depth, 1, 5),
+			FString(), FString(), Detail == TEXT("full") ? 200 : 50, 0))
 		{
 			const FString Rid = R.Entity->GetStringField(TEXT("id"));
+			if (!Allowed(Kinds, R.Entity->GetStringField(TEXT("kind")))) { continue; }
 			if (RelatedSeen.Contains(Rid)) { continue; }
 			RelatedSeen.Add(Rid);
-			Related.Add(MakeShared<FJsonValueObject>(RefRowJson(R)));
+			Related.Add(MakeShared<FJsonValueObject>(bSummaryOnly ? CompactEntity(R.Entity, true) : RefRowJson(R)));
 		}
 	}
 
 	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
+	const int32 CandidateSeedCount = SeedJson.Num();
+	const int32 CandidateRelatedCount = Related.Num();
 	Payload->SetStringField(TEXT("topic"), Topic);
+	Payload->SetStringField(TEXT("detailLevel"), Detail);
+	Payload->SetStringField(TEXT("format"), Format.ToLower());
 	Payload->SetArrayField(TEXT("seeds"), SeedJson);
 	Payload->SetArrayField(TEXT("related"), Related);
-	return Envelope(Db, MakeShared<FJsonValueObject>(Payload));
+	TSharedRef<FJsonObject> BudgetInfo = MakeShared<FJsonObject>();
+	BudgetInfo->SetNumberField(TEXT("maxChars"), Budget);
+	Payload->SetObjectField(TEXT("budget"), BudgetInfo);
+
+	auto Render = [&]() -> FString
+	{
+		BudgetInfo->SetNumberField(TEXT("includedEntities"), SeedJson.Num() + Related.Num());
+		BudgetInfo->SetNumberField(TEXT("omittedEntities"), CandidateSeedCount + CandidateRelatedCount - SeedJson.Num() - Related.Num());
+		BudgetInfo->SetBoolField(TEXT("truncated"), SeedJson.Num() < CandidateSeedCount || Related.Num() < CandidateRelatedCount);
+		if (!Format.Equals(TEXT("markdown"), ESearchCase::IgnoreCase))
+		{
+			return Envelope(Db, MakeShared<FJsonValueObject>(Payload));
+		}
+		FString Markdown = FString::Printf(TEXT("# GameIQ context: %s\n\n## Seeds\n"), *Topic);
+		auto Append = [&Markdown](const TSharedPtr<FJsonValue>& Value)
+		{
+			TSharedPtr<FJsonObject> Object = Value->AsObject();
+			if (Object->HasTypedField<EJson::Object>(TEXT("entity"))) { Object = Object->GetObjectField(TEXT("entity")); }
+			Markdown += FString::Printf(TEXT("- `%s` — %s (%s)\n"), *Object->GetStringField(TEXT("id")),
+				*Object->GetStringField(TEXT("name")), *Object->GetStringField(TEXT("kind")));
+		};
+		for (const TSharedPtr<FJsonValue>& Value : SeedJson) { Append(Value); }
+		Markdown += TEXT("\n## Related\n");
+		for (const TSharedPtr<FJsonValue>& Value : Related) { Append(Value); }
+		TSharedRef<FJsonObject> MarkdownPayload = MakeShared<FJsonObject>();
+		MarkdownPayload->SetStringField(TEXT("format"), TEXT("markdown"));
+		MarkdownPayload->SetStringField(TEXT("content"), Markdown);
+		MarkdownPayload->SetObjectField(TEXT("budget"), BudgetInfo);
+		return Envelope(Db, MakeShared<FJsonValueObject>(MarkdownPayload));
+	};
+
+	FString Output = Render();
+	while (Output.Len() > Budget && Related.Num() > 0)
+	{
+		Related.Pop(); Payload->SetArrayField(TEXT("related"), Related); Output = Render();
+	}
+	while (Output.Len() > Budget && SeedJson.Num() > 1)
+	{
+		SeedJson.Pop(); Payload->SetArrayField(TEXT("seeds"), SeedJson); Output = Render();
+	}
+	BudgetInfo->SetNumberField(TEXT("usedChars"), Output.Len());
+	Output = Render();
+	while (Output.Len() > Budget && Related.Num() > 0)
+	{
+		Related.Pop(); Payload->SetArrayField(TEXT("related"), Related); Output = Render();
+	}
+	while (Output.Len() > Budget && SeedJson.Num() > 1)
+	{
+		SeedJson.Pop(); Payload->SetArrayField(TEXT("seeds"), SeedJson); Output = Render();
+	}
+	BudgetInfo->SetNumberField(TEXT("usedChars"), Output.Len());
+	Output = Render();
+	return Output.Len() <= Budget ? Output : ErrorJson(TEXT("max_chars is too small for the response envelope"));
+}
+
+FString GameIQQuery::GetBlueprintContext(const FString& IdOrPath, const FString& DetailLevel,
+	int32 MaxChars, const FString& Format)
+{
+	if (MaxChars < 512) { return ErrorJson(TEXT("max_chars must be at least 512")); }
+	if (!Format.Equals(TEXT("json"), ESearchCase::IgnoreCase) && !Format.Equals(TEXT("markdown"), ESearchCase::IgnoreCase))
+	{
+		return ErrorJson(TEXT("format must be json or markdown"));
+	}
+	FSQLiteDatabase Db;
+	FString OpenErr;
+	if (!OpenIndex(Db, OpenErr)) { return ErrorJson(OpenErr); }
+	ON_SCOPE_EXIT { Db.Close(); };
+	const FString Id = ResolveEntityIdOrPath(Db, IdOrPath);
+	if (Id.IsEmpty()) { return NotFoundEnvelope(Db, IdOrPath); }
+	const TSharedPtr<FJsonObject> Entity = LoadEntity(Db, Id);
+	if (!Entity.IsValid()) { return NotFoundEnvelope(Db, IdOrPath); }
+	const FString Kind = Entity->GetStringField(TEXT("kind"));
+	if (!Kind.Contains(TEXT("blueprint"), ESearchCase::IgnoreCase))
+	{
+		return ErrorJson(FString::Printf(TEXT("entity is not a Blueprint: %s (%s)"), *Id, *Kind));
+	}
+
+	struct FChunkOut { FString Id; FString Kind; FString Text; };
+	TArray<FChunkOut> Chunks;
+	FSQLitePreparedStatement Stmt = Db.PrepareStatement(TEXT(
+		"WITH RECURSIVE tree(id) AS (SELECT ?1 UNION SELECT e.id FROM entities e JOIN tree t ON e.parent=t.id) "
+		"SELECT c.id,c.kind,c.text FROM chunks c JOIN tree t ON t.id=c.entity_id "
+		"ORDER BY CASE c.kind WHEN 'recipe-summary' THEN 0 WHEN 'bp-pseudocode' THEN 1 ELSE 2 END,c.id"));
+	if (Stmt.IsValid())
+	{
+		Stmt.SetBindingValueByIndex(1, Id);
+		while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+		{
+			Chunks.Add({ ColStr(Stmt, TEXT("id")), ColStr(Stmt, TEXT("kind")), ColStr(Stmt, TEXT("text")) });
+		}
+	}
+	const int32 Budget = FMath::Max(512, MaxChars);
+	const FString Detail = DetailLevel.ToLower();
+	TArray<TSharedPtr<FJsonValue>> ChunkJson;
+	for (const FChunkOut& Chunk : Chunks)
+	{
+		if (Detail == TEXT("summary") && Chunk.Kind != TEXT("recipe-summary")) { continue; }
+		if (Detail == TEXT("logic") && Chunk.Kind != TEXT("recipe-summary") && Chunk.Kind != TEXT("bp-pseudocode")) { continue; }
+		TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
+		Object->SetStringField(TEXT("id"), Chunk.Id);
+		Object->SetStringField(TEXT("kind"), Chunk.Kind);
+		Object->SetStringField(TEXT("text"), Detail == TEXT("summary") ? Chunk.Text.Left(1200) : Chunk.Text);
+		ChunkJson.Add(MakeShared<FJsonValueObject>(Object));
+	}
+	TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetObjectField(TEXT("entity"), CompactEntity(Entity.ToSharedRef(), Detail != TEXT("full")));
+	Result->SetStringField(TEXT("detailLevel"), Detail);
+	Result->SetStringField(TEXT("format"), Format.ToLower());
+	Result->SetArrayField(TEXT("chunks"), ChunkJson);
+	Result->SetNumberField(TEXT("totalChunks"), ChunkJson.Num());
+	TSharedRef<FJsonObject> BudgetInfo = MakeShared<FJsonObject>();
+	BudgetInfo->SetNumberField(TEXT("maxChars"), Budget);
+	Result->SetObjectField(TEXT("budget"), BudgetInfo);
+	const int32 EligibleChunks = ChunkJson.Num();
+	auto Render = [&]() -> FString
+	{
+		BudgetInfo->SetNumberField(TEXT("includedChunks"), ChunkJson.Num());
+		BudgetInfo->SetNumberField(TEXT("omittedChunks"), EligibleChunks - ChunkJson.Num());
+		BudgetInfo->SetBoolField(TEXT("truncated"), ChunkJson.Num() < EligibleChunks);
+		if (!Format.Equals(TEXT("markdown"), ESearchCase::IgnoreCase))
+		{
+			return Envelope(Db, MakeShared<FJsonValueObject>(Result));
+		}
+		FString Markdown = FString::Printf(TEXT("# %s\n\n- ID: `%s`\n- Kind: `%s`\n\n"),
+			*Entity->GetStringField(TEXT("name")), *Id, *Kind);
+		for (const TSharedPtr<FJsonValue>& Value : ChunkJson)
+		{
+			const TSharedPtr<FJsonObject> Chunk = Value->AsObject();
+			Markdown += FString::Printf(TEXT("## %s\n\n%s\n\n"), *Chunk->GetStringField(TEXT("kind")), *Chunk->GetStringField(TEXT("text")));
+		}
+		TSharedRef<FJsonObject> MarkdownResult = MakeShared<FJsonObject>();
+		MarkdownResult->SetStringField(TEXT("format"), TEXT("markdown"));
+		MarkdownResult->SetStringField(TEXT("entityId"), Id);
+		MarkdownResult->SetStringField(TEXT("content"), Markdown);
+		MarkdownResult->SetObjectField(TEXT("budget"), BudgetInfo);
+		return Envelope(Db, MakeShared<FJsonValueObject>(MarkdownResult));
+	};
+	FString Output = Render();
+	while (Output.Len() > Budget && ChunkJson.Num() > 0)
+	{
+		ChunkJson.Pop(); Result->SetArrayField(TEXT("chunks"), ChunkJson);
+		Output = Render();
+	}
+	BudgetInfo->SetNumberField(TEXT("usedChars"), Output.Len());
+	Output = Render();
+	while (Output.Len() > Budget && ChunkJson.Num() > 0)
+	{
+		ChunkJson.Pop(); Result->SetArrayField(TEXT("chunks"), ChunkJson); Output = Render();
+	}
+	BudgetInfo->SetNumberField(TEXT("usedChars"), Output.Len());
+	Output = Render();
+	return Output.Len() <= Budget ? Output : ErrorJson(TEXT("max_chars is too small for the Blueprint response envelope"));
+}
+
+FString GameIQQuery::ExportGraph(const FString& TopicOrId, const FString& Format,
+	const FString& Direction, int32 Depth, const FString& EdgeTypesCsv, const FString& KindsCsv, int32 MaxNodes)
+{
+	FSQLiteDatabase Db;
+	FString OpenErr;
+	if (!OpenIndex(Db, OpenErr)) { return ErrorJson(OpenErr); }
+	ON_SCOPE_EXIT { Db.Close(); };
+	FString RootId = ResolveEntityIdOrPath(Db, TopicOrId);
+	if (RootId.IsEmpty())
+	{
+		const TArray<FSearchHit> Hits = BuildSearchHits(Db, TopicOrId, FString(), 1, 0);
+		if (Hits.Num() > 0) { RootId = Hits[0].Entity->GetStringField(TEXT("id")); }
+	}
+	if (RootId.IsEmpty()) { return NotFoundEnvelope(Db, TopicOrId); }
+
+	const TSet<FString> EdgeTypes = CsvSet(EdgeTypesCsv);
+	const TSet<FString> Kinds = CsvSet(KindsCsv);
+	const int32 NodeCap = FMath::Clamp(MaxNodes, 1, 500);
+	const int32 DepthCap = FMath::Clamp(Depth, 0, 8);
+	TMap<FString, int32> Seen;
+	TArray<FString> Queue;
+	Queue.Add(RootId);
+	Seen.Add(RootId, 0);
+	struct FGraphEdge { FString Src; FString Dst; FString Type; };
+	TMap<FString, FGraphEdge> Edges;
+	bool bTruncated = false;
+	for (int32 QueueIndex = 0; QueueIndex < Queue.Num(); ++QueueIndex)
+	{
+		const FString Current = Queue[QueueIndex];
+		const int32 CurrentDepth = Seen.FindChecked(Current);
+		if (CurrentDepth >= DepthCap) { continue; }
+		FSQLitePreparedStatement Stmt = Db.PrepareStatement(TEXT(
+			"SELECT src,dst,type FROM edges WHERE ((?2 IN ('out','both') AND src=?1) OR "
+			"(?2 IN ('in','both') AND dst=?1)) ORDER BY type,src,dst"));
+		if (!Stmt.IsValid()) { continue; }
+		Stmt.SetBindingValueByIndex(1, Current);
+		Stmt.SetBindingValueByIndex(2, Direction.IsEmpty() ? TEXT("both") : Direction.ToLower());
+		while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+		{
+			FGraphEdge Edge{ ColStr(Stmt, TEXT("src")), ColStr(Stmt, TEXT("dst")), ColStr(Stmt, TEXT("type")) };
+			if (!Allowed(EdgeTypes, Edge.Type)) { continue; }
+			const FString Other = Edge.Src == Current ? Edge.Dst : Edge.Src;
+			const TSharedPtr<FJsonObject> OtherEntity = LoadEntity(Db, Other);
+			if ((!OtherEntity.IsValid() && Kinds.Num() > 0) ||
+				(OtherEntity.IsValid() && !Allowed(Kinds, OtherEntity->GetStringField(TEXT("kind"))))) { continue; }
+			if (!Seen.Contains(Other))
+			{
+				if (Seen.Num() >= NodeCap) { bTruncated = true; continue; }
+				Seen.Add(Other, CurrentDepth + 1);
+				Queue.Add(Other);
+			}
+			if (Seen.Contains(Edge.Src) && Seen.Contains(Edge.Dst))
+			{
+				Edges.Add(Edge.Src + TEXT("\x1f") + Edge.Dst + TEXT("\x1f") + Edge.Type, Edge);
+			}
+		}
+	}
+
+	TArray<FString> NodeIds;
+	Seen.GetKeys(NodeIds);
+	NodeIds.Sort();
+	TArray<FString> EdgeKeys;
+	Edges.GetKeys(EdgeKeys);
+	EdgeKeys.Sort();
+	TMap<FString, FString> Symbols;
+	TArray<TSharedPtr<FJsonValue>> NodesJson, EdgesJson;
+	for (int32 Index = 0; Index < NodeIds.Num(); ++Index)
+	{
+		Symbols.Add(NodeIds[Index], FString::Printf(TEXT("n%d"), Index));
+		const TSharedPtr<FJsonObject> Entity = LoadEntity(Db, NodeIds[Index]);
+		TSharedRef<FJsonObject> Node = MakeShared<FJsonObject>();
+		Node->SetStringField(TEXT("id"), NodeIds[Index]);
+		Node->SetStringField(TEXT("symbol"), Symbols.FindChecked(NodeIds[Index]));
+		Node->SetStringField(TEXT("name"), Entity.IsValid() ? Entity->GetStringField(TEXT("name")) : NodeIds[Index]);
+		Node->SetStringField(TEXT("kind"), Entity.IsValid() ? Entity->GetStringField(TEXT("kind")) : TEXT("unknown"));
+		NodesJson.Add(MakeShared<FJsonValueObject>(Node));
+	}
+	for (const FString& Key : EdgeKeys)
+	{
+		const FGraphEdge& Edge = Edges.FindChecked(Key);
+		TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
+		Object->SetStringField(TEXT("src"), Edge.Src);
+		Object->SetStringField(TEXT("dst"), Edge.Dst);
+		Object->SetStringField(TEXT("type"), Edge.Type);
+		EdgesJson.Add(MakeShared<FJsonValueObject>(Object));
+	}
+
+	FString Content;
+	if (Format.Equals(TEXT("mermaid"), ESearchCase::IgnoreCase))
+	{
+		Content = TEXT("graph LR\n");
+		for (const TSharedPtr<FJsonValue>& Value : NodesJson)
+		{
+			const TSharedPtr<FJsonObject> Node = Value->AsObject();
+			Content += FString::Printf(TEXT("  %s[\"%s\"]\n"), *Node->GetStringField(TEXT("symbol")),
+				*GraphEscape(Node->GetStringField(TEXT("name"))));
+		}
+		for (const FString& Key : EdgeKeys)
+		{
+			const FGraphEdge& Edge = Edges.FindChecked(Key);
+			Content += FString::Printf(TEXT("  %s -->|%s| %s\n"), *Symbols.FindChecked(Edge.Src),
+				*GraphEscape(Edge.Type), *Symbols.FindChecked(Edge.Dst));
+		}
+	}
+	else if (Format.Equals(TEXT("dot"), ESearchCase::IgnoreCase) || Format.Equals(TEXT("graphviz"), ESearchCase::IgnoreCase))
+	{
+		Content = TEXT("digraph GameIQ {\n");
+		for (const TSharedPtr<FJsonValue>& Value : NodesJson)
+		{
+			const TSharedPtr<FJsonObject> Node = Value->AsObject();
+			Content += FString::Printf(TEXT("  %s [label=\"%s\"];\n"), *Node->GetStringField(TEXT("symbol")),
+				*GraphEscape(Node->GetStringField(TEXT("name"))));
+		}
+		for (const FString& Key : EdgeKeys)
+		{
+			const FGraphEdge& Edge = Edges.FindChecked(Key);
+			Content += FString::Printf(TEXT("  %s -> %s [label=\"%s\"];\n"), *Symbols.FindChecked(Edge.Src),
+				*Symbols.FindChecked(Edge.Dst), *GraphEscape(Edge.Type));
+		}
+		Content += TEXT("}\n");
+	}
+	TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("rootId"), RootId);
+	Result->SetStringField(TEXT("format"), Format.ToLower());
+	Result->SetArrayField(TEXT("nodes"), NodesJson);
+	Result->SetArrayField(TEXT("edges"), EdgesJson);
+	if (!Content.IsEmpty()) { Result->SetStringField(TEXT("content"), Content); }
+	Result->SetBoolField(TEXT("truncated"), bTruncated);
+	Result->SetNumberField(TEXT("nodeCount"), NodesJson.Num());
+	Result->SetNumberField(TEXT("edgeCount"), EdgesJson.Num());
+	Result->SetNumberField(TEXT("maxNodes"), NodeCap);
+	Result->SetStringField(TEXT("provenance"), TEXT("GameIQ indexed entity and relationship graph"));
+	return Envelope(Db, MakeShared<FJsonValueObject>(Result));
 }
 
 FString GameIQQuery::ProjectStats(const FString& Facet)

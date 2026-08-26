@@ -28,7 +28,11 @@ Python signatures (defaults apply — a bare `search("query")` searches all kind
   substring-matches the child class, so `children(map_id, "Light")` lists every light in a level
 - `references(id, direction="both", depth=1, edge_type="", kind="", offset=0)` — graph walk
 - `impact(id, limit=200)` — transitive inbound dependents ranked by severity
-- `explain(topic)` — context bundle: top hits plus their graph neighborhood
+- `explain(topic, detail_level="standard", max_chars=40000, kinds="", depth=1, format="json")` — bounded context pack
+- `get_blueprint_context(id_or_path, detail_level="logic", max_chars=40000, format="json")` — compact BP export
+- `export_graph(topic_or_id, format="mermaid", direction="both", depth=1, edge_types="", kinds="", max_nodes=50)`
+- `create_snapshot(name, metadata_json="{}")`, `list_snapshots(limit=50)`, `delete_snapshot(id)`
+- `changes(since_snapshot, until_snapshot="current", kind="", path_prefix="", limit=200, offset=0)`
 - `project_stats(facet="overview")` — facets: `overview`, `kinds`, `edges`, `unused`, `largest-deps`, `authority`, `doc-types`
 - `drift()` — doc-stated `property = value` claims that contradict the extracted implementation
 - `coverage(doc_type="")` — which stated design intent is backed by a real implementation
@@ -36,7 +40,8 @@ Python signatures (defaults apply — a bare `search("query")` searches all kind
 
 **Via MCP `call_tool` or `unreal.ToolsetRegistry.execute_tool`** the toolset name is
 `GameIQ.GameIQService` (tools: `Search`, `GetEntity`, `Children`, `References`, `Impact`, `Explain`,
-`ProjectStats`, `Drift`, `Coverage`, `Doctor`). At this layer `Search` **requires** `kind` (pass `""`
+`GetBlueprintContext`, `ExportGraph`, snapshot tools, `Changes`, `ProjectStats`, `Drift`, `Coverage`,
+`Doctor`). At this layer `Search` **requires** `kind` (pass `""`
 for all kinds) and `References` requires `edgeType` + `kind`. Results arrive as
 `{"returnValue": "<json string>"}` — parse twice:
 
@@ -85,6 +90,14 @@ Grep, Glob, `list_assets`, or the Content Browser:
   not modeled — the response carries a `note` saying so on `cpp:*` ids). Treat missing C++ callers
   as "unknown", not "none": for exhaustive C++ flow tracing, follow up with a grep of `Source/`.
 - For a fuller system summary, use `explain` (new to a system, "how does X work here").
+- Prefer a bounded `explain(..., max_chars=..., format="markdown")` or
+  `get_blueprint_context(...)` pack when context must be reused; repeated broad search/detail calls
+  cost more round trips and tokens.
+- For an architecture map, call `export_graph(topic_or_id, "mermaid", ..., max_nodes)`; the node ids
+  and ordering are deterministic, so the artifact diffs cleanly.
+- For unattended work, `create_snapshot` before changes and `changes(snapshot_id, "current", ...)`
+  after saved/indexed changes. Attach the result to the VibeUE run journal, then delete the snapshot
+  when its review window is over.
 - For project-level health or unused-asset questions, use `project_stats` (`"unused"` before a
   cleanup pass, `"largest-deps"` for coupling hot-spots).
 - After editing design docs — or before claiming code matches a doc — use `drift` and `coverage`.

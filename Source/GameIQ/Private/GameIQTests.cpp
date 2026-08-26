@@ -5,6 +5,7 @@
 #include "GameIQCppParse.h"
 #include "GameIQDocText.h"
 #include "GameIQQuery.h"
+#include "GameIQSnapshots.h"
 #include "GameIQStore.h"
 #include "GameIQTextUtil.h"
 #include "HAL/FileManager.h"
@@ -777,6 +778,194 @@ bool FGameIQQueryIdResolutionTest::RunTest(const FString& Parameters)
 		if (!TestTrue(TEXT("didYouMean present"), (*Obj)->TryGetArrayField(TEXT("didYouMean"), Suggestions))) { return false; }
 		TestTrue(TEXT("suggests a real id"), Suggestions->Num() >= 1);
 	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGameIQContextBudgetTest, "GameIQ.Query.ContextBudgetAndBlueprintExport",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGameIQContextBudgetTest::RunTest(const FString& Parameters)
+{
+	using namespace GameIQTestUtil;
+	const FString DbPath = TempDbPath(TEXT("context.db"));
+	FGameIQStore Store;
+	if (!TestTrue(TEXT("open"), Store.OpenAtPath(DbPath))) { return false; }
+	Store.IngestProducer(TEXT("test"),
+		{
+			Entity(TEXT("asset:/Game/Test/BP_Combat"), TEXT("blueprint"), TEXT("BP_Combat"), nullptr, TEXT("/Game/Test/BP_Combat")),
+			Entity(TEXT("asset:/Game/Test/BP_Combat::fn::Fire"), TEXT("bp-function"), TEXT("Fire"), TEXT("asset:/Game/Test/BP_Combat")),
+			Entity(TEXT("asset:/Game/Test/W_Rifle"), TEXT("asset"), TEXT("W_Rifle")),
+		},
+		{ Edge(TEXT("asset:/Game/Test/BP_Combat"), TEXT("asset:/Game/Test/W_Rifle"), TEXT("references")) },
+		{
+			Chunk(TEXT("combat-summary"), TEXT("asset:/Game/Test/BP_Combat"), TEXT("combat weapon firing reload blueprint")),
+			Chunk(TEXT("fire-logic"), TEXT("asset:/Game/Test/BP_Combat::fn::Fire"), TEXT("Fire checks ammo then spawns projectile and decrements ammo")),
+			Chunk(TEXT("rifle-summary"), TEXT("asset:/Game/Test/W_Rifle"), TEXT("combat weapon rifle asset")),
+		});
+	Store.Close();
+	GameIQQuery::SetDbPathOverrideForTests(DbPath);
+	ON_SCOPE_EXIT { GameIQQuery::SetDbPathOverrideForTests(FString()); };
+
+	const FString Explain = GameIQQuery::Explain(TEXT("combat weapon"), 8, TEXT("summary"), 1200,
+		TEXT("blueprint"), 1, TEXT("json"));
+	TestTrue(TEXT("Explain honors exact character budget"), Explain.Len() <= 1200);
+	const TSharedPtr<FJsonValue> ExplainResult = ParseResult(Explain);
+	const TSharedPtr<FJsonObject>* ExplainObject = nullptr;
+	if (!TestTrue(TEXT("Explain returns an object"), ExplainResult.IsValid() && ExplainResult->TryGetObject(ExplainObject))) { return false; }
+	const TArray<TSharedPtr<FJsonValue>>* Seeds = nullptr;
+	if (!TestTrue(TEXT("Explain returns seeds"), (*ExplainObject)->TryGetArrayField(TEXT("seeds"), Seeds))) { return false; }
+	for (const TSharedPtr<FJsonValue>& Seed : *Seeds)
+	{
+		TestEqual(TEXT("kind filter is respected"), Seed->AsObject()->GetStringField(TEXT("kind")), FString(TEXT("blueprint")));
+	}
+
+	const FString Blueprint = GameIQQuery::GetBlueprintContext(TEXT("/Game/Test/BP_Combat"), TEXT("logic"), 1800, TEXT("json"));
+	TestTrue(TEXT("Blueprint export honors budget"), Blueprint.Len() <= 1800);
+	const TSharedPtr<FJsonValue> BlueprintResult = ParseResult(Blueprint);
+	const TSharedPtr<FJsonObject>* BlueprintObject = nullptr;
+	if (!TestTrue(TEXT("Blueprint payload"), BlueprintResult.IsValid() && BlueprintResult->TryGetObject(BlueprintObject))) { return false; }
+	TestEqual(TEXT("Blueprint path resolves"), (*BlueprintObject)->GetObjectField(TEXT("entity"))->GetStringField(TEXT("id")),
+		FString(TEXT("asset:/Game/Test/BP_Combat")));
+	TestTrue(TEXT("Blueprint logic chunks included"), (*BlueprintObject)->GetNumberField(TEXT("totalChunks")) >= 2);
+	const FString Markdown = GameIQQuery::Explain(TEXT("combat weapon"), 8, TEXT("standard"), 1400,
+		FString(), 1, TEXT("markdown"));
+	TestTrue(TEXT("Markdown Explain honors budget"), Markdown.Len() <= 1400);
+	TestTrue(TEXT("Markdown Explain renders content"), Markdown.Contains(TEXT("# GameIQ context")));
+	const FString BlueprintMarkdown = GameIQQuery::GetBlueprintContext(TEXT("asset:/Game/Test/BP_Combat"),
+		TEXT("logic"), 1800, TEXT("markdown"));
+	TestTrue(TEXT("Blueprint Markdown honors budget"), BlueprintMarkdown.Len() <= 1800);
+	TestTrue(TEXT("Blueprint Markdown renders content"), BlueprintMarkdown.Contains(TEXT("# BP_Combat")));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGameIQGraphExportTest, "GameIQ.Query.DeterministicGraphExport",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGameIQGraphExportTest::RunTest(const FString& Parameters)
+{
+	using namespace GameIQTestUtil;
+	const FString DbPath = TempDbPath(TEXT("graph.db"));
+	FGameIQStore Store;
+	if (!TestTrue(TEXT("open"), Store.OpenAtPath(DbPath))) { return false; }
+	Store.IngestProducer(TEXT("test"),
+		{
+			Entity(TEXT("asset:/Game/A"), TEXT("blueprint"), TEXT("A")),
+			Entity(TEXT("asset:/Game/B"), TEXT("blueprint"), TEXT("B")),
+			Entity(TEXT("asset:/Game/C"), TEXT("asset"), TEXT("C")),
+			Entity(TEXT("cpp:CombatComponent"), TEXT("cpp-class"), TEXT("CombatComponent"), nullptr, TEXT("Source/CombatComponent.h")),
+		},
+		{
+			Edge(TEXT("asset:/Game/A"), TEXT("asset:/Game/B"), TEXT("calls")),
+			Edge(TEXT("asset:/Game/B"), TEXT("asset:/Game/A"), TEXT("calls")),
+			Edge(TEXT("asset:/Game/B"), TEXT("asset:/Game/C"), TEXT("references")),
+			Edge(TEXT("asset:/Game/A"), TEXT("cpp:CombatComponent"), TEXT("inherits")),
+			Edge(TEXT("asset:/Game/A"), TEXT("external:CombatService"), TEXT("calls")),
+		}, {});
+	Store.Close();
+	GameIQQuery::SetDbPathOverrideForTests(DbPath);
+	ON_SCOPE_EXIT { GameIQQuery::SetDbPathOverrideForTests(FString()); };
+
+	const FString Mermaid = GameIQQuery::ExportGraph(TEXT("asset:/Game/A"), TEXT("mermaid"), TEXT("out"), 3,
+		TEXT("calls"), TEXT("blueprint"), 10);
+	TestEqual(TEXT("export is deterministic"), Mermaid, GameIQQuery::ExportGraph(TEXT("asset:/Game/A"), TEXT("mermaid"),
+		TEXT("out"), 3, TEXT("calls"), TEXT("blueprint"), 10));
+	TestTrue(TEXT("Mermaid emitted"), Mermaid.Contains(TEXT("graph LR")) && Mermaid.Contains(TEXT("-->|calls|")));
+	const FString Dot = GameIQQuery::ExportGraph(TEXT("asset:/Game/A"), TEXT("dot"), TEXT("both"), 2,
+		FString(), FString(), 2);
+	TestTrue(TEXT("DOT emitted"), Dot.Contains(TEXT("digraph GameIQ")));
+	const TSharedPtr<FJsonValue> CappedResult = ParseResult(Dot);
+	const TSharedPtr<FJsonObject>* CappedObject = nullptr;
+	if (!TestTrue(TEXT("capped graph payload"), CappedResult.IsValid() && CappedResult->TryGetObject(CappedObject))) { return false; }
+	TestEqual(TEXT("node cap respected"), (*CappedObject)->GetArrayField(TEXT("nodes")).Num(), 2);
+	const FString JsonGraph = GameIQQuery::ExportGraph(TEXT("asset:/Game/A"), TEXT("json"), TEXT("both"), 2,
+		FString(), FString(), 10);
+	TestTrue(TEXT("mixed Blueprint/C++/asset graph exported"), JsonGraph.Contains(TEXT("cpp:CombatComponent")) &&
+		JsonGraph.Contains(TEXT("asset:/Game/C")));
+	TestTrue(TEXT("unknown external target retained"), JsonGraph.Contains(TEXT("external:CombatService")) &&
+		JsonGraph.Contains(TEXT("unknown")));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGameIQSnapshotChangesTest, "GameIQ.Snapshots.SemanticChanges",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGameIQSnapshotChangesTest::RunTest(const FString& Parameters)
+{
+	using namespace GameIQTestUtil;
+	const FString DbPath = TempDbPath(TEXT("snapshots.db"));
+	FGameIQStore Store;
+	if (!TestTrue(TEXT("open"), Store.OpenAtPath(DbPath))) { return false; }
+	const TSharedPtr<FJsonValue> RemovedEntity = Entity(TEXT("asset:/Game/Test/RemovedAsset"), TEXT("asset"),
+		TEXT("RemovedAsset"), nullptr, TEXT("/Game/Test/RemovedAsset"));
+	RemovedEntity->AsObject()->SetStringField(TEXT("summary"), TEXT("exists only before the run"));
+	const TSharedPtr<FJsonValue> OldVariable = Entity(TEXT("asset:/Game/Test/BP_Same::var::Ammo"), TEXT("bp-variable"),
+		TEXT("Ammo"), TEXT("asset:/Game/Test/BP_Same"));
+	TSharedRef<FJsonObject> OldVariableDetail = MakeShared<FJsonObject>();
+	OldVariableDetail->SetStringField(TEXT("default"), TEXT("10"));
+	OldVariable->AsObject()->SetObjectField(TEXT("detail"), OldVariableDetail);
+	Store.IngestProducer(TEXT("test"),
+		{
+			Entity(TEXT("asset:/Game/Test/BP_Old"), TEXT("blueprint"), TEXT("BP_Old"), nullptr, TEXT("/Game/Test/BP_Old")),
+			Entity(TEXT("asset:/Game/Test/BP_Same"), TEXT("blueprint"), TEXT("BP_Same"), nullptr, TEXT("/Game/Test/BP_Same")),
+			OldVariable,
+			Entity(TEXT("asset:/Game/Test/BP_Same::component::Mesh"), TEXT("bp-component"), TEXT("Mesh"), TEXT("asset:/Game/Test/BP_Same")),
+			RemovedEntity,
+		},
+		{}, { Chunk(TEXT("logic"), TEXT("asset:/Game/Test/BP_Old"), TEXT("old blueprint logic")) });
+	Store.Close();
+	GameIQQuery::SetDbPathOverrideForTests(DbPath);
+	ON_SCOPE_EXIT { GameIQQuery::SetDbPathOverrideForTests(FString()); };
+
+	const TSharedPtr<FJsonValue> SnapshotResult = ParseResult(GameIQSnapshots::Create(TEXT("before"), TEXT("{\"run\":\"automation\"}")));
+	const TSharedPtr<FJsonObject>* SnapshotObject = nullptr;
+	if (!TestTrue(TEXT("snapshot created"), SnapshotResult.IsValid() && SnapshotResult->TryGetObject(SnapshotObject))) { return false; }
+	const FString SnapshotId = (*SnapshotObject)->GetStringField(TEXT("id"));
+
+	if (!TestTrue(TEXT("re-open"), Store.OpenAtPath(DbPath))) { return false; }
+	const TSharedPtr<FJsonValue> CreatedEntity = Entity(TEXT("asset:/Game/Test/NewAsset"), TEXT("asset"), TEXT("NewAsset"));
+	CreatedEntity->AsObject()->SetStringField(TEXT("summary"), TEXT("exists only after the run"));
+	const TSharedPtr<FJsonValue> NewVariable = Entity(TEXT("asset:/Game/Test/BP_Same::var::Ammo"), TEXT("bp-variable"),
+		TEXT("Ammo"), TEXT("asset:/Game/Test/BP_Same"));
+	TSharedRef<FJsonObject> NewVariableDetail = MakeShared<FJsonObject>();
+	NewVariableDetail->SetStringField(TEXT("default"), TEXT("20"));
+	NewVariable->AsObject()->SetObjectField(TEXT("detail"), NewVariableDetail);
+	Store.IngestProducer(TEXT("test"),
+		{
+			Entity(TEXT("asset:/Game/Test/BP_New"), TEXT("blueprint"), TEXT("BP_New"), nullptr, TEXT("/Game/Test/BP_New")),
+			Entity(TEXT("asset:/Game/Test/BP_Same"), TEXT("blueprint"), TEXT("BP_Same"), nullptr, TEXT("/Game/Test/BP_Same")),
+			NewVariable,
+			Entity(TEXT("asset:/Game/Test/BP_Same::fn::Reload"), TEXT("bp-function"), TEXT("Reload"), TEXT("asset:/Game/Test/BP_Same")),
+			CreatedEntity,
+		},
+		{ Edge(TEXT("asset:/Game/Test/BP_New"), TEXT("asset:/Game/Test/NewAsset"), TEXT("references")) },
+		{ Chunk(TEXT("logic"), TEXT("asset:/Game/Test/BP_New"), TEXT("new blueprint logic")) });
+	Store.Close();
+	const TSharedPtr<FJsonValue> ChangesResult = ParseResult(GameIQSnapshots::Changes(SnapshotId, TEXT("current"),
+		FString(), FString(), 50, 0));
+	const TSharedPtr<FJsonObject>* ChangesObject = nullptr;
+	if (!TestTrue(TEXT("changes payload"), ChangesResult.IsValid() && ChangesResult->TryGetObject(ChangesObject))) { return false; }
+	const TArray<TSharedPtr<FJsonValue>>& Changes = (*ChangesObject)->GetArrayField(TEXT("changes"));
+	bool bRename = false, bCreated = false, bDeleted = false, bRelationship = false, bLogic = false;
+	bool bVariableChanged = false, bComponentDeleted = false, bFunctionCreated = false;
+	for (const TSharedPtr<FJsonValue>& Change : Changes)
+	{
+		const FString Type = Change->AsObject()->GetStringField(TEXT("type"));
+		bRename |= Type == TEXT("renamed"); bCreated |= Type == TEXT("created");
+		bDeleted |= Type == TEXT("deleted"); bLogic |= Type == TEXT("blueprint-logic-changed");
+		bRelationship |= Type == TEXT("relationship-added");
+		bVariableChanged |= Type == TEXT("blueprint-variable-changed");
+		bComponentDeleted |= Type == TEXT("blueprint-component-deleted");
+		bFunctionCreated |= Type == TEXT("blueprint-function-created");
+	}
+	TestTrue(TEXT("rename detected"), bRename);
+	TestTrue(TEXT("creation detected"), bCreated);
+	TestTrue(TEXT("deletion detected"), bDeleted);
+	TestTrue(TEXT("relationship detected"), bRelationship);
+	TestTrue(TEXT("Blueprint logic change detected"), bLogic);
+	TestTrue(TEXT("Blueprint variable/default change is semantic"), bVariableChanged);
+	TestTrue(TEXT("Blueprint component deletion is semantic"), bComponentDeleted);
+	TestTrue(TEXT("Blueprint function creation is semantic"), bFunctionCreated);
+	const TSharedPtr<FJsonValue> RemovedResult = ParseResult(GameIQSnapshots::Remove(SnapshotId));
+	const TSharedPtr<FJsonObject>* RemovedObject = nullptr;
+	TestTrue(TEXT("snapshot can be removed"), RemovedResult.IsValid() && RemovedResult->TryGetObject(RemovedObject) &&
+		(*RemovedObject)->GetBoolField(TEXT("removed")));
 	return true;
 }
 

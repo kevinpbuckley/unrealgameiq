@@ -57,10 +57,42 @@ public:
 	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "GameIQ")
 	static FString Impact(const FString& Id, int32 Limit = 200);
 
-	/** Assemble a context bundle for a topic/system: top search hits plus their immediate graph
-	 *  neighborhood. Returns a JSON string. */
+	/** Assemble a bounded context bundle for a topic/system. `DetailLevel` is summary, standard,
+	 *  or full; `Kinds` is a comma-separated allow-list; `Format` is json or markdown. The minimum
+	 *  accepted `MaxChars` is 512 so the provenance/error envelope remains honest. */
 	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "GameIQ")
-	static FString Explain(const FString& Topic);
+	static FString Explain(const FString& Topic, const FString& DetailLevel = TEXT("standard"),
+		int32 MaxChars = 40000, const FString& Kinds = TEXT(""), int32 Depth = 1,
+		const FString& Format = TEXT("json"));
+
+	/** Export one Blueprint's compact context by GameIQ id or /Game path. */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "GameIQ")
+	static FString GetBlueprintContext(const FString& IdOrPath, const FString& DetailLevel = TEXT("logic"),
+		int32 MaxChars = 40000, const FString& Format = TEXT("json"));
+
+	/** Export a bounded project graph as Mermaid, Graphviz DOT, or structured JSON. */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "GameIQ")
+	static FString ExportGraph(const FString& TopicOrId, const FString& Format = TEXT("mermaid"),
+		const FString& Direction = TEXT("both"), int32 Depth = 1,
+		const FString& EdgeTypes = TEXT(""), const FString& Kinds = TEXT(""), int32 MaxNodes = 50);
+
+	/** Create a consistent named local snapshot of the index. `MetadataJson` must be an object. */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "GameIQ")
+	static FString CreateSnapshot(const FString& Name, const FString& MetadataJson = TEXT("{}"));
+
+	/** List local snapshots, newest first. */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "GameIQ")
+	static FString ListSnapshots(int32 Limit = 50);
+
+	/** Remove one local snapshot by id. */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "GameIQ")
+	static FString DeleteSnapshot(const FString& Id);
+
+	/** Semantic entity/edge/chunk changes between snapshots, or a snapshot and "current". */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "GameIQ")
+	static FString Changes(const FString& SinceSnapshot, const FString& UntilSnapshot = TEXT("current"),
+		const FString& Kind = TEXT(""), const FString& PathPrefix = TEXT(""),
+		int32 Limit = 200, int32 Offset = 0);
 
 	/** Project-wide stats. `Facet` is "overview", "kinds", "edges", "unused", "largest-deps",
 	 *  "authority" (extracted-fact vs stated-intent), or "doc-types". Returns a JSON string. */

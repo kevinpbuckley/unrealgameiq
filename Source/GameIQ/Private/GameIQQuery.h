@@ -42,8 +42,23 @@ namespace GameIQQuery
 	 *  Capped at `Limit` rows; full byKind counts always reported. */
 	FString Impact(const FString& Id, int32 MaxDepth = 4, int32 Limit = 200);
 
-	/** Assembled bundle for a topic: top search hits + their immediate neighborhood. */
-	FString Explain(const FString& Topic, int32 Limit = 8);
+	/** Assembled, character-budgeted bundle for a topic. `KindsCsv` optionally restricts entity
+	 *  kinds; `Format` is "json" or "markdown". */
+	FString Explain(const FString& Topic, int32 Limit = 8, const FString& DetailLevel = TEXT("standard"),
+		int32 MaxChars = 40000, const FString& KindsCsv = TEXT(""), int32 Depth = 1,
+		const FString& Format = TEXT("json"));
+
+	/** One-call Blueprint context export by entity id or /Game asset path. */
+	FString GetBlueprintContext(const FString& IdOrPath, const FString& DetailLevel = TEXT("logic"),
+		int32 MaxChars = 40000, const FString& Format = TEXT("json"));
+
+	/** Deterministic bounded graph export from an entity id/path or Explain-style topic. */
+	FString ExportGraph(const FString& TopicOrId, const FString& Format = TEXT("mermaid"),
+		const FString& Direction = TEXT("both"), int32 Depth = 1,
+		const FString& EdgeTypesCsv = TEXT(""), const FString& KindsCsv = TEXT(""), int32 MaxNodes = 50);
+
+	/** Absolute index path used by query-adjacent services (snapshots/export). Honors the test override. */
+	FString GetDbPathForServices();
 
 	/** Project-wide stats. Facet: "overview" | "kinds" | "edges" | "unused" | "largest-deps". */
 	FString ProjectStats(const FString& Facet);

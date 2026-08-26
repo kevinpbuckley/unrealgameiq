@@ -116,7 +116,7 @@ Data model — deliberately boring:
 - **`entities`** — one row per thing: any asset (mesh, material, texture, skeleton, level…), Blueprint, BP function/variable, material parameter, socket, level actor, C++ class/function/property, config section, plugin, **design-doc section**. Columns: id, kind, name, path, parent, **`source` (code / asset / config / doc — fact vs. intent)**, summary, raw JSON detail (the recipe output).
 - **`edges`** — typed relations: generic `references`/`depends-on` from the registry, plus semantic types from recipes: `inherits`, `calls`, `implements`, `uses-material`, `uses-texture`, `uses-skeleton`, `overrides-parameter`, `placed-in-level`, `plays-on`, `casts-to`. Typed edges are what turn "what references X" into "which *meshes* use this *skeleton*."
 - **`chunks`** — text units for retrieval (BP pseudocode per function, recipe summaries per asset, C++ signatures + doc comments, config blocks, ingested design-doc sections) with an **external-content FTS5 index** (`content='chunks'`, trigger-synced — no second copy of the text) using **porter stemming** ("reload" matches "Reloading"), a **prefix index** (`prefix='2 3'`), and an **`aux` column** of camelCase/underscore-split identifier tokens ("player" matches `BP_PlayerCharacter`) weighted below body text in bm25. Search runs AND-first, then OR, then prefix-OR — first tier with hits wins. Embedding vectors (small local model; pluggable) remain a future tier.
-- **`snapshots`** — index state per VCS revision (or timestamp), so "what changed since X" is a diff of two snapshots, with binary `.uasset` changes rendered as *semantic* diffs ("`BP_Enemy`: function `TakeDamage` modified — 3 nodes added; variable `Armor` default 50 → 75"). *(planned)*
+- **`snapshots`** — named, consistent SQLite index states with timestamps and caller metadata. `changes` compares entities, relationships, and indexed chunks, reporting Blueprint structure/logic changes and rename/move detection. Node-level graph diffs remain a future refinement.
 
 **Producer-scoped ingest.** Every entity/edge/chunk is tagged with the `producer` that emitted it (`gameiq-cpp`, `gameiq-ue-registry`, `gameiq-ue-assets`, `gameiq-ue-bp`, `gameiq-config`, …). Re-ingesting a producer replaces only *its own* rows, so producers compose without ordering assumptions or cross-clobbering — e.g. the registry owns a Blueprint's entity while the blueprints producer adds a structure chunk to it, and either can re-run independently. This is what makes the multi-producer, incrementally-refreshed model safe.
 
@@ -153,9 +153,9 @@ Two rules hold throughout:
 
 ## 6. Surfaces
 
-### 6.1 MCP server (the product's center of gravity)
+### 6.1 Native editor toolset (the product's center of gravity)
 
-`gameiq mcp` (stdio, local; same shape as the rest of the ecosystem). Following the UE Skills MCP v2 consolidation — **few tools, rich parameters** — this shipped as **one `game_iq` multi-action tool** (matching `unreal-engine-skills-manager`), keeping the tool count at one in agent contexts. Actions:
+Game IQ ships `UGameIQService`, an in-process UE 5.8 `UToolsetDefinition` exposed through Epic's native MCP endpoint and Python. There is no Node runtime or standalone stdio server. The current callable surface is:
 
 | Action | What it does |
 |---|---|
@@ -163,17 +163,21 @@ Two rules hold throughout:
 | `get_entity(id)` | Full detail: summary, chunks (BP pseudocode / recipe), edges, and child entities. **Bounded** — arrays capped with full `counts` + a `truncated` flag so a level with hundreds of actors stays usable. |
 | `references(id, direction, depth?, edgeType?, kind?)` | Who uses this / what it uses. `edgeType` filters the relation (`uses-skeleton`, `placed-in-level`, …); `kind` filters the result entity kind. |
 | `impact(id, limit?)` | Transitive "what could break if I change or delete this," severity-ranked by edge type — top-N rows plus full per-kind counts and a `truncated` flag (a hub asset no longer dumps thousands of entities). |
-| `explain(topic)` | Retrieval bundle for a system: seed hits + immediate neighborhood, pre-assembled context. |
+| `explain(topic, detailLevel, maxChars, kinds, depth, format)` | Strictly character-budgeted JSON/Markdown context pack. |
+| `get_blueprint_context(idOrPath, detailLevel, maxChars, format)` | Compact, prioritized Blueprint pseudocode/recipe export. |
+| `export_graph(topicOrId, format, direction, depth, edgeTypes, kinds, maxNodes)` | Deterministic Mermaid, DOT, or JSON graph. |
+| `create/list/delete_snapshot` | Named, consistent local SQLite snapshots with metadata. |
+| `changes(since, until, kind, pathPrefix, limit, offset)` | Semantic entity, Blueprint logic, and relationship changes. |
 | `project_stats(facet)` | Counts, unused-asset candidates, largest dependencies — the hygiene queries. |
 | `doctor()` | Index health: schema/tables check, row counts, per-producer breakdown, FTS consistency, freshness — distinguishes "empty project" from "broken index" before trusting empty results. |
 
 `search` and `references` take an `offset` for paging. Graph traversal (`references`/`impact`) runs as a single recursive CTE with the kind/edge-type filters pushed into SQL — the old C++ BFS prepared one edge query per visited node plus one entity load per neighbor.
 
-Every response carries an index-age stamp (design §8). `changes(since)` (semantic diff) is **planned** — pending snapshots (§5.2). The server is stdio and spawned on demand by the MCP client (`claude mcp add <name> -- node …/cli mcp --project <dir>`); user-scoped registrations should use an absolute `--project` path.
+Every query response carries an index-age stamp (design §8). Tool calls are served inside the running editor; headless extraction remains available through commandlets.
 
-### 6.2 CLI
+### 6.2 Commandlets and editor commands
 
-`gameiq index` (build/refresh), `gameiq watch`, `gameiq ask "..."`, `gameiq impact <asset>`, `gameiq changes --since <rev>`, `gameiq stats`. The CLI is also the CI entry point (index on the build machine; fail PRs that delete still-referenced assets).
+`GameIQBuild`, `GameIQIndex`, and the extractor commandlets provide the headless build surface. In-editor refreshes use `GameIQ.Rebuild`, `GameIQ.ReindexDocs`, and `GameIQ.ReindexCode`. Querying is currently editor-native; there is no standalone query CLI.
 
 ### 6.3 The ecosystem story
 
@@ -187,12 +191,12 @@ An agent task like "add fall damage" becomes: Game IQ `explain("damage")` → gr
 
 ### 6.4 Why not just VibeUE? (probe vs. index)
 
-VibeUE can already read a Blueprint, its references, and live diffs — so the fair challenge is "why is Game IQ not redundant?" The answer is that those are **point inspections against a live editor**: VibeUE is a *probe* (editor open, project loaded, you point it at one thing you already know). Game IQ is *persistent memory* — a precomputed graph + searchable corpus + history that answers with the editor closed. Same primitive ("read this asset"); opposite system. VibeUE inspects; Game IQ remembers and searches.
+VibeUE can already read a Blueprint, its references, and live diffs — so the fair challenge is "why is Game IQ not redundant?" Those are **point inspections against a live editor**: VibeUE is a *probe* (you point it at one thing you already know). Game IQ is *persistent memory* — a precomputed whole-project graph, searchable corpus, and local snapshot history. Queries are currently served by the open editor, while headless commandlets can build/refresh the index.
 
 Game IQ earns its existence **only** on the four axes a live probe is structurally bad at — and at least one must be in the MVP demo or the product has no reason to exist next to VibeUE:
 
 - **Scale** — "which of my 4,000 meshes use the deprecated skeleton?" is one indexed graph query, not thousands of sequential live reads.
-- **Availability** — answers at 2am, in CI, in a git hook, on a machine that never opened the editor.
+- **Availability after indexing** — the persisted index survives editor sessions and can be refreshed by CI/headless commandlets; the shipped query adapter still requires an open editor.
 - **Discovery** — "where is reload handled?" when you *don't* know the asset name (hybrid search over a corpus VibeUE doesn't have).
 - **History** — "what changed in combat since the milestone?" diffed against any VCS revision, offline.
 
@@ -202,9 +206,9 @@ Relationship, not rivalry: Game IQ does **not** reimplement VibeUE's live readin
 
 UE 5.8 ships (Experimental, `EditorOnly`, off by default) a **`ToolsetRegistry`** framework: you register a `UToolsetDefinition` subclass with static `UFUNCTION`s marked `meta=(AICallable)`, and it is surfaced on Epic's **native MCP endpoint** — reaching any agent already connected to the built-in UE MCP *or* VibeUE (which registers its own services into the same registry). This is the "AI Editor Toolset" path.
 
-**Decision (superseded — see update): Game IQ shipped as an all-C++ UE plugin; the Node core was removed.** The original design was a standalone Node/TypeScript core (CLI + stdio MCP + SQLite) with the plugin as one extraction backend. It was first extended with the toolset as a *second* front-end, then — once every capability was ported to C++ and verified at parity — the Node side was deleted entirely (2026-07). The whole pipeline now lives inside Unreal:
+**Historical architecture decision (2026-07): the Node core was removed.** The original design used a standalone Node/TypeScript core (CLI + stdio MCP + SQLite) with the plugin as one extraction backend. Once every capability was ported to C++ and verified at parity, the Node side was deleted. The current pipeline lives inside Unreal:
 
-- **Serve — native toolset `UGameIQService : UToolsetDefinition`** (the root-level GameIQ plugin, registered via `UToolsetRegistry::RegisterToolsetClass` on `PostEngineInit`) — zero-setup for anyone on the native UE MCP / VibeUE. Its `AICallable` functions — the full query surface: `Search`, `GetEntity`, `References`, `Impact`, `Explain`, `ProjectStats` — are answered **in-process** by the C++ query engine (`GameIQQuery`) reading `.gameiq/index.db` via UE's **SQLiteCore** (FTS5). No Node spawn, no per-call editor-API round-trips, so it returns project data faster than probing the editor with many calls. Verified live on ThirdPerson58 via `describe_toolset` and `call_tool`.
+- **Serve — native toolset `UGameIQService : UToolsetDefinition`** (the root-level GameIQ plugin, registered via `UToolsetRegistry::RegisterToolsetClass` on `PostEngineInit`) — zero-setup for anyone on the native UE MCP / VibeUE. Its `AICallable` functions cover search/detail, bounded context packs, Blueprint context, deterministic graph export, snapshots/changes, impact, statistics, coverage, drift, and health. They are answered **in-process** by the C++ query engine (`GameIQQuery`) reading `.gameiq/index.db` via UE's **SQLiteCore** (FTS5). No Node spawn or per-call editor-API round-trips.
 - **Build & update — `FGameIQStore`** (C++ store+ingest). The **save hook** patches the index directly on save/delete/rename (`FGameIQStore::Patch` — verified: a Blueprint variable value change reflects in the toolset immediately). The **`GameIQIndex` commandlet** ingests the extract JSONs (producer-scoped merge), and **`GameIQBuild`** runs every extractor + ingest in one editor boot. The full C++ build reproduces the old Node build exactly (2245 entities on ThirdPerson58).
 - **Editor-less extractors ported** — `GameIQConfig` (`.ini`/`.uproject`/`.uplugin`) and `GameIQCode` (C++ header reflection: UCLASS/USTRUCT/UINTERFACE + UFUNCTION/UPROPERTY, regex + brace-matching) are now commandlets. Entity ids and coverage match the former TS extractors byte-for-byte (config = 26 entities, same `config:<rel>#<section>` ids; `gameiq.config.json` excludes honored).
 - **DB journal:** rollback journal (`journal_mode=DELETE`) — and it turns out this is **forced, not chosen**: UE's SQLiteCore registers a custom VFS at **iVersion 1 with no shared-memory (xShm*) methods** (`SQLiteEmbeddedPlatform.cpp` — "we do not provide an implementation for shared memory"), so **`PRAGMA journal_mode=WAL` silently no-ops** under UE. (A 2026-07 attempt to switch to WAL discovered this: the pragma "succeeds" and the DB stays in legacy mode.) Cross-process contention (save hook vs. rebuild ingest vs. queries) is handled by `busy_timeout=3000` plus a bounded `BEGIN IMMEDIATE` retry loop in the store; writes are short transactions. `FSQLiteDatabase` asserts if destroyed while open, so every handle closes on all paths (`ON_SCOPE_EXIT`).
@@ -212,18 +216,20 @@ UE 5.8 ships (Experimental, `EditorOnly`, off by default) a **`ToolsetRegistry`*
 - **Trade-off accepted:** dropping the Node stdio server means **querying requires the editor open** (no editor-closed / CI path). This reverses the earlier "editor-optional" principle (§11) — a deliberate choice to be a pure UE-native product. If a headless path is ever wanted again, it would return as a standalone C++ query binary, not Node.
 - Read it competitively too: Epic's assistant + `AgentSkill` concept encroaches on all three Buckley Builds products at once (engine knowledge, project context, in-editor action) — a reason to *own* the project-intelligence layer, delivered where UE devs already are (the editor + its MCP).
 
-## 7. MVP (v0.1) — cut ruthlessly
+## 7. MVP record (v0.1)
+
+This section records the original cut; §14 is the authoritative current status.
 
 **In:**
 - Tier 0 for **all** assets (Asset Registry, editor-less) + C++ header reflection parse + config parse.
 - The extraction commandlet with the **generic property-bag fallback** (so every asset type has *some* depth from day one) and Tier 1 recipes for the highest-traffic classes: Blueprint, Material/Material Instance, Skeleton, Skeletal/Static Mesh, Texture, Anim assets, DataTable, Level.
 - SQLite store, FTS5 search (embeddings behind a flag), graph queries with typed edges.
-- MCP server with `search_project`, `get_entity`, `references`, `impact`, `project_stats`.
-- CLI: `gameiq index`, `gameiq mcp`. Windows first.
+- Native editor toolset with search, entity, relationship, impact, and project-stat queries.
+- Headless build commandlets and PowerShell helpers. Windows first.
 
 **The one hard MVP feature:** Tier 2 pseudocode for Blueprints (headless commandlet) — the demo that makes people gasp ("my agent just read my Blueprint"). Other Tier 2 renderings (materials, Anim BP state machines, Behavior Trees) follow in v0.2 on the same machinery.
 
-**Out (v0.2+):** live watcher, snapshots/`changes`, semantic uasset diffing, `explain` bundles, embeddings-by-default, Perforce, dashboard UI, team sync (Turso — same infra as the MCP usage tracking), Mac/Linux, design-doc ingestion + intent-vs-implementation conformance (§5.4, v0.3+).
+Items originally deferred from v0.1 have since landed selectively: live save updates, `explain`, design-doc ingestion/conformance, and local snapshots/semantic `changes`. Remaining roadmap items are listed in §14.
 
 **Success criterion:** on a real project, an agent with Game IQ correctly answers "where is X handled and what references it?" for Blueprint-implemented logic that the same agent without Game IQ cannot answer at all.
 
@@ -231,11 +237,11 @@ UE 5.8 ships (Experimental, `EditorOnly`, off by default) a **`ToolsetRegistry`*
 
 Freshness has two separable jobs, and conflating them is the common mistake: **detection** (what changed) is cheap and editor-free; **extraction** (reading the changed thing) is not, because a binary `.uasset` must be loaded into a UE process to render Tier 1/2 — detecting the change doesn't read it.
 
-- **Detection** — a filesystem watcher on `Content/` + `Source/` (a `.uasset` only hits disk on *save*, which is the right granularity) plus a VCS hook. Editor-free, and it naturally covers both "I saved" and "I synced/pulled." Text artifacts (C++, config) and the Tier 0 graph are *also* extracted here with no editor.
+- **Detection** — the in-editor asset save/delete/rename hook covers saved UObject changes. A source-tree fingerprint check refreshes changed C++ on editor startup and after Live Coding. Large out-of-editor syncs use the headless build commandlet.
 - **Extraction of changed binary assets** — needs a live UE process. Two modes:
   1. **Incremental rebuild** (`GameIQ.Rebuild` / `GameIQBuild`) — the Assets/Blueprints extractors keep a **signature-only cache** (`asset-hashes.json` / `blueprint-hashes.json`: id → AssetRegistry content hash, keyed to the DB's `dbGeneration`) and emit a **producer-scoped delta** (`mode:"delta"`, `replaces:[changed+removed ids]`, rows only for changed assets). Ingest applies it with `PatchProducerScoped` — replacing only that producer's rows for the listed subtrees, so the registry's rows on the same entities are untouched and order doesn't matter. Unchanged assets are neither re-extracted nor re-serialized. *(v1 of the cache carried every asset's full extracted rows through the JSON side-car — 60 MB of pure duplication per run on Slash; sig-only killed that.)* `-full` forces a from-scratch snapshot (full producer replace).
   2. **In-editor save hook** *(shipped, reworked 2026-07)* — while the editor is open, `UGameIQSaveHookSubsystem` keeps the index in step with edits. A **save** enqueues the package; a low-frequency ticker extracts it (still loaded — instant) and patches SQLite directly, one package per tick, entirely **off the save critical path** (saving never stalls on Game IQ; a WP level save no longer pulls hundreds of external-actor packages — the hook skips them and leaves that to the build). **Delete/rename** patch immediately (cheap subtree drop). Hook rows use the **same producer ids as the commandlets**, so rebuild deltas supersede hook patches cleanly (the old distinct "bridge" producer left orphaned rows rebuilds never replaced).
-- **No drain step.** The save hook writes straight into SQLite (WAL — readers never block), so the toolset always reads current state with no pending-delta directory and no always-on process.
+- **No drain step.** The save hook writes straight into SQLite using short transactions plus `busy_timeout`; UE's SQLite VFS does not support WAL shared memory, so the store uses rollback-journal mode. There is no pending-delta directory or always-on sidecar process.
 - Every query response carries an index-age stamp so agents (and humans) know how stale the answer might be.
 
 **Verified end-to-end** on ThirdPerson58: (1) change a Blueprint variable's value → save → next `game_iq` query shows the new default (read from the CDO, not the authored string); (2) create/save a non-Blueprint asset (Material) → its Tier 1 recipe appears; (3) delete an asset → it's gone from the index; (4) rename an asset → old id gone, new id present — all auto-drained on the next query with no full rebuild. **Gap:** *unsaved* in-editor edits aren't captured (save is the trigger).
@@ -244,7 +250,7 @@ Freshness has two separable jobs, and conflating them is the common mistake: **d
 
 Non-negotiable for adoption: **the index never leaves the developer's machine by default.** No cloud ingestion of game content. Embeddings computed locally. Telemetry limited to anonymous usage counts (opt-out), same convention as the skills MCP usage tracking. Team-sync of the index (later) goes through infrastructure the team controls or an explicit opt-in cloud tier. This is both the right thing and a sales weapon against any cloud-first competitor.
 
-## 10. Tech stack (proposed)
+## 10. Tech stack (current)
 
 Game IQ is **an all-C++ Unreal Engine 5.8 editor plugin** — one artifact, no external runtime. *(History: it began as a standalone Node/TypeScript core with the plugin as one extraction backend. Every piece — store, ingest, the six query actions, and the editor-less config/C++ extractors — was ported to C++ and verified at parity, then the Node core was removed 2026-07. See §6.5.)* Everything runs in-process against each project's `.gameiq/` index.
 
@@ -280,7 +286,9 @@ Techniques and libraries worth studying or reusing:
 - **tree-sitter (C++ grammar)** — proven approach for fast, robust parsing of UE's reflection macros without a full compiler; the right base for our C++ extractor.
 - **Generic code-AI indexers** (Cursor, Sourcegraph, Greptile) — index text only; Blueprints are invisible to all of them. They set UX expectations ("my agent knows my codebase") that UE projects can't meet today — that expectation gap is our market.
 
-**Net read:** nobody ships a **persistent, editor-optional, agent-agnostic project intelligence layer** for UE as a standalone product. The specific shape (open MCP + local-first + history) is unclaimed — and the window won't stay open forever. Ship the MVP fast.
+**Historical market read (pre-native pivot):** the original opportunity was a persistent,
+editor-optional, agent-agnostic intelligence layer. The shipped product kept the local-first index and
+history but chose a native editor toolset for querying; a standalone query path is no longer claimed.
 
 ## 12. Open questions
 
@@ -301,7 +309,7 @@ Techniques and libraries worth studying or reusing:
 
 All public materials follow the existing convention: Unreal® is a trademark of Epic Games, Inc.; Unreal Game IQ is an independent Buckley Builds LLC product, not affiliated with or endorsed by Epic Games. Keep marketing version-agnostic ("Unreal Engine", not "UE5.x").
 
-## 14. Implementation status (v0.1)
+## 14. Implementation status (v0.1, as of 2026-08-25)
 
 Snapshot of shipped vs. planned so the vision above doesn't read as done. Verified end-to-end on **ThirdPerson58 (UE 5.8)**: extract → index → MCP → agent.
 
@@ -310,7 +318,7 @@ Snapshot of shipped vs. planned so the vision above doesn't read as done. Verifi
 - **Editor-less:** C++ header reflection parse, config/`.ini`/`.uproject` parse, directory-exclude config (§5.5).
 - **Commandlets:** `GameIQExport` (Tier 0 registry graph), `GameIQAssets` (Tier 1: static/skeletal mesh, texture, skeleton, data table, material, **Input Mapping Context/Action**, **level actor inventory with light/mesh detail**, generic reflection fallback for the rest), `GameIQBlueprints` (Tier 2 pseudocode + variables/components/interfaces).
 - **Edges:** `depends-on`, `references`, `inherits`, `implements`, `calls`, `uses-material`, `uses-texture`, `uses-skeleton`, `placed-in-level`.
-- **MCP — native toolset (§6.5):** `UGameIQService` on UE 5.8's `ToolsetRegistry` / Epic's MCP endpoint, in-process C++ via SQLiteCore, zero-setup for UE-MCP/VibeUE agents. Full action parity: `Search`, `GetEntity`, `References`, `Impact`, `Explain`, `ProjectStats`. (The Node stdio server was removed; querying now requires the editor open.)
+- **MCP — native toolset (§6.5):** `UGameIQService` on UE 5.8's `ToolsetRegistry` / Epic's MCP endpoint, in-process C++ via SQLiteCore, zero-setup for UE-MCP/VibeUE agents. Includes bounded context/Blueprint packs, graph export, and snapshot/semantic-change tools. (The Node stdio server was removed; querying now requires the editor open.)
 - **Editor UI — Tools ▸ Game IQ:** a dockable Slate panel (`SGameIQPanel`) showing index stats (project, DB size, last-built time, entity counts by kind, edge count) with **Rebuild Index** (full) and **Reindex Documents** (docs/images/external sources only) buttons. Registered as a nomad tab + Tools-menu entry from the module.
 - **Build orchestration — `FGameIQBuildRunner`:** both panel buttons and the `GameIQ.Rebuild` / `GameIQ.ReindexDocs` console commands go through this shared runner, which spawns the commandlet as a background `UnrealEditor-Cmd` process (never in-process — a live editor trips engine ensures that a clean commandlet process doesn't), captures its stdout over a pipe, and surfaces live per-stage progress via a persistent Slate notification and the Output Log (`LogGameIQRunner`). The verdict comes from a **result marker** (`.gameiq/last-build.json`: success flag + duration + post-build row counts) the build commandlets write as their last act — never from the process exit code, which is the engine's logged-error count and is routinely nonzero on clean runs (the panel used to report "rebuild failed (exit code 1)" on verified-successful builds). The success notification shows the entity/edge/chunk counts.
 - **Build timing:** `GameIQBuild`/`GameIQDocsBuild` time each stage (logged as it completes) and append a record (per-stage seconds + total) to `.gameiq/build-timings.json` (last 20 runs) via `GameIQBuildTiming.h`, so rebuild performance is comparable across runs as the project grows. The Assets and Blueprints extractors (the ones doing full synchronous asset loads — the slowest stages on a large project) additionally log a ~2s heartbeat (with loaded/tag-only/cache-hit counts) while they run, so a long stage reads as "still working" rather than "stuck".
@@ -318,9 +326,9 @@ Snapshot of shipped vs. planned so the vision above doesn't read as done. Verifi
 - **Editor-native pipeline (§6.5):** `FGameIQStore` (C++ store+ingest) owns building *and* updating the index. The save hook patches SQLite directly on save/delete/rename; `GameIQIndex` ingests, `GameIQBuild` runs all extractors + ingest in one boot. The editor-less extractors are C++ too (`GameIQConfig`, `GameIQCode`). Verified live: a Blueprint variable value change is visible immediately; the full C++ build reproduces the old 2245-entity index exactly.
 - **Incremental updates (§8):** in-editor save hook (`UGameIQSaveHookSubsystem`) writes directly into the index on any asset save (Blueprints and non-Blueprints via the shared recipes) and on delete/rename (Asset Registry delegates). Verified live: variable-value change, non-BP save, delete, and rename all reflect immediately, no full rebuild and no Node.
 - Cross-language robustness: BOM-tolerant JSON reader, UTF-8 output, bounded `get_entity`.
-- **Automation tests** (`GameIQTests.cpp`, `Automation RunTests GameIQ`): fresh-DB schema creation (the regression test for the 2026-07 single-statement-Execute empty-index bug), ingest round-trip incl. FTS trigger sync + porter stemming + aux identifier matching, producer-scoped patch semantics, and the text utilities.
+- **Automation tests** (`GameIQTests.cpp`, `Automation RunTests GameIQ`): store/schema/FTS and patch semantics, ranking/id resolution, bounded JSON/Markdown context packs, Blueprint context export, deterministic cyclic mixed-kind graph export, and named snapshot semantic changes.
 
-**Not yet built** — editor-less Tier 0 (registry-file parsing, still commandlet-only); save hook for *unsaved* edits (§8; save/delete/rename now covered); snapshots / `changes` semantic diff; embeddings (FTS5 only); `ask` synthesis; design-doc ingestion (§5.4); Tier 2 for materials/AnimBP/Behavior Trees; bespoke recipes for Niagara/Sound/Physics (generic fallback today); Mac/Linux; team sync.
+**Not yet built** — editor-less Tier 0 (registry-file parsing, still commandlet-only); save hook for *unsaved* edits (§8; save/delete/rename now covered); node-level `.uasset` graph diffs beyond indexed semantic changes; embeddings (FTS5 only); `ask` synthesis; Tier 2 for materials/AnimBP/Behavior Trees; bespoke recipes for Niagara/Sound/Physics (generic fallback today); Mac/Linux; team sync.
 
 **Recently fixed** — Enhanced Input events in Blueprint graphs. The Tier-2 pseudocode extractor only treated `UK2Node_Event`/`FunctionEntry` as graph roots, so `UK2Node_EnhancedInputAction` nodes (and legacy Input* nodes) rendered as nothing — the input-system logs wrongly concluded the bindings were in native C++. Now any node implementing `IK2Node_EventNodeInterface` is an event root, so a character's `IA_Move`/`IA_Jump`/`IA_Sprint` → handler bindings render with their trigger phases. *Verified: BP_ThirdPersonCharacter now shows IA_Sprint → Set MaxWalkSpeed 600→2000, etc., in one chunk — the logs' "must be C++" was a rendering gap, not a real one.*
 
