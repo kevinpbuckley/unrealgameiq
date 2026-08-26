@@ -8,6 +8,7 @@
 #include "Async/Async.h"
 #include "Dom/JsonObject.h"
 #include "Engine/Blueprint.h"
+#include "Engine/World.h"
 #include "GameIQAssetCommandlet.h"
 #include "GameIQBlueprintCommandlet.h"
 #include "GameIQBuildRunner.h"
@@ -248,7 +249,15 @@ void UGameIQSaveHookSubsystem::PatchSavedPackage(const FString& PackageName)
 	FGameIQStore Store;
 	if (Store.Open())
 	{
-		const bool bOk = Store.Patch({ Id }, Entities, Edges, Chunks, BP ? HookBlueprintProducer : HookAssetsProducer);
+		// World saves patch UPSERT-ONLY: the hook re-extracts without external actors (loading
+		// hundreds of OFPA packages mid-save would stall the editor), so the subtree delete was
+		// wiping every build-produced external-actor entity of a World Partition level on each
+		// save (issue #17). Upserting keeps them; actors deleted from the level linger until the
+		// next build — which was already the documented refresh path for external actors.
+		const bool bIsWorld = !BP && Asset->IsA<UWorld>();
+		const bool bOk = bIsWorld
+			? Store.Patch({}, Entities, Edges, Chunks, HookAssetsProducer)
+			: Store.Patch({ Id }, Entities, Edges, Chunks, BP ? HookBlueprintProducer : HookAssetsProducer);
 		Store.Close();
 		if (bOk)
 		{

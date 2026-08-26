@@ -30,13 +30,14 @@ namespace GameIQTestUtil
 		return Path;
 	}
 
-	TSharedPtr<FJsonValue> Entity(const TCHAR* Id, const TCHAR* Kind, const TCHAR* Name, const TCHAR* Parent = nullptr)
+	TSharedPtr<FJsonValue> Entity(const TCHAR* Id, const TCHAR* Kind, const TCHAR* Name, const TCHAR* Parent = nullptr,
+		const TCHAR* Path = TEXT("/Game/Test"))
 	{
 		TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
 		O->SetStringField(TEXT("id"), Id);
 		O->SetStringField(TEXT("kind"), Kind);
 		O->SetStringField(TEXT("name"), Name);
-		O->SetStringField(TEXT("path"), TEXT("/Game/Test"));
+		O->SetStringField(TEXT("path"), Path);
 		O->SetStringField(TEXT("source"), TEXT("asset"));
 		if (Parent) { O->SetStringField(TEXT("parent"), Parent); }
 		return MakeShared<FJsonValueObject>(O);
@@ -655,6 +656,126 @@ bool FGameIQQueryChildrenTest::RunTest(const FString& Parameters)
 		const TArray<TSharedPtr<FJsonValue>>* Rows = nullptr;
 		if (!TestTrue(TEXT("rows array"), (*Payload)->TryGetArrayField(TEXT("children"), Rows))) { return false; }
 		TestEqual(TEXT("page limited"), Rows->Num(), 2);
+	}
+	return true;
+}
+
+/**
+ * Island penalty (issue #13): a sample pack that only references itself must not outrank a real
+ * gameplay asset that is leaned on from outside its folder — the NiagaraExamples failure shape.
+ */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGameIQQueryIslandPenaltyTest, "GameIQ.Query.SelfContainedIslandPenalty",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGameIQQueryIslandPenaltyTest::RunTest(const FString& Parameters)
+{
+	using namespace GameIQTestUtil;
+	const FString DbPath = TempDbPath(TEXT("island.db"));
+
+	FGameIQStore Store;
+	if (!TestTrue(TEXT("open"), Store.OpenAtPath(DbPath))) { return false; }
+	TArray<TSharedPtr<FJsonValue>> Edges;
+	// The island: five intra-pack references — plenty of inbound, none external.
+	for (int32 i = 0; i < 5; ++i)
+	{
+		Edges.Add(Edge(*FString::Printf(TEXT("asset:/Game/SamplePack/BP_Demo%d"), i),
+			TEXT("asset:/Game/SamplePack/BP_ShowcasePlayer"), TEXT("references")));
+	}
+	// The real asset: two references from another folder.
+	Edges.Add(Edge(TEXT("asset:/Game/Modes/BP_GameMode"), TEXT("asset:/Game/Blueprints/BP_Player"), TEXT("references")));
+	Edges.Add(Edge(TEXT("asset:/Game/Maps/L1"), TEXT("asset:/Game/Blueprints/BP_Player"), TEXT("placed-in-level")));
+	Store.IngestProducer(TEXT("test"),
+		{
+			// Insertion order + inbound count both favor the island so the test fails without the penalty.
+			Entity(TEXT("asset:/Game/SamplePack/BP_ShowcasePlayer"), TEXT("blueprint"), TEXT("BP_ShowcasePlayer"), nullptr, TEXT("/Game/SamplePack/BP_ShowcasePlayer")),
+			Entity(TEXT("asset:/Game/SamplePack/BP_Demo0"), TEXT("blueprint"), TEXT("BP_Demo0"), nullptr, TEXT("/Game/SamplePack/BP_Demo0")),
+			Entity(TEXT("asset:/Game/SamplePack/BP_Demo1"), TEXT("blueprint"), TEXT("BP_Demo1"), nullptr, TEXT("/Game/SamplePack/BP_Demo1")),
+			Entity(TEXT("asset:/Game/SamplePack/BP_Demo2"), TEXT("blueprint"), TEXT("BP_Demo2"), nullptr, TEXT("/Game/SamplePack/BP_Demo2")),
+			Entity(TEXT("asset:/Game/SamplePack/BP_Demo3"), TEXT("blueprint"), TEXT("BP_Demo3"), nullptr, TEXT("/Game/SamplePack/BP_Demo3")),
+			Entity(TEXT("asset:/Game/SamplePack/BP_Demo4"), TEXT("blueprint"), TEXT("BP_Demo4"), nullptr, TEXT("/Game/SamplePack/BP_Demo4")),
+			Entity(TEXT("asset:/Game/Blueprints/BP_Player"), TEXT("blueprint"), TEXT("BP_Player"), nullptr, TEXT("/Game/Blueprints/BP_Player")),
+			Entity(TEXT("asset:/Game/Modes/BP_GameMode"), TEXT("blueprint"), TEXT("BP_GameMode"), nullptr, TEXT("/Game/Modes/BP_GameMode")),
+			Entity(TEXT("asset:/Game/Maps/L1"), TEXT("asset"), TEXT("L1"), nullptr, TEXT("/Game/Maps/L1")),
+		},
+		Edges,
+		{
+			// Identical chunk text: bm25 and the name boost tie; only the reference shapes differ.
+			Chunk(TEXT("c1"), TEXT("asset:/Game/SamplePack/BP_ShowcasePlayer"), TEXT("player character pawn blueprint")),
+			Chunk(TEXT("c2"), TEXT("asset:/Game/Blueprints/BP_Player"), TEXT("player character pawn blueprint")),
+		});
+	Store.Close();
+
+	GameIQQuery::SetDbPathOverrideForTests(DbPath);
+	ON_SCOPE_EXIT { GameIQQuery::SetDbPathOverrideForTests(FString()); };
+
+	const TSharedPtr<FJsonValue> Result = ParseResult(GameIQQuery::Search(TEXT("player character pawn"), FString(), 10, 0));
+	const TArray<TSharedPtr<FJsonValue>>* Hits = nullptr;
+	if (!TestTrue(TEXT("search returns array"), Result.IsValid() && Result->TryGetArray(Hits))) { return false; }
+	if (!TestTrue(TEXT("both entities hit"), Hits->Num() >= 2)) { return false; }
+	TestEqual(TEXT("externally-referenced asset outranks the self-contained island"),
+		HitEntityId((*Hits)[0]), FString(TEXT("asset:/Game/Blueprints/BP_Player")));
+	const TSharedPtr<FJsonObject>* Top = nullptr;
+	if (TestTrue(TEXT("hit object"), (*Hits)[0]->TryGetObject(Top)))
+	{
+		TestEqual(TEXT("externalRefs reported"), (int32)(*Top)->GetNumberField(TEXT("externalRefs")), 2);
+	}
+	return true;
+}
+
+/**
+ * Id resolution (issues #11/#12): UE-prefixed cpp ids must resolve to the stored stripped form,
+ * and a genuinely unknown id must return an explicit not-found with did-you-mean suggestions —
+ * never a truthy-but-empty shell (the "no inbound references" false-conclusion bug).
+ */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGameIQQueryIdResolutionTest, "GameIQ.Query.PrefixedIdResolutionAndNotFound",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGameIQQueryIdResolutionTest::RunTest(const FString& Parameters)
+{
+	using namespace GameIQTestUtil;
+	const FString DbPath = TempDbPath(TEXT("idresolve.db"));
+
+	FGameIQStore Store;
+	if (!TestTrue(TEXT("open"), Store.OpenAtPath(DbPath))) { return false; }
+	Store.IngestProducer(TEXT("test"),
+		{
+			Entity(TEXT("cpp:EnemyAIController"), TEXT("cpp-class"), TEXT("EnemyAIController"), nullptr, TEXT("Source/Enemy/AI/EnemyAIController.h")),
+			Entity(TEXT("asset:/Game/AI/BP_EnemyAIController"), TEXT("blueprint"), TEXT("BP_EnemyAIController"), nullptr, TEXT("/Game/AI/BP_EnemyAIController")),
+		},
+		{
+			Edge(TEXT("asset:/Game/AI/BP_EnemyAIController"), TEXT("cpp:EnemyAIController"), TEXT("inherits")),
+		},
+		{});
+	Store.Close();
+
+	GameIQQuery::SetDbPathOverrideForTests(DbPath);
+	ON_SCOPE_EXIT { GameIQQuery::SetDbPathOverrideForTests(FString()); };
+
+	// Prefixed spelling resolves to the stored entity (the row nests under result["entity"]).
+	{
+		const TSharedPtr<FJsonValue> Result = ParseResult(GameIQQuery::GetEntity(TEXT("cpp:AEnemyAIController"), 10));
+		const TSharedPtr<FJsonObject>* Obj = nullptr;
+		if (!TestTrue(TEXT("get_entity object"), Result.IsValid() && Result->TryGetObject(Obj))) { return false; }
+		const TSharedPtr<FJsonObject>* EntityObj = nullptr;
+		if (!TestTrue(TEXT("entity field"), (*Obj)->TryGetObjectField(TEXT("entity"), EntityObj))) { return false; }
+		TestEqual(TEXT("resolved id"), (*EntityObj)->GetStringField(TEXT("id")), FString(TEXT("cpp:EnemyAIController")));
+		TestEqual(TEXT("resolvedFrom recorded"), (*EntityObj)->GetStringField(TEXT("resolvedFrom")), FString(TEXT("cpp:AEnemyAIController")));
+	}
+	// ...and its references are reachable through the prefixed spelling too (the actual footgun).
+	{
+		const TSharedPtr<FJsonValue> Result = ParseResult(GameIQQuery::References(TEXT("cpp:AEnemyAIController"), TEXT("in"), 1, FString(), FString(), 50, 0));
+		const TArray<TSharedPtr<FJsonValue>>* Rows = nullptr;
+		if (!TestTrue(TEXT("references array"), Result.IsValid() && Result->TryGetArray(Rows))) { return false; }
+		TestEqual(TEXT("inbound reference found via prefixed id"), Rows->Num(), 1);
+	}
+	// Unknown ids answer not-found + didYouMean, not an empty shell. Wrong-kind-prefix mistake:
+	// the name part exists, the id doesn't — suggestions must surface the real ids.
+	{
+		const TSharedPtr<FJsonValue> Result = ParseResult(GameIQQuery::References(TEXT("asset:/Game/AI/EnemyAIController"), TEXT("in"), 1, FString(), FString(), 50, 0));
+		const TSharedPtr<FJsonObject>* Obj = nullptr;
+		if (!TestTrue(TEXT("not-found is an object"), Result.IsValid() && Result->TryGetObject(Obj))) { return false; }
+		TestTrue(TEXT("error field present"), (*Obj)->HasField(TEXT("error")));
+		const TArray<TSharedPtr<FJsonValue>>* Suggestions = nullptr;
+		if (!TestTrue(TEXT("didYouMean present"), (*Obj)->TryGetArrayField(TEXT("didYouMean"), Suggestions))) { return false; }
+		TestTrue(TEXT("suggests a real id"), Suggestions->Num() >= 1);
 	}
 	return true;
 }

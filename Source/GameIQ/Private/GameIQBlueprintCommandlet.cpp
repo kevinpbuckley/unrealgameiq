@@ -31,6 +31,12 @@
 #include "UObject/PropertyPortFlags.h"
 #include "UObject/UnrealType.h"
 #include "UObject/UObjectGlobals.h"
+#if WITH_EDITOR
+#include "WidgetBlueprint.h"          // UMGEditor — widget-tree summary (issue #14)
+#include "Blueprint/WidgetTree.h"
+#include "Components/Widget.h"
+#include "Components/PanelWidget.h"
+#endif
 
 DEFINE_LOG_CATEGORY_STATIC(LogGameIQBlueprints, Log, All);
 
@@ -380,6 +386,29 @@ void GameIQBlueprint::ExtractBlueprint(
 			BpId, FString::Printf(TEXT("cpp:%s"), *IfClass->GetName()), TEXT("implements"), FString())));
 	}
 
+	// Widget Blueprints: the designer tree is the load-bearing UI fact (issue #14) — a WBP entity
+	// that stays silent about it costs agents a whole fallback chain, and "the tree is EMPTY"
+	// (UI built dynamically in the graph) is as important as any widget list.
+	TArray<FString> WidgetLines;
+	bool bIsWidgetBlueprint = false;
+#if WITH_EDITOR
+	if (const UWidgetBlueprint* WidgetBP = Cast<UWidgetBlueprint>(BP))
+	{
+		bIsWidgetBlueprint = true;
+		if (WidgetBP->WidgetTree)
+		{
+			WidgetBP->WidgetTree->ForEachWidget([&WidgetLines](UWidget* Widget)
+			{
+				if (!Widget) { return; }
+				const UPanelWidget* ParentWidget = Widget->GetParent();
+				WidgetLines.Add(ParentWidget
+					? FString::Printf(TEXT("%s (%s, in %s)"), *Widget->GetName(), *Widget->GetClass()->GetName(), *ParentWidget->GetName())
+					: FString::Printf(TEXT("%s (%s)"), *Widget->GetName(), *Widget->GetClass()->GetName()));
+			});
+		}
+	}
+#endif
+
 	FString S = AssetName;
 	if (!ParentName.IsEmpty()) { S += FString::Printf(TEXT(" (parent: %s)"), *ParentName); }
 	S += TEXT("\n");
@@ -387,6 +416,12 @@ void GameIQBlueprint::ExtractBlueprint(
 	if (CompLines.Num() > 0)  { S += TEXT("Components: ") + FString::Join(CompLines, TEXT(", ")) + TEXT("\n"); }
 	if (IfaceLines.Num() > 0) { S += TEXT("Implements: ") + FString::Join(IfaceLines, TEXT(", ")) + TEXT("\n"); }
 	if (InputLines.Num() > 0) { S += TEXT("Input: ")      + FString::Join(InputLines, TEXT(", ")) + TEXT("\n"); }
+	if (bIsWidgetBlueprint)
+	{
+		S += WidgetLines.Num() > 0
+			? TEXT("Widgets: ") + FString::Join(WidgetLines, TEXT(", ")) + TEXT("\n")
+			: TEXT("Designer tree: empty (UI likely constructed in the graph)\n");
+	}
 	Chunks.Add(MakeShared<FJsonValueObject>(GameIQ::MakeChunk(
 		FString::Printf(TEXT("%s#structure"), *BpId), BpId, TEXT("recipe-summary"), S)));
 }

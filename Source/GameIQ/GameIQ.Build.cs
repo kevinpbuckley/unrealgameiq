@@ -27,6 +27,7 @@ public class GameIQ : ModuleRules
 			"ToolsetRegistry",   // UE 5.8 native AI toolset registry — exposes GameIQ queries on Epic's MCP endpoint
 			"ImageWrapper",      // read image dimensions (png/jpg/…) for the docs image extractor (issue #7)
 			"zlib",              // inflate PDF FlateDecode content streams for text extraction (issue #5)
+			"UMG",               // widget-tree summary for WidgetBlueprints (issue #14)
 		});
 
 		// Editor-only machinery for the live in-editor bridge and Tier 2 graph export
@@ -44,6 +45,7 @@ public class GameIQ : ModuleRules
 				"ToolMenus",       // register the Tools menu entry
 				"WorkspaceMenuStructure", // Tools category for the dockable tab
 				"FileUtilities",   // FZipArchiveReader (over bundled libzip) — read DOCX word/document.xml (issue #5)
+				"UMGEditor",       // UWidgetBlueprint for the widget-tree summary (issue #14)
 			});
 
 			if (Target.bWithLiveCoding)
