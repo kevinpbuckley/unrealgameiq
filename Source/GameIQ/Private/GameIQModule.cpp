@@ -2,6 +2,7 @@
 
 #include "GameIQModule.h"
 
+#include "Editor.h"
 #include "Framework/Application/SlateApplication.h"
 #include "Framework/Docking/TabManager.h"
 #include "GameIQBuildRunner.h"
@@ -261,8 +262,9 @@ void FGameIQModule::StartupModule()
 	UE_LOG(LogGameIQ, Log, TEXT("Game IQ module started. Run `-run=GameIQBuild` to build the index."));
 
 	// The ToolsetRegistry + editor UI need the editor up. Register now if it already is (hot-reload /
-	// late load), otherwise wait for PostEngineInit.
-	if (UToolsetRegistry::IsAvailable())
+	// late load), otherwise wait for PostEngineInit. IsAvailable() itself logs a warning while
+	// GEditor is still null, which is the normal state during module load.
+	if (GEditor)
 	{
 		RegisterToolsets();
 		RegisterUI();
