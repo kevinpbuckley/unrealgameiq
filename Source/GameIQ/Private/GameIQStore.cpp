@@ -7,6 +7,7 @@
 #include "GameIQTextUtil.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformProcess.h"
+#include "HAL/PlatformTime.h"
 #include "Misc/DateTime.h"
 #include "Misc/Guid.h"
 #include "Misc/Paths.h"
@@ -86,6 +87,31 @@ namespace
 		return FString(); // empty => bind NULL
 	}
 
+	/** True if a SQLite error text means the file itself is damaged (SQLITE_CORRUPT / SQLITE_NOTADB),
+	 *  as opposed to a transient lock or a bad statement. */
+	bool IsCorruptionError(const FString& Error)
+	{
+		return Error.Contains(TEXT("malformed")) || Error.Contains(TEXT("corrupt"))
+			|| Error.Contains(TEXT("not a database"));
+	}
+
+	/** Index files proven damaged this process (by an integrity check or a write error); the next
+	 *  Open() quarantines them instead of writing into a broken b-tree. Every patch after the first
+	 *  "malformed" error otherwise fails the same way, one warning per saved asset. */
+	TSet<FString> GCorruptPaths;
+	/** Index files whose integrity was already checked this process (the check reads the whole file,
+	 *  so it runs once per path per process, not on every save-hook patch). */
+	TSet<FString> GCheckedPaths;
+
+	/** Move a damaged index aside (kept for diagnosis) so a fresh one can be created in its place. */
+	bool QuarantineDbFile(const FString& DbPath)
+	{
+		const FString Stamp = FDateTime::UtcNow().ToString(TEXT("%Y%m%dT%H%M%SZ"));
+		const FString Dest = DbPath + TEXT(".corrupt-") + Stamp;
+		IFileManager::Get().Delete(*(DbPath + TEXT("-journal")), false, true, true);
+		return IFileManager::Get().Move(*Dest, *DbPath, /*Replace=*/true, /*EvenIfReadOnly=*/true);
+	}
+
 	const FJsonObject* AsObjectPtr(const TSharedPtr<FJsonValue>& V)
 	{
 		if (V.IsValid() && V->Type == EJson::Object)
@@ -155,6 +181,77 @@ bool FGameIQStore::OpenInternal(const FString& DbPath, bool bAllowRecreate)
 	Exec(TEXT("PRAGMA busy_timeout=3000;"));
 	Exec(TEXT("PRAGMA foreign_keys=OFF;"));
 
+	// Page-level damage (out-of-order rowids, a wrong freelist) is invisible to the schema check
+	// below, and a full rebuild would write straight into the broken b-trees and keep failing.
+	// Check the file once per process (and whenever a write reported corruption), and quarantine
+	// it so the rebuild starts from a clean file.
+	if (bAllowRecreate)
+	{
+		const FString Canon = FPaths::ConvertRelativePathToFull(DbPath);
+		bool bCorrupt = GCorruptPaths.Contains(Canon);
+		if (!bCorrupt && !GCheckedPaths.Contains(Canon))
+		{
+			GCheckedPaths.Add(Canon);
+			const double Start = FPlatformTime::Seconds();
+			FString Result;
+			FSQLitePreparedStatement Check(Db, TEXT("PRAGMA quick_check(1);"));
+			if (!Check.IsValid())
+			{
+				bCorrupt = IsCorruptionError(Db.GetLastError());
+			}
+			else if (Check.Step() == ESQLitePreparedStatementStepResult::Row)
+			{
+				Check.GetColumnValueByIndex(0, Result);
+				bCorrupt = !Result.Equals(TEXT("ok"), ESearchCase::IgnoreCase);
+			}
+			else
+			{
+				bCorrupt = IsCorruptionError(Db.GetLastError());
+			}
+			Check.Destroy();
+			UE_LOG(LogGameIQStore, Log, TEXT("Game IQ: index integrity check %s in %.2fs (%s)"),
+				bCorrupt ? TEXT("FAILED") : TEXT("ok"), FPlatformTime::Seconds() - Start, *DbPath);
+			if (bCorrupt && !Result.IsEmpty())
+			{
+				UE_LOG(LogGameIQStore, Warning, TEXT("Game IQ: integrity check: %s"), *Result);
+			}
+		}
+		if (bCorrupt)
+		{
+			StmtCache.Empty();
+			Db.Close();
+			GCorruptPaths.Remove(Canon);
+			if (!QuarantineDbFile(DbPath))
+			{
+				UE_LOG(LogGameIQStore, Error, TEXT("Game IQ: index at %s is corrupt and could not be moved aside (is another process holding it?). Close it and run GameIQ.Rebuild full."), *DbPath);
+				GCorruptPaths.Add(Canon); // keep refusing writes into it
+				return false;
+			}
+			UE_LOG(LogGameIQStore, Error, TEXT("Game IQ: index at %s was corrupt — moved aside as %s.corrupt-* and recreated empty. Run GameIQ.Rebuild full to repopulate it."), *DbPath, *FPaths::GetCleanFilename(DbPath));
+			if (!Db.Open(*DbPath, ESQLiteDatabaseOpenMode::ReadWriteCreate))
+			{
+				UE_LOG(LogGameIQStore, Error, TEXT("Game IQ: could not recreate index at %s: %s"), *DbPath, *Db.GetLastError());
+				return false;
+			}
+			Exec(TEXT("PRAGMA journal_mode=DELETE;"));
+			Exec(TEXT("PRAGMA synchronous=NORMAL;"));
+			Exec(TEXT("PRAGMA busy_timeout=3000;"));
+			Exec(TEXT("PRAGMA foreign_keys=OFF;"));
+			if (!EnsureSchema())
+			{
+				UE_LOG(LogGameIQStore, Error, TEXT("Game IQ: schema creation failed on a fresh DB at %s — giving up."), *DbPath);
+				Close();
+				return false;
+			}
+			InvalidateExtractCaches();
+		}
+	}
+	else if (GCorruptPaths.Contains(FPaths::ConvertRelativePathToFull(DbPath)))
+	{
+		Close();
+		return false;
+	}
+
 	if (!EnsureSchema())
 	{
 		if (!bAllowRecreate)
@@ -211,10 +308,29 @@ bool FGameIQStore::Exec(const TCHAR* Sql)
 {
 	if (!Db.Execute(Sql))
 	{
-		UE_LOG(LogGameIQStore, Error, TEXT("Game IQ: SQL failed: %s — %s"), Sql, *Db.GetLastError());
+		const FString Error = Db.GetLastError();
+		UE_LOG(LogGameIQStore, Error, TEXT("Game IQ: SQL failed: %s — %s"), Sql, *Error);
+		if (IsCorruptionError(Error) && !OpenedPath.IsEmpty())
+		{
+			// The next Open() quarantines the file instead of patching into it again.
+			const FString Canon = FPaths::ConvertRelativePathToFull(OpenedPath);
+			if (!GCorruptPaths.Contains(Canon))
+			{
+				GCorruptPaths.Add(Canon);
+				UE_LOG(LogGameIQStore, Error, TEXT("Game IQ: the index file is damaged; it will be moved aside and recreated on the next write. Run GameIQ.Rebuild full afterwards."));
+			}
+		}
 		return false;
 	}
 	return true;
+}
+
+bool FGameIQStore::Commit()
+{
+	if (Exec(TEXT("COMMIT;"))) { return true; }
+	// Leave the connection usable: a failed COMMIT keeps the transaction open otherwise.
+	Db.Execute(TEXT("ROLLBACK;"));
+	return false;
 }
 
 bool FGameIQStore::BeginTransaction()
@@ -550,7 +666,7 @@ bool FGameIQStore::Patch(
 	for (const FString& Root : Roots) { DeleteSubtree(Root); }
 	InsertRows(Entities, Edges, Chunks, Producer);
 	SetMeta(TEXT("lastIngestAtIso"), FDateTime::UtcNow().ToIso8601());
-	return Exec(TEXT("COMMIT;"));
+	return Commit();
 }
 
 bool FGameIQStore::PatchProducerScoped(
@@ -565,7 +681,7 @@ bool FGameIQStore::PatchProducerScoped(
 	for (const FString& Root : Replaces) { DeleteSubtreeForProducer(Root, Producer); }
 	InsertRows(Entities, Edges, Chunks, Producer);
 	SetMeta(TEXT("lastIngestAtIso"), FDateTime::UtcNow().ToIso8601());
-	return Exec(TEXT("COMMIT;"));
+	return Commit();
 }
 
 bool FGameIQStore::IngestProducer(
@@ -579,7 +695,7 @@ bool FGameIQStore::IngestProducer(
 	DeleteByProducer(Producer);
 	InsertRows(Entities, Edges, Chunks, Producer);
 	SetMeta(TEXT("lastIngestAtIso"), FDateTime::UtcNow().ToIso8601());
-	return Exec(TEXT("COMMIT;"));
+	return Commit();
 }
 
 void FGameIQStore::SetProjectMeta(const FString& Name, const FString& Root, const FString& GeneratedAtIso)
