@@ -1470,6 +1470,26 @@ FString GameIQQuery::Doctor()
 		}
 	}
 
+	// Page-level integrity: a damaged file keeps its tables (so the schema check passes) but every
+	// write fails with "database disk image is malformed".
+	{
+		FString Integrity;
+		FSQLitePreparedStatement Stmt = Db.PrepareStatement(TEXT("PRAGMA quick_check(1)"));
+		if (Stmt.IsValid() && Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+		{
+			Stmt.GetColumnValueByIndex(0, Integrity);
+		}
+		else
+		{
+			Integrity = Db.GetLastError();
+		}
+		Payload->SetStringField(TEXT("integrity"), Integrity);
+		if (!Integrity.Equals(TEXT("ok"), ESearchCase::IgnoreCase))
+		{
+			Problems.Add(FString::Printf(TEXT("the index file is damaged (%s) — run GameIQ.Rebuild full (the store moves the damaged file aside first)"), *Integrity.Left(200)));
+		}
+	}
+
 	if (MissingTables.Num() == 0)
 	{
 		const int64 Entities = ScalarInt(Db, TEXT("SELECT COUNT(*) FROM entities"));
