@@ -1,6 +1,7 @@
 // Copyright Buckley Builds LLC. All Rights Reserved.
 
 #include "GameIQQuery.h"
+#include "GameIQSqlBind.h"
 
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
@@ -106,7 +107,7 @@ namespace
 	{
 		FSQLitePreparedStatement Stmt = Db.PrepareStatement(Sql);
 		if (!Stmt.IsValid()) { return 0; }
-		Stmt.SetBindingValueByIndex(1, Id);
+		GameIQSql::Bind(Stmt, 1, Id);
 		int32 N = 0;
 		if (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
 		{
@@ -119,7 +120,7 @@ namespace
 	{
 		FSQLitePreparedStatement Stmt = Db.PrepareStatement(TEXT("SELECT value FROM meta WHERE key = ?"));
 		if (!Stmt.IsValid()) { return FString(); }
-		Stmt.SetBindingValueByIndex(1, FString(Key));
+		GameIQSql::Bind(Stmt, 1, FString(Key));
 		FString V;
 		if (Stmt.Step() == ESQLitePreparedStatementStepResult::Row) { Stmt.GetColumnValueByName(TEXT("value"), V); }
 		return V;
@@ -179,7 +180,7 @@ namespace
 	{
 		FSQLitePreparedStatement Stmt = Db.PrepareStatement(TEXT("SELECT * FROM entities WHERE id = ?"));
 		if (!Stmt.IsValid()) { return nullptr; }
-		Stmt.SetBindingValueByIndex(1, Id);
+		GameIQSql::Bind(Stmt, 1, Id);
 		if (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
 		{
 			return EntityJson(Stmt);
@@ -191,7 +192,7 @@ namespace
 	{
 		FSQLitePreparedStatement Stmt = Db.PrepareStatement(TEXT("SELECT 1 FROM entities WHERE id = ?"));
 		if (!Stmt.IsValid()) { return false; }
-		Stmt.SetBindingValueByIndex(1, Id);
+		GameIQSql::Bind(Stmt, 1, Id);
 		return Stmt.Step() == ESQLitePreparedStatementStepResult::Row;
 	}
 
@@ -248,7 +249,7 @@ namespace
 		FSQLitePreparedStatement Stmt = Db.PrepareStatement(
 			TEXT("SELECT id FROM entities WHERE name LIKE '%' || ?1 || '%' ORDER BY length(name) LIMIT 5"));
 		if (!Stmt.IsValid()) { return Out; }
-		Stmt.SetBindingValueByIndex(1, Name);
+		GameIQSql::Bind(Stmt, 1, Name);
 		while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
 		{
 			FString FoundId;
@@ -346,11 +347,11 @@ namespace
 			UE_LOG(LogGameIQQuery, Warning, TEXT("Game IQ: search statement failed to prepare: %s"), *Db.GetLastError());
 			return Out;
 		}
-		Stmt.SetBindingValueByIndex(1, Match);
-		Stmt.SetBindingValueByIndex(2, Kind);
-		Stmt.SetBindingValueByIndex(3, Limit);
-		Stmt.SetBindingValueByIndex(4, Offset);
-		Stmt.SetBindingValueByIndex(5, PathPrefix);
+		GameIQSql::Bind(Stmt, 1, Match);
+		GameIQSql::Bind(Stmt, 2, Kind);
+		GameIQSql::Bind(Stmt, 3, Limit);
+		GameIQSql::Bind(Stmt, 4, Offset);
+		GameIQSql::Bind(Stmt, 5, PathPrefix);
 		while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
 		{
 			double Score = 0.0;
@@ -377,8 +378,8 @@ namespace
 				"WHERE x.dst = ?1 AND (se.id IS NULL OR NOT ("
 				"COALESCE(se.path, '') LIKE ?2 || '%' OR se.id LIKE 'asset:' || ?2 || '%'))"));
 			if (!ExtStmt.IsValid()) { H.ExternalRefs = H.InboundRefs; continue; }
-			ExtStmt.SetBindingValueByIndex(1, H.Entity->GetStringField(TEXT("id")));
-			ExtStmt.SetBindingValueByIndex(2, Root);
+			GameIQSql::Bind(ExtStmt, 1, H.Entity->GetStringField(TEXT("id")));
+			GameIQSql::Bind(ExtStmt, 2, Root);
 			if (ExtStmt.Step() == ESQLitePreparedStatementStepResult::Row)
 			{
 				ExtStmt.GetColumnValueByName(TEXT("n"), H.ExternalRefs);
@@ -519,11 +520,11 @@ namespace
 			UE_LOG(LogGameIQQuery, Warning, TEXT("Game IQ: traversal statement failed to prepare: %s"), *Db.GetLastError());
 			return;
 		}
-		Stmt.SetBindingValueByIndex(1, Id);
-		Stmt.SetBindingValueByIndex(2, EdgeType);
-		Stmt.SetBindingValueByIndex(3, Depth);
-		Stmt.SetBindingValueByIndex(4, Kind);
-		Stmt.SetBindingValueByIndex(5, MaxRows);
+		GameIQSql::Bind(Stmt, 1, Id);
+		GameIQSql::Bind(Stmt, 2, EdgeType);
+		GameIQSql::Bind(Stmt, 3, Depth);
+		GameIQSql::Bind(Stmt, 4, Kind);
+		GameIQSql::Bind(Stmt, 5, MaxRows);
 		while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
 		{
 			const FString EntId = ColStr(Stmt, TEXT("id"));
@@ -644,7 +645,7 @@ namespace
 			"SELECT id FROM entities WHERE path = ?1 OR id = 'asset:' || ?1 "
 			"ORDER BY CASE WHEN kind = 'blueprint' THEN 0 ELSE 1 END, id LIMIT 1"));
 		if (!Stmt.IsValid()) { return FString(); }
-		Stmt.SetBindingValueByIndex(1, IdOrPath);
+		GameIQSql::Bind(Stmt, 1, IdOrPath);
 		return Stmt.Step() == ESQLitePreparedStatementStepResult::Row ? ColStr(Stmt, TEXT("id")) : FString();
 	}
 
@@ -713,8 +714,8 @@ FString GameIQQuery::GetEntity(const FString& InId, int32 Cap)
 		FSQLitePreparedStatement Stmt = Db.PrepareStatement(TEXT("SELECT id, kind, text FROM chunks WHERE entity_id = ? LIMIT ?"));
 		if (Stmt.IsValid())
 		{
-			Stmt.SetBindingValueByIndex(1, Id);
-			Stmt.SetBindingValueByIndex(2, Cap);
+			GameIQSql::Bind(Stmt, 1, Id);
+			GameIQSql::Bind(Stmt, 2, Cap);
 			while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
 			{
 				TSharedRef<FJsonObject> C = MakeShared<FJsonObject>();
@@ -733,8 +734,8 @@ FString GameIQQuery::GetEntity(const FString& InId, int32 Cap)
 		FSQLitePreparedStatement Stmt = Db.PrepareStatement(Sql);
 		if (Stmt.IsValid())
 		{
-			Stmt.SetBindingValueByIndex(1, Id);
-			Stmt.SetBindingValueByIndex(2, Cap);
+			GameIQSql::Bind(Stmt, 1, Id);
+			GameIQSql::Bind(Stmt, 2, Cap);
 			while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
 			{
 				TSharedRef<FJsonObject> Ed = MakeShared<FJsonObject>();
@@ -767,8 +768,8 @@ FString GameIQQuery::GetEntity(const FString& InId, int32 Cap)
 		}
 		if (Stmt.IsValid())
 		{
-			Stmt.SetBindingValueByIndex(1, Id);
-			Stmt.SetBindingValueByIndex(2, Cap);
+			GameIQSql::Bind(Stmt, 1, Id);
+			GameIQSql::Bind(Stmt, 2, Cap);
 			while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
 			{
 				Children.Add(MakeShared<FJsonValueObject>(EntityJson(Stmt)));
@@ -785,7 +786,7 @@ FString GameIQQuery::GetEntity(const FString& InId, int32 Cap)
 			"FROM entities WHERE parent = ? GROUP BY class ORDER BY count DESC"));
 		if (Stmt.IsValid())
 		{
-			Stmt.SetBindingValueByIndex(1, Id);
+			GameIQSql::Bind(Stmt, 1, Id);
 			while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
 			{
 				TSharedRef<FJsonObject> Row = MakeShared<FJsonObject>();
@@ -854,8 +855,8 @@ FString GameIQQuery::Children(const FString& InId, const FString& ClassFilter, i
 			"WHERE parent = ?1 AND (?2 = '' OR COALESCE(json_extract(detail,'$.class'), kind) LIKE '%' || ?2 || '%')"));
 		if (Stmt.IsValid())
 		{
-			Stmt.SetBindingValueByIndex(1, Id);
-			Stmt.SetBindingValueByIndex(2, ClassFilter);
+			GameIQSql::Bind(Stmt, 1, Id);
+			GameIQSql::Bind(Stmt, 2, ClassFilter);
 			if (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
 			{
 				Stmt.GetColumnValueByName(TEXT("n"), Total);
@@ -871,10 +872,10 @@ FString GameIQQuery::Children(const FString& InId, const FString& ClassFilter, i
 			"ORDER BY id LIMIT ?3 OFFSET ?4"));
 		if (Stmt.IsValid())
 		{
-			Stmt.SetBindingValueByIndex(1, Id);
-			Stmt.SetBindingValueByIndex(2, ClassFilter);
-			Stmt.SetBindingValueByIndex(3, UseLimit);
-			Stmt.SetBindingValueByIndex(4, UseOffset);
+			GameIQSql::Bind(Stmt, 1, Id);
+			GameIQSql::Bind(Stmt, 2, ClassFilter);
+			GameIQSql::Bind(Stmt, 3, UseLimit);
+			GameIQSql::Bind(Stmt, 4, UseOffset);
 			while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
 			{
 				Rows.Add(MakeShared<FJsonValueObject>(EntityJson(Stmt)));
@@ -950,9 +951,9 @@ FString GameIQQuery::Impact(const FString& InId, int32 MaxDepth, int32 Limit)
 			"WHERE b.rn = 1 AND b.id <> ?1 LIMIT ?3"));
 		if (Stmt.IsValid())
 		{
-			Stmt.SetBindingValueByIndex(1, Id);
-			Stmt.SetBindingValueByIndex(2, DepthCap);
-			Stmt.SetBindingValueByIndex(3, InternalCap);
+			GameIQSql::Bind(Stmt, 1, Id);
+			GameIQSql::Bind(Stmt, 2, DepthCap);
+			GameIQSql::Bind(Stmt, 3, InternalCap);
 			while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
 			{
 				int32 HopDepth = 1;
@@ -1157,7 +1158,7 @@ FString GameIQQuery::GetBlueprintContext(const FString& IdOrPath, const FString&
 		"ORDER BY CASE c.kind WHEN 'recipe-summary' THEN 0 WHEN 'bp-pseudocode' THEN 1 ELSE 2 END,c.id"));
 	if (Stmt.IsValid())
 	{
-		Stmt.SetBindingValueByIndex(1, Id);
+		GameIQSql::Bind(Stmt, 1, Id);
 		while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
 		{
 			Chunks.Add({ ColStr(Stmt, TEXT("id")), ColStr(Stmt, TEXT("kind")), ColStr(Stmt, TEXT("text")) });
@@ -1261,8 +1262,8 @@ FString GameIQQuery::ExportGraph(const FString& TopicOrId, const FString& Format
 			"SELECT src,dst,type FROM edges WHERE ((?2 IN ('out','both') AND src=?1) OR "
 			"(?2 IN ('in','both') AND dst=?1)) ORDER BY type,src,dst"));
 		if (!Stmt.IsValid()) { continue; }
-		Stmt.SetBindingValueByIndex(1, Current);
-		Stmt.SetBindingValueByIndex(2, Direction.IsEmpty() ? TEXT("both") : Direction.ToLower());
+		GameIQSql::Bind(Stmt, 1, Current);
+		GameIQSql::Bind(Stmt, 2, Direction.IsEmpty() ? TEXT("both") : Direction.ToLower());
 		while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
 		{
 			FGraphEdge Edge{ ColStr(Stmt, TEXT("src")), ColStr(Stmt, TEXT("dst")), ColStr(Stmt, TEXT("type")) };
@@ -1450,7 +1451,7 @@ FString GameIQQuery::Doctor()
 	{
 		FSQLitePreparedStatement Stmt = Db.PrepareStatement(TEXT("SELECT 1 FROM sqlite_master WHERE name = ?"));
 		if (!Stmt.IsValid()) { MissingTables.Add(Table); continue; }
-		Stmt.SetBindingValueByIndex(1, FString(Table));
+		GameIQSql::Bind(Stmt, 1, FString(Table));
 		if (Stmt.Step() != ESQLitePreparedStatementStepResult::Row) { MissingTables.Add(Table); }
 	}
 	if (MissingTables.Num() > 0)
@@ -1782,7 +1783,7 @@ FString GameIQQuery::Drift(int32 Limit)
 			{
 				FSQLitePreparedStatement T = Db.PrepareStatement(
 					TEXT("SELECT text FROM chunks WHERE entity_id = ? AND kind='doc-section' LIMIT 1"));
-				if (T.IsValid()) { T.SetBindingValueByIndex(1, Src); if (T.Step() == ESQLitePreparedStatementStepResult::Row) { T.GetColumnValueByName(TEXT("text"), Text); } }
+				if (T.IsValid()) { GameIQSql::Bind(T, 1, Src); if (T.Step() == ESQLitePreparedStatementStepResult::Row) { T.GetColumnValueByName(TEXT("text"), Text); } }
 			}
 			if (Text.IsEmpty()) { continue; }
 
@@ -1790,7 +1791,7 @@ FString GameIQQuery::Drift(int32 Limit)
 			FString TargetName, DetailRaw;
 			{
 				FSQLitePreparedStatement E = Db.PrepareStatement(TEXT("SELECT name, detail FROM entities WHERE id = ? LIMIT 1"));
-				if (E.IsValid()) { E.SetBindingValueByIndex(1, Dst); if (E.Step() == ESQLitePreparedStatementStepResult::Row) { E.GetColumnValueByName(TEXT("name"), TargetName); E.GetColumnValueByName(TEXT("detail"), DetailRaw); } }
+				if (E.IsValid()) { GameIQSql::Bind(E, 1, Dst); if (E.Step() == ESQLitePreparedStatementStepResult::Row) { E.GetColumnValueByName(TEXT("name"), TargetName); E.GetColumnValueByName(TEXT("detail"), DetailRaw); } }
 			}
 			const TMap<FString, FString> Facts = FlattenScalars(ParseDetail(DetailRaw));
 			for (const TPair<FString, FString>& Fact : Facts)

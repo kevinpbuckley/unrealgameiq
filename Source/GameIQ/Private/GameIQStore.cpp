@@ -1,6 +1,7 @@
 // Copyright Buckley Builds LLC. All Rights Reserved.
 
 #include "GameIQStore.h"
+#include "GameIQSqlBind.h"
 
 #include "Dom/JsonObject.h"
 #include "GameIQJson.h"
@@ -142,7 +143,7 @@ FString FGameIQStore::ReadMetaValue(const FString& Key)
 		FSQLitePreparedStatement Stmt(Db, TEXT("SELECT value FROM meta WHERE key = ?"));
 		if (Stmt.IsValid())
 		{
-			Stmt.SetBindingValueByIndex(1, Key);
+			GameIQSql::Bind(Stmt, 1, Key);
 			if (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
 			{
 				Stmt.GetColumnValueByName(TEXT("value"), Value);
@@ -367,7 +368,7 @@ bool FGameIQStore::SchemaLooksValid()
 	{
 		FSQLitePreparedStatement Stmt(Db, TEXT("SELECT 1 FROM sqlite_master WHERE name = ?"));
 		if (!Stmt.IsValid()) { return false; }
-		Stmt.SetBindingValueByIndex(1, FString(Table));
+		GameIQSql::Bind(Stmt, 1, FString(Table));
 		if (Stmt.Step() != ESQLitePreparedStatementStepResult::Row)
 		{
 			UE_LOG(LogGameIQStore, Warning, TEXT("Game IQ: required table '%s' is missing."), Table);
@@ -425,8 +426,8 @@ void FGameIQStore::SetMeta(const FString& Key, const FString& Value)
 	FSQLitePreparedStatement& Stmt = GetCachedStmt(
 		TEXT("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"));
 	if (!Stmt.IsValid()) { return; }
-	Stmt.SetBindingValueByIndex(1, Key);
-	Stmt.SetBindingValueByIndex(2, Value);
+	GameIQSql::Bind(Stmt, 1, Key);
+	GameIQSql::Bind(Stmt, 2, Value);
 	Stmt.Execute();
 }
 
@@ -436,7 +437,7 @@ FString FGameIQStore::GetMeta(const FString& Key)
 	FSQLitePreparedStatement& Stmt = GetCachedStmt(TEXT("SELECT value FROM meta WHERE key = ?"));
 	if (!Stmt.IsValid()) { return Value; }
 	Stmt.Reset();
-	Stmt.SetBindingValueByIndex(1, Key);
+	GameIQSql::Bind(Stmt, 1, Key);
 	if (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
 	{
 		Stmt.GetColumnValueByName(TEXT("value"), Value);
@@ -468,7 +469,7 @@ int64 FGameIQStore::CountChunksForProducer(const FString& Producer)
 	int64 N = 0;
 	if (Stmt.IsValid())
 	{
-		Stmt.SetBindingValueByIndex(1, Producer);
+		GameIQSql::Bind(Stmt, 1, Producer);
 		if (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
 		{
 			Stmt.GetColumnValueByIndex(0, N);
@@ -486,28 +487,28 @@ void FGameIQStore::UpsertEntity(const FJsonObject& E, const FString& Producer)
 		     "parent=excluded.parent, source=excluded.source, summary=excluded.summary, "
 		     "detail=excluded.detail, producer=excluded.producer, authority=excluded.authority"));
 	if (!Stmt.IsValid()) { return; }
-	Stmt.SetBindingValueByIndex(1, E.GetStringField(TEXT("id")));
-	Stmt.SetBindingValueByIndex(2, E.GetStringField(TEXT("kind")));
-	Stmt.SetBindingValueByIndex(3, E.GetStringField(TEXT("name")));
-	Stmt.SetBindingValueByIndex(4, E.GetStringField(TEXT("path")));
+	GameIQSql::Bind(Stmt, 1, E.GetStringField(TEXT("id")));
+	GameIQSql::Bind(Stmt, 2, E.GetStringField(TEXT("kind")));
+	GameIQSql::Bind(Stmt, 3, E.GetStringField(TEXT("name")));
+	GameIQSql::Bind(Stmt, 4, E.GetStringField(TEXT("path")));
 	FString Parent;
-	if (E.TryGetStringField(TEXT("parent"), Parent) && !Parent.IsEmpty()) { Stmt.SetBindingValueByIndex(5, Parent); }
+	if (E.TryGetStringField(TEXT("parent"), Parent) && !Parent.IsEmpty()) { GameIQSql::Bind(Stmt, 5, Parent); }
 	else { Stmt.SetBindingValueByIndex(5); } // NULL
-	Stmt.SetBindingValueByIndex(6, E.GetStringField(TEXT("source")));
+	GameIQSql::Bind(Stmt, 6, E.GetStringField(TEXT("source")));
 	FString Summary;
-	if (E.TryGetStringField(TEXT("summary"), Summary) && !Summary.IsEmpty()) { Stmt.SetBindingValueByIndex(7, Summary); }
+	if (E.TryGetStringField(TEXT("summary"), Summary) && !Summary.IsEmpty()) { GameIQSql::Bind(Stmt, 7, Summary); }
 	else { Stmt.SetBindingValueByIndex(7); }
 	const FString Detail = AsObject(E, TEXT("detail"));
-	if (!Detail.IsEmpty()) { Stmt.SetBindingValueByIndex(8, Detail); }
+	if (!Detail.IsEmpty()) { GameIQSql::Bind(Stmt, 8, Detail); }
 	else { Stmt.SetBindingValueByIndex(8); }
-	Stmt.SetBindingValueByIndex(9, Producer);
+	GameIQSql::Bind(Stmt, 9, Producer);
 	// Provenance: a producer omits `authority` for extracted ground truth; docs set 'stated-intent'.
 	FString AuthorityTag;
 	if (!(E.TryGetStringField(TEXT("authority"), AuthorityTag) && !AuthorityTag.IsEmpty()))
 	{
 		AuthorityTag = GameIQ::Authority::ExtractedFact;
 	}
-	Stmt.SetBindingValueByIndex(10, AuthorityTag);
+	GameIQSql::Bind(Stmt, 10, AuthorityTag);
 	Stmt.Execute();
 }
 
@@ -517,13 +518,13 @@ void FGameIQStore::InsertEdge(const FJsonObject& E, const FString& Producer)
 		TEXT("INSERT INTO edges (src, dst, type, attrs, producer) VALUES (?, ?, ?, ?, ?) "
 		     "ON CONFLICT(src, dst, type) DO UPDATE SET attrs=excluded.attrs, producer=excluded.producer"));
 	if (!Stmt.IsValid()) { return; }
-	Stmt.SetBindingValueByIndex(1, E.GetStringField(TEXT("src")));
-	Stmt.SetBindingValueByIndex(2, E.GetStringField(TEXT("dst")));
-	Stmt.SetBindingValueByIndex(3, E.GetStringField(TEXT("type")));
+	GameIQSql::Bind(Stmt, 1, E.GetStringField(TEXT("src")));
+	GameIQSql::Bind(Stmt, 2, E.GetStringField(TEXT("dst")));
+	GameIQSql::Bind(Stmt, 3, E.GetStringField(TEXT("type")));
 	const FString Attrs = AsObject(E, TEXT("attrs"));
-	if (!Attrs.IsEmpty()) { Stmt.SetBindingValueByIndex(4, Attrs); }
+	if (!Attrs.IsEmpty()) { GameIQSql::Bind(Stmt, 4, Attrs); }
 	else { Stmt.SetBindingValueByIndex(4); }
-	Stmt.SetBindingValueByIndex(5, Producer);
+	GameIQSql::Bind(Stmt, 5, Producer);
 	Stmt.Execute();
 }
 
@@ -538,12 +539,12 @@ void FGameIQStore::InsertChunk(const FJsonObject& C, const FString& Producer)
 		     "ON CONFLICT(id) DO UPDATE SET entity_id=excluded.entity_id, kind=excluded.kind, "
 		     "text=excluded.text, producer=excluded.producer, aux=excluded.aux"));
 	if (!Stmt.IsValid()) { return; }
-	Stmt.SetBindingValueByIndex(1, ChunkId);
-	Stmt.SetBindingValueByIndex(2, EntityId);
-	Stmt.SetBindingValueByIndex(3, C.GetStringField(TEXT("kind")));
-	Stmt.SetBindingValueByIndex(4, Text);
-	Stmt.SetBindingValueByIndex(5, Producer);
-	Stmt.SetBindingValueByIndex(6, GameIQText::BuildAuxTokens(EntityId, Text));
+	GameIQSql::Bind(Stmt, 1, ChunkId);
+	GameIQSql::Bind(Stmt, 2, EntityId);
+	GameIQSql::Bind(Stmt, 3, C.GetStringField(TEXT("kind")));
+	GameIQSql::Bind(Stmt, 4, Text);
+	GameIQSql::Bind(Stmt, 5, Producer);
+	GameIQSql::Bind(Stmt, 6, GameIQText::BuildAuxTokens(EntityId, Text));
 	Stmt.Execute();
 }
 
@@ -556,7 +557,7 @@ void FGameIQStore::DeleteByProducer(const FString& Producer)
 		TEXT("DELETE FROM entities WHERE producer = ?") })
 	{
 		FSQLitePreparedStatement& Stmt = GetCachedStmt(Sql);
-		if (Stmt.IsValid()) { Stmt.SetBindingValueByIndex(1, Producer); Stmt.Execute(); }
+		if (Stmt.IsValid()) { GameIQSql::Bind(Stmt, 1, Producer); Stmt.Execute(); }
 	}
 }
 
@@ -575,7 +576,7 @@ TArray<FString> FGameIQStore::CollectSubtreeIds(const FString& RootId)
 			FSQLitePreparedStatement& Stmt = GetCachedStmt(TEXT("SELECT id FROM entities WHERE parent = ?"));
 			if (!Stmt.IsValid()) { continue; }
 			Stmt.Reset(); // manual Step() loop doesn't auto-reset like Execute() does — must rewind before reuse
-			Stmt.SetBindingValueByIndex(1, P);
+			GameIQSql::Bind(Stmt, 1, P);
 			while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
 			{
 				FString Kid;
@@ -598,7 +599,7 @@ void FGameIQStore::DeleteSubtree(const FString& RootId)
 			TEXT("DELETE FROM entities WHERE id = ?") })
 		{
 			FSQLitePreparedStatement& Stmt = GetCachedStmt(Sql);
-			if (Stmt.IsValid()) { Stmt.SetBindingValueByIndex(1, Id); Stmt.Execute(); }
+			if (Stmt.IsValid()) { GameIQSql::Bind(Stmt, 1, Id); Stmt.Execute(); }
 		}
 	}
 }
@@ -617,8 +618,8 @@ void FGameIQStore::DeleteSubtreeForProducer(const FString& RootId, const FString
 			FSQLitePreparedStatement& Stmt = GetCachedStmt(Sql);
 			if (Stmt.IsValid())
 			{
-				Stmt.SetBindingValueByIndex(1, Id);
-				Stmt.SetBindingValueByIndex(2, Producer);
+				GameIQSql::Bind(Stmt, 1, Id);
+				GameIQSql::Bind(Stmt, 2, Producer);
 				Stmt.Execute();
 			}
 		}

@@ -1,6 +1,7 @@
 // Copyright Buckley Builds LLC. All Rights Reserved.
 
 #include "GameIQSnapshots.h"
+#include "GameIQSqlBind.h"
 
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
@@ -142,7 +143,7 @@ namespace
 	{
 		FSQLitePreparedStatement Stmt = Db.PrepareStatement(TEXT("SELECT value FROM meta WHERE key = ?"));
 		if (!Stmt.IsValid()) { return FString(); }
-		Stmt.SetBindingValueByIndex(1, Key);
+		GameIQSql::Bind(Stmt, 1, Key);
 		return Stmt.Step() == ESQLitePreparedStatementStepResult::Row ? Col(Stmt, TEXT("value")) : FString();
 	}
 
