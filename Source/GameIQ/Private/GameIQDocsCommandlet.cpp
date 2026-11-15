@@ -41,6 +41,11 @@ int32 UGameIQDocsCommandlet::Main(const FString& /*Params*/)
 		}
 	}
 
+	// Fingerprint the doc files BEFORE reading them: a doc saved while the extraction runs then
+	// leaves a stamp that no longer matches, so the next check reindexes it (stamping afterwards
+	// would record the new file as already indexed). Issue #29.
+	const FString DocsFingerprint = GameIQDocsFingerprint::Compute(Root);
+
 	int32 Walked = 0, Skipped = 0;
 	const int32 Docs = GameIQDocsExtract::ExtractTree(
 		DocsRoot, TEXT("repo"), FString(), Entities, Edges, Chunks, Walked, Skipped, /*bSkipPlugins=*/true);
@@ -49,7 +54,7 @@ int32 UGameIQDocsCommandlet::Main(const FString& /*Params*/)
 	IFileManager::Get().MakeDirectory(*OutDir, true);
 	GameIQ::WriteOutput(OutDir, TEXT("docs.json"), DocsProducer, Entities, Edges, Chunks);
 	// Stamp what this extraction saw: the editor's docs watcher and Doctor compare against it (issue #29).
-	GameIQDocsFingerprint::Write(Root, GameIQDocsFingerprint::Compute(Root));
+	GameIQDocsFingerprint::Write(Root, DocsFingerprint);
 
 	UE_LOG(LogGameIQDocs, Display,
 		TEXT("Game IQ docs: %d documents (%d files walked, %d skipped) → %d entities, %d chunks → docs.json"),

@@ -62,6 +62,8 @@ private:
 	FDelegateHandle DocsWatcherHandle;
 	FTSTicker::FDelegateHandle DocsDebounceHandle;
 	bool bDocsCheckInFlight = false;
+	/** FPlatformTime::Seconds() when the last automatic docs reindex was queued (0 = never). */
+	double LastDocsReindexQueuedAt = 0.0;
 
 	// ---- Background reindex queue: the build runner runs one commandlet at a time ----
 	/** Queue a GameIQCppBuild / GameIQDocsBuild run; it starts as soon as the runner is idle. */

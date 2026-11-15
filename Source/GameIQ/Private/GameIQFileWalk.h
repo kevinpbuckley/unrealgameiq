@@ -149,9 +149,23 @@ namespace GameIQWalk
 	/**
 	 * Directories the walk never enters (issue #30): build/cache output, every dot-directory
 	 * (.git, .gameiq, .claude, .vs, .idea, .vscode — agent worktrees under .claude/worktrees were
-	 * 46 of 105 indexed documents in one project), and any directory holding a `.git` FILE, which
-	 * marks a linked git worktree: a second copy of the project that would duplicate every entity.
+	 * 46 of 105 indexed documents in one project), and any linked git worktree: a second copy of
+	 * the project that would duplicate every entity. A linked worktree is a directory holding a
+	 * `.git` FILE whose `gitdir:` points into a `worktrees/` folder. A git SUBMODULE also has a
+	 * `.git` file (pointing into `modules/`), but it is real project content (plugins are often
+	 * submodules), so it is kept, like a nested clone with a `.git` directory.
 	 */
+	inline bool IsLinkedWorktree(const FString& FullDir)
+	{
+		const FString GitMarker = FullDir / TEXT(".git");
+		IFileManager& FM = IFileManager::Get();
+		if (!FM.FileExists(*GitMarker) || FM.DirectoryExists(*GitMarker)) { return false; }
+		FString Text;
+		if (!FFileHelper::LoadFileToString(Text, *GitMarker)) { return false; }
+		Text.ReplaceInline(TEXT("\\"), TEXT("/"));
+		return Text.TrimStart().StartsWith(TEXT("gitdir:")) && Text.Contains(TEXT("/worktrees/"));
+	}
+
 	inline bool ShouldSkipDirectory(const FString& FullDir, const FString& Name)
 	{
 		static const TArray<FString> Skip = {
@@ -159,9 +173,7 @@ namespace GameIQWalk
 			TEXT("node_modules") };
 		if (Name.StartsWith(TEXT("."))) { return true; }
 		if (Skip.Contains(Name)) { return true; }
-		const FString GitMarker = FullDir / TEXT(".git");
-		IFileManager& FM = IFileManager::Get();
-		return FM.FileExists(*GitMarker) && !FM.DirectoryExists(*GitMarker);
+		return IsLinkedWorktree(FullDir);
 	}
 
 	inline void Collect(const FString& Root, const FString& Dir, const TArray<FString>& LowerExts,

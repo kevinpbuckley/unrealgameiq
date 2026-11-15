@@ -454,6 +454,7 @@ void UGameIQSaveHookSubsystem::CheckDocsFreshness()
 			// Empty Stored = an index from before docs fingerprints: reindex once, which stamps one.
 			if (Current == Stored) { return; }
 			UE_LOG(LogGameIQHook, Display, TEXT("Game IQ: design docs changed since the last docs extraction — reindexing documents in the background."));
+			This->LastDocsReindexQueuedAt = FPlatformTime::Seconds();
 			This->QueueReindex(TEXT("GameIQDocsBuild"));
 		});
 	});
@@ -504,6 +505,14 @@ void UGameIQSaveHookSubsystem::OnDocsDirectoryChanged(const TArray<FFileChangeDa
 
 	// Debounce: an editor saving a doc fires several events, and an agent edits docs in bursts.
 	// Re-arm a 10 s timer on every doc event; the fingerprint check runs once things go quiet.
+	// A reindex is a whole UnrealEditor-Cmd process, so the timer also never fires sooner than
+	// the minimum interval after the previous automatic docs reindex.
+	float Delay = 10.0f;
+	if (LastDocsReindexQueuedAt > 0.0)
+	{
+		const double MinInterval = static_cast<double>(GetDefault<UGameIQSettings>()->AutoReindexDocsMinIntervalSeconds);
+		Delay = FMath::Max(Delay, static_cast<float>(MinInterval - (FPlatformTime::Seconds() - LastDocsReindexQueuedAt)));
+	}
 	if (DocsDebounceHandle.IsValid())
 	{
 		FTSTicker::GetCoreTicker().RemoveTicker(DocsDebounceHandle);
@@ -517,7 +526,7 @@ void UGameIQSaveHookSubsystem::OnDocsDirectoryChanged(const TArray<FFileChangeDa
 				This->CheckDocsFreshness();
 			}
 			return false;
-		}), 10.0f);
+		}), Delay);
 }
 
 // ---- Startup catch-up scan (issue #35) -----------------------------------------------------

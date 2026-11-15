@@ -53,6 +53,15 @@ public:
 	bool bAutoReindexDocs = true;
 
 	/**
+	 * Shortest time between two automatic docs reindexes started by the docs watcher. Each reindex
+	 * runs a headless UnrealEditor-Cmd process next to the editor, so a project whose docs change
+	 * every few seconds (agents writing notes) must not start one per change: changes that arrive
+	 * inside the interval are picked up by one reindex when it ends.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Indexing", meta = (ClampMin = "10", ClampMax = "86400", Units = "s"))
+	int32 AutoReindexDocsMinIntervalSeconds = 300;
+
+	/**
 	 * On editor startup (once the Asset Registry has scanned), add every /Game asset that is on disk
 	 * but missing from the index (marketplace packs, a VCS sync — anything that arrived without an
 	 * editor save) as registry-level entries with size facts and dependencies, and drop entries whose

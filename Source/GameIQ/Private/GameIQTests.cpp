@@ -1019,8 +1019,9 @@ namespace GameIQTestUtil
 	}
 }
 
-/** Issue #30: the walk skips every dot-directory and linked git worktrees (a `.git` FILE), keeps
- *  nested clones (a `.git` directory), and honours exclude globs from gameiq.config.json. */
+/** Issue #30: the walk skips every dot-directory and linked git worktrees (a `.git` FILE pointing
+ *  into worktrees/), keeps nested clones (a `.git` directory) and submodules (a `.git` file
+ *  pointing into modules/), and honours exclude globs from gameiq.config.json. */
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGameIQWalkSkipTest, "GameIQ.Walk.SkipsDotDirsWorktreesAndGlobs",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 bool FGameIQWalkSkipTest::RunTest(const FString& Parameters)
@@ -1034,6 +1035,8 @@ bool FGameIQWalkSkipTest::RunTest(const FString& Parameters)
 	WriteFile(Root / TEXT("Linked/Docs/Design.md"));
 	WriteFile(Root / TEXT("Nested/.git/HEAD"), TEXT("ref: refs/heads/main"));
 	WriteFile(Root / TEXT("Nested/Readme.md"));
+	WriteFile(Root / TEXT("Plugins/Sub/.git"), TEXT("gitdir: ../../.git/modules/Plugins/Sub"));
+	WriteFile(Root / TEXT("Plugins/Sub/Readme.md"));
 	WriteFile(Root / TEXT("Docs/Archive2025/Old.md"));
 	WriteFile(Root / TEXT("Docs/Draft.bak.md"));
 	WriteFile(Root / TEXT("gameiq.config.json"), TEXT("{ \"exclude\": [\"Docs/Archive*\", \"*.bak.md\"] }"));
@@ -1048,7 +1051,8 @@ bool FGameIQWalkSkipTest::RunTest(const FString& Parameters)
 	TestFalse(TEXT("linked worktree (.git file) skipped"), Rel.Contains(TEXT("Linked/Docs/Design.md")));
 	TestFalse(TEXT("directory glob excluded"), Rel.Contains(TEXT("Docs/Archive2025/Old.md")));
 	TestFalse(TEXT("file glob excluded"), Rel.Contains(TEXT("Docs/Draft.bak.md")));
-	TestEqual(TEXT("exactly the two real docs"), Rel.Num(), 2);
+	TestTrue(TEXT("git submodule (.git file into modules/) kept"), Rel.Contains(TEXT("Plugins/Sub/Readme.md")));
+	TestEqual(TEXT("exactly the three real docs"), Rel.Num(), 3);
 
 	// The docs watcher filter applies the same rules.
 	TestTrue(TEXT("watcher: project doc counts"), GameIQDocsFingerprint::IsDocFile(Root, Root / TEXT("Docs/Design.md")));
@@ -1149,6 +1153,57 @@ bool FGameIQUnusedTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("exact literal -> possibly loaded by path"), ByPath.Contains(TEXT("asset:/Game/Anim/A_ByLiteral")));
 	TestTrue(TEXT("format-string pattern -> possibly loaded by path"), ByPath.Contains(TEXT("asset:/Game/Anim/A_Idle_Seated_REX")));
 	TestFalse(TEXT("literal-loaded asset not listed as unused"), Unused.Contains(TEXT("asset:/Game/Anim/A_ByLiteral")));
+	return true;
+}
+
+/** Issue #31 migration: an index written by the previous schema (v4, self-edges stored) upgrades
+ *  in place on open — only the self-edges go, every real edge and row stays. */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGameIQSchemaV5UpgradeTest, "GameIQ.Store.UpgradesV4IndexDroppingOnlySelfEdges",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGameIQSchemaV5UpgradeTest::RunTest(const FString& Parameters)
+{
+	using namespace GameIQTestUtil;
+	const FString DbPath = TempDbPath(TEXT("upgrade_v4.db"));
+	FGameIQStore Store;
+	if (!TestTrue(TEXT("open"), Store.OpenAtPath(DbPath))) { return false; }
+	Store.IngestProducer(TEXT("test"),
+		{ Entity(TEXT("asset:/Game/A"), TEXT("asset"), TEXT("A")), Entity(TEXT("asset:/Game/B"), TEXT("asset"), TEXT("B")) },
+		{ Edge(TEXT("asset:/Game/A"), TEXT("asset:/Game/B"), TEXT("depends-on")) },
+		{ Chunk(TEXT("asset:/Game/A#summary"), TEXT("asset:/Game/A"), TEXT("alpha summary")) });
+	Store.Close();
+
+	// Put the file back into the v4 shape: a stored self-edge, no type index, user_version 4.
+	{
+		FSQLiteDatabase Db;
+		if (!TestTrue(TEXT("raw open"), Db.Open(*DbPath, ESQLiteDatabaseOpenMode::ReadWrite))) { return false; }
+		TestTrue(TEXT("plant self-edge"), Db.Execute(TEXT("INSERT INTO edges (src, dst, type, producer) VALUES ('asset:/Game/A', 'asset:/Game/A', 'references', 'test');")));
+		TestTrue(TEXT("drop v5 index"), Db.Execute(TEXT("DROP INDEX IF EXISTS idx_edges_type;")));
+		TestTrue(TEXT("back to v4"), Db.SetUserVersion(4));
+		Db.Close();
+	}
+	TestEqual(TEXT("v4 file holds the self-edge"), CountRows(DbPath, TEXT("SELECT COUNT(*) FROM edges WHERE src = dst")), (int64)1);
+
+	// The read-only query layer must already cope with the un-migrated file.
+	{
+		GameIQQuery::SetDbPathOverrideForTests(DbPath);
+		ON_SCOPE_EXIT { GameIQQuery::SetDbPathOverrideForTests(FString()); };
+		const TSharedPtr<FJsonValue> Result = ParseResult(GameIQQuery::ProjectStats(TEXT("unused")));
+		const TSharedPtr<FJsonObject>* Payload = nullptr;
+		if (!TestTrue(TEXT("unused answers on a v4 file"), Result.IsValid() && Result->TryGetObject(Payload))) { return false; }
+		TestTrue(TEXT("self-edge does not count as use before the migration"),
+			IdsOf((*Payload)->GetArrayField(TEXT("unused"))).Contains(TEXT("asset:/Game/A")));
+	}
+
+	FGameIQStore Upgraded;
+	if (!TestTrue(TEXT("v4 index opens with the new store"), Upgraded.OpenAtPath(DbPath))) { return false; }
+	Upgraded.Close();
+	TestEqual(TEXT("schema is v5"), CountRows(DbPath, TEXT("PRAGMA user_version")), (int64)5);
+	TestEqual(TEXT("self-edge removed"), CountRows(DbPath, TEXT("SELECT COUNT(*) FROM edges WHERE src = dst")), (int64)0);
+	TestEqual(TEXT("real edge kept"), CountRows(DbPath, TEXT("SELECT COUNT(*) FROM edges")), (int64)1);
+	TestEqual(TEXT("entities kept"), CountRows(DbPath, TEXT("SELECT COUNT(*) FROM entities")), (int64)2);
+	TestEqual(TEXT("chunks kept"), CountRows(DbPath, TEXT("SELECT COUNT(*) FROM chunks")), (int64)1);
+	TestEqual(TEXT("full-text rows kept"), CountRows(DbPath, TEXT("SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH 'alpha'")), (int64)1);
+	TestEqual(TEXT("type index created"), CountRows(DbPath, TEXT("SELECT COUNT(*) FROM sqlite_master WHERE name = 'idx_edges_type'")), (int64)1);
 	return true;
 }
 

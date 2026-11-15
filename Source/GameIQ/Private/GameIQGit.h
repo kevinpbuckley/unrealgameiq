@@ -90,7 +90,14 @@ namespace GameIQGit
 		{
 			OutSha = Head;
 		}
-		return OutSha.Len() >= 40;
+		// A sha is passed to `git show` later: accept nothing but hex (a hand-edited or damaged
+		// HEAD/ref file must not become a git argument).
+		if (OutSha.Len() < 40) { return false; }
+		for (const TCHAR C : OutSha)
+		{
+			if (!FChar::IsHexDigit(C)) { OutSha.Reset(); return false; }
+		}
+		return true;
 	}
 
 	/** Run `git <Args>` in Root; true on exit code 0. Output trimmed. */

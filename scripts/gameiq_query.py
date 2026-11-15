@@ -501,9 +501,18 @@ def is_excluded(name, rel, excludes):
 
 
 def skip_dir(full, name):
+    """Dot-dirs, build output and linked git worktrees (a .git FILE pointing into worktrees/).
+    A submodule's .git file points into modules/ and is kept, as in GameIQWalk::IsLinkedWorktree."""
     if name.startswith(".") or name in SKIP_DIRS:
         return True
-    return (Path(full) / ".git").is_file()
+    marker = Path(full) / ".git"
+    if not marker.is_file():
+        return False
+    try:
+        text = marker.read_text(encoding="utf-8", errors="replace").replace("\\", "/")
+    except OSError:
+        return False
+    return text.lstrip().startswith("gitdir:") and "/worktrees/" in text
 
 
 def walk_files(root, exts):
@@ -803,8 +812,33 @@ def cmd_changes(con, a):
                           "provenance": "semantic comparison of GameIQ index entities, edges, and chunks"})
 
 
+# What the `sql` command may do: read rows and call functions. Everything else is denied by the
+# SQLite authorizer, so ATTACH (opens another file), VACUUM INTO (writes a file), PRAGMA (can turn
+# query_only off) and every INSERT/UPDATE/DELETE/DDL fail even though the file is opened mode=ro.
+SQL_ALLOWED = {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION, sqlite3.SQLITE_RECURSIVE}
+SQL_SCHEMA_PRAGMAS = {"table_info", "table_xinfo", "table_list", "index_list", "index_info", "index_xinfo"}
+SQL_VALUE_PRAGMAS = {"user_version", "schema_version", "page_count", "page_size", "freelist_count",
+                     "journal_mode", "encoding", "data_version"}
+
+
+def sql_authorizer(action, arg1, arg2, _db, _trigger):
+    if action in SQL_ALLOWED:
+        return sqlite3.SQLITE_OK
+    if action == sqlite3.SQLITE_PRAGMA:
+        name = (arg1 or "").lower()
+        # Schema pragmas take a table/index name and only read; value pragmas are allowed without a
+        # value (with one they set it). FTS5 issues "PRAGMA data_version" internally.
+        if name in SQL_SCHEMA_PRAGMAS or (name in SQL_VALUE_PRAGMAS and arg2 is None):
+            return sqlite3.SQLITE_OK
+    return sqlite3.SQLITE_DENY
+
+
 def cmd_sql(con, a):
-    return envelope(con, rows(con, a.statement))
+    con.set_authorizer(sql_authorizer)
+    try:
+        return envelope(con, rows(con, a.statement))
+    finally:
+        con.set_authorizer(None)
 
 
 # ---- main ------------------------------------------------------------------------------------

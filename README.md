@@ -32,7 +32,8 @@ The plugin does everything in-process:
   VibeUE — zero extra setup, answered in-process.
 - **Stay fresh** — an editor save hook patches the index on every asset save / delete / rename; a
   source-tree fingerprint check reindexes C++ automatically on editor startup and after Live Coding
-  patches; the docs folder is watched and design docs reindex when they change; and a catch-up scan on
+  patches; the docs folder is watched and design docs reindex when they change (a background
+  `UnrealEditor-Cmd` run, at most one every 5 minutes by default); and a catch-up scan on
   editor start adds assets that arrived without a save (marketplace packs, a VCS sync). Every response
   says how fresh each source is (`index.bySource`). No manual rebuilds in the normal edit loop.
 - **Query without the editor** — `scripts/gameiq_query.py` opens `.gameiq/index.db` read-only with stock
@@ -182,8 +183,9 @@ To keep the index focused on *your* game, add a `gameiq.config.json` at the proj
 
 Entries match a directory name (`VibeUE`), a project-relative path (`Plugins/VibeUE`), or a glob over
 either (`Docs/Archive*`, `*.bak.md`). Add `Plugins/GameIQ` (or all of `Plugins`) so Game IQ's own source
-stays out of your index. Every dot-directory (`.git`, `.claude`, `.vs`, …) and every folder holding a
-`.git` file (a linked git worktree, i.e. a second copy of the project) is always skipped.
+stays out of your index. Every dot-directory (`.git`, `.claude`, `.vs`, …) and every linked git
+worktree (a folder whose `.git` file points into `worktrees/`, i.e. a second copy of the project) is
+always skipped; submodules and nested clones are kept.
 You can also edit the list in the editor under **Project Settings → Plugins → Game IQ**.
 
 ## Status
