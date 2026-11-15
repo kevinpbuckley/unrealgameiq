@@ -31,6 +31,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 if ($All) { $Build = $true; $Index = $true }
+. (Join-Path $PSScriptRoot "GameIQCommon.ps1")
 
 $repoRoot = Split-Path $PSScriptRoot -Parent
 $projectRoot = (Resolve-Path $Project).Path
@@ -48,7 +49,7 @@ Write-Host "Project: $projectPath" -ForegroundColor Yellow
 # Copy only the deployable plugin payload. Keep target build artifacts for incremental builds.
 New-Item -ItemType Directory -Force -Path $pluginDst | Out-Null
 Copy-Item -Force (Join-Path $repoRoot "GameIQ.uplugin") $pluginDst
-foreach ($directory in @("Source", "Content", "Resources", "Config")) {
+foreach ($directory in @("Source", "Content", "Resources", "Config", "Skills", "scripts")) {
     $source = Join-Path $repoRoot $directory
     if (-not (Test-Path $source)) { continue }
 
@@ -75,31 +76,9 @@ if ($entry) {
 }
 ($projectJson | ConvertTo-Json -Depth 20) | Set-Content $projectPath -Encoding utf8
 
-function Resolve-Engine([string]$Association) {
-    try {
-        $builds = Get-ItemProperty "HKCU:\SOFTWARE\Epic Games\Unreal Engine\Builds" -ErrorAction SilentlyContinue
-        if ($builds.$Association) { return $builds.$Association }
-    } catch {}
-
-    try {
-        $release = Get-ItemProperty "HKLM:\SOFTWARE\EpicGames\Unreal Engine\$Association" -ErrorAction SilentlyContinue
-        if ($release.InstalledDirectory) { return $release.InstalledDirectory }
-    } catch {}
-
-    foreach ($candidate in @(
-        "E:\Program Files\Epic Games\UE_$Association",
-        "C:\Program Files\Epic Games\UE_$Association",
-        "D:\Program Files\Epic Games\UE_$Association"
-    )) {
-        if (Test-Path $candidate) { return $candidate }
-    }
-    return $null
-}
-
 $enginePath = $null
 if ($Build -or $Index) {
-    $enginePath = Resolve-Engine $projectJson.EngineAssociation
-    if (-not $enginePath) { throw "Could not locate Unreal Engine '$($projectJson.EngineAssociation)'" }
+    $enginePath = Resolve-GameIQEngine $projectPath
     Write-Host "Engine : $enginePath" -ForegroundColor Yellow
 }
 
@@ -112,8 +91,8 @@ if ($Build) {
 }
 
 if ($Index) {
-    if (Get-Process UnrealEditor -ErrorAction SilentlyContinue) {
-        throw "Close Unreal Editor before running GameIQBuild."
+    if (Test-GameIQProjectOpen $projectPath) {
+        throw "Close the Unreal Editor that has $projectPath open before running GameIQBuild."
     }
 
     $commandlet = Join-Path $enginePath "Engine\Binaries\Win64\UnrealEditor-Cmd.exe"
