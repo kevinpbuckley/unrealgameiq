@@ -3,6 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "AssetRegistry/AssetData.h"
 #include "Containers/Ticker.h"
 #include "EditorSubsystem.h"
 #include "UObject/ObjectSaveContext.h"
@@ -50,6 +51,48 @@ private:
 
 	/** Compare the source-tree fingerprint with the last code extraction's; reindex C++ on mismatch. */
 	void CheckCppFreshness();
+
+	// ---- Docs auto-reindex (issue #29) ----
+	/** Compare the docs fingerprint with the last docs extraction's; queue a docs reindex on mismatch. */
+	void CheckDocsFreshness();
+	void StartDocsWatcher();
+	void StopDocsWatcher();
+	void OnDocsDirectoryChanged(const TArray<struct FFileChangeData>& Changes);
+	FString WatchedDocsDir;
+	FDelegateHandle DocsWatcherHandle;
+	FTSTicker::FDelegateHandle DocsDebounceHandle;
+	bool bDocsCheckInFlight = false;
+	/** FPlatformTime::Seconds() when the last automatic docs reindex was queued (0 = never). */
+	double LastDocsReindexQueuedAt = 0.0;
+
+	// ---- Background reindex queue: the build runner runs one commandlet at a time ----
+	/** Queue a GameIQCppBuild / GameIQDocsBuild run; it starts as soon as the runner is idle. */
+	void QueueReindex(const FString& RunArg);
+	bool PumpReindexQueue(float DeltaTime);
+	TArray<FString> QueuedRuns;
+	FTSTicker::FDelegateHandle QueueHandle;
+
+	// ---- Startup catch-up scan (issue #35) ----
+	/** Diff /Game in the Asset Registry against the index; add missing assets (Tier 0 + tag summary),
+	 *  drop indexed assets whose package is gone. Batched across ticks. */
+	void StartCatchUpScan();
+	bool CatchUpTick(float DeltaTime);
+	TArray<FAssetData> CatchUpMissing;
+	TArray<FString> CatchUpGone;
+	int32 CatchUpAdded = 0;
+	FTSTicker::FDelegateHandle CatchUpHandle;
+	FDelegateHandle FilesLoadedHandle;
+	bool bCatchUpDone = false;
+
+	// ---- Per-commit snapshots (issue #36) ----
+	bool CheckGitHead(float DeltaTime);
+	FTSTicker::FDelegateHandle GitHeadHandle;
+	FString LastSeenGitHead;
+	bool bSnapshotInFlight = false;
+
+	/** False in commandlets and when the editor runs with -NoGameIQAuto (tests, CI): no background
+	 *  reindexes, catch-up writes, or automatic snapshots. */
+	static bool AutomationAllowed();
 
 	/** Saved packages waiting for extraction (deduped; insertion-ordered). */
 	TArray<FString> PendingPackages;

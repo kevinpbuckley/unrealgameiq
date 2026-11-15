@@ -4,8 +4,13 @@
 #include "Dom/JsonValue.h"
 #include "GameIQCppParse.h"
 #include "GameIQDocText.h"
+#include "GameIQFileWalk.h"
+#include "GameIQGit.h"
+#include "GameIQPaths.h"
+#include "GameIQProjectChecks.h"
 #include "GameIQQuery.h"
 #include "GameIQSnapshots.h"
+#include "Misc/FileHelper.h"
 #include "GameIQStore.h"
 #include "GameIQTextUtil.h"
 #include "HAL/FileManager.h"
@@ -966,6 +971,426 @@ bool FGameIQSnapshotChangesTest::RunTest(const FString& Parameters)
 	const TSharedPtr<FJsonObject>* RemovedObject = nullptr;
 	TestTrue(TEXT("snapshot can be removed"), RemovedResult.IsValid() && RemovedResult->TryGetObject(RemovedObject) &&
 		(*RemovedObject)->GetBoolField(TEXT("removed")));
+	return true;
+}
+
+// ---- post-jam review issues (#26-#37) ------------------------------------------------------
+
+namespace GameIQTestUtil
+{
+	/** Fresh empty directory under Intermediate/GameIQTests. */
+	FString TempDir(const TCHAR* Name)
+	{
+		const FString Dir = FPaths::ConvertRelativePathToFull(FPaths::Combine(FPaths::ProjectIntermediateDir(), TEXT("GameIQTests"), Name));
+		IFileManager::Get().DeleteDirectory(*Dir, false, true);
+		IFileManager::Get().MakeDirectory(*Dir, true);
+		return Dir;
+	}
+
+	void WriteFile(const FString& Path, const FString& Text = TEXT("x"))
+	{
+		IFileManager::Get().MakeDirectory(*FPaths::GetPath(Path), true);
+		FFileHelper::SaveStringToFile(Text, *Path);
+	}
+
+	TSharedPtr<FJsonValue> EntityWithDetail(const TCHAR* Id, const TCHAR* Kind, const TCHAR* Name,
+		const TSharedRef<FJsonObject>& Detail, const TCHAR* Parent = nullptr, const TCHAR* Authority = nullptr)
+	{
+		TSharedPtr<FJsonValue> V = Entity(Id, Kind, Name, Parent);
+		V->AsObject()->SetObjectField(TEXT("detail"), Detail);
+		if (Authority) { V->AsObject()->SetStringField(TEXT("authority"), Authority); }
+		return V;
+	}
+
+	TSharedPtr<FJsonValue> EdgeVia(const TCHAR* Src, const TCHAR* Dst, const TCHAR* Type, const TCHAR* Via)
+	{
+		TSharedPtr<FJsonValue> V = Edge(Src, Dst, Type);
+		TSharedRef<FJsonObject> Attrs = MakeShared<FJsonObject>();
+		Attrs->SetStringField(TEXT("via"), Via);
+		V->AsObject()->SetObjectField(TEXT("attrs"), Attrs);
+		return V;
+	}
+
+	TSet<FString> IdsOf(const TArray<TSharedPtr<FJsonValue>>& Rows)
+	{
+		TSet<FString> Out;
+		for (const TSharedPtr<FJsonValue>& R : Rows) { Out.Add(R->AsObject()->GetStringField(TEXT("id"))); }
+		return Out;
+	}
+}
+
+/** Issue #30: the walk skips every dot-directory and linked git worktrees (a `.git` FILE pointing
+ *  into worktrees/), keeps nested clones (a `.git` directory) and submodules (a `.git` file
+ *  pointing into modules/), and honours exclude globs from gameiq.config.json. */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGameIQWalkSkipTest, "GameIQ.Walk.SkipsDotDirsWorktreesAndGlobs",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGameIQWalkSkipTest::RunTest(const FString& Parameters)
+{
+	using namespace GameIQTestUtil;
+	const FString Root = TempDir(TEXT("walk"));
+	WriteFile(Root / TEXT("Docs/Design.md"));
+	WriteFile(Root / TEXT(".claude/worktrees/wf_1/Docs/Design.md"));
+	WriteFile(Root / TEXT(".vscode/notes.md"));
+	WriteFile(Root / TEXT("Linked/.git"), TEXT("gitdir: E:/elsewhere/.git/worktrees/linked"));
+	WriteFile(Root / TEXT("Linked/Docs/Design.md"));
+	WriteFile(Root / TEXT("Nested/.git/HEAD"), TEXT("ref: refs/heads/main"));
+	WriteFile(Root / TEXT("Nested/Readme.md"));
+	WriteFile(Root / TEXT("Plugins/Sub/.git"), TEXT("gitdir: ../../.git/modules/Plugins/Sub"));
+	WriteFile(Root / TEXT("Plugins/Sub/Readme.md"));
+	WriteFile(Root / TEXT("Docs/Archive2025/Old.md"));
+	WriteFile(Root / TEXT("Docs/Draft.bak.md"));
+	WriteFile(Root / TEXT("gameiq.config.json"), TEXT("{ \"exclude\": [\"Docs/Archive*\", \"*.bak.md\"] }"));
+
+	TSet<FString> Rel;
+	for (const FString& F : GameIQWalk::WalkFiles(Root, { TEXT(".md") })) { Rel.Add(GameIQWalk::RelPath(Root, F)); }
+
+	TestTrue(TEXT("project doc kept"), Rel.Contains(TEXT("Docs/Design.md")));
+	TestTrue(TEXT("nested clone (.git directory) kept"), Rel.Contains(TEXT("Nested/Readme.md")));
+	TestFalse(TEXT(".claude worktree copy skipped"), Rel.Contains(TEXT(".claude/worktrees/wf_1/Docs/Design.md")));
+	TestFalse(TEXT("other dot-dir skipped"), Rel.Contains(TEXT(".vscode/notes.md")));
+	TestFalse(TEXT("linked worktree (.git file) skipped"), Rel.Contains(TEXT("Linked/Docs/Design.md")));
+	TestFalse(TEXT("directory glob excluded"), Rel.Contains(TEXT("Docs/Archive2025/Old.md")));
+	TestFalse(TEXT("file glob excluded"), Rel.Contains(TEXT("Docs/Draft.bak.md")));
+	TestTrue(TEXT("git submodule (.git file into modules/) kept"), Rel.Contains(TEXT("Plugins/Sub/Readme.md")));
+	TestEqual(TEXT("exactly the three real docs"), Rel.Num(), 3);
+
+	// The docs watcher filter applies the same rules.
+	TestTrue(TEXT("watcher: project doc counts"), GameIQDocsFingerprint::IsDocFile(Root, Root / TEXT("Docs/Design.md")));
+	TestFalse(TEXT("watcher: worktree doc ignored"), GameIQDocsFingerprint::IsDocFile(Root, Root / TEXT(".claude/worktrees/wf_1/Docs/Design.md")));
+	TestFalse(TEXT("watcher: non-doc ignored"), GameIQDocsFingerprint::IsDocFile(Root, Root / TEXT("Docs/Design.uasset")));
+	return true;
+}
+
+/** Issue #29: the docs fingerprint moves when a doc changes, and every write stamps a per-producer time. */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGameIQDocsFreshnessTest, "GameIQ.Docs.FingerprintAndPerProducerFreshness",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGameIQDocsFreshnessTest::RunTest(const FString& Parameters)
+{
+	using namespace GameIQTestUtil;
+	const FString Root = TempDir(TEXT("docsfresh"));
+	WriteFile(Root / TEXT("Docs/GDD.md"), TEXT("# Final Take\nold title"));
+	const FString Before = GameIQDocsFingerprint::Compute(Root);
+	WriteFile(Root / TEXT("Docs/GDD.md"), TEXT("# Dead Reel\nnew title, longer text"));
+	TestNotEqual(TEXT("fingerprint changes with the doc"), GameIQDocsFingerprint::Compute(Root), Before);
+	WriteFile(Root / TEXT(".claude/worktrees/x/Docs/GDD.md"), TEXT("# copy"));
+	const FString After = GameIQDocsFingerprint::Compute(Root);
+	WriteFile(Root / TEXT(".claude/worktrees/x/Docs/GDD.md"), TEXT("# copy changed"));
+	TestEqual(TEXT("worktree copies do not move the fingerprint"), GameIQDocsFingerprint::Compute(Root), After);
+
+	const FString DbPath = Root / TEXT(".gameiq/index.db");
+	FGameIQStore Store;
+	if (!TestTrue(TEXT("open"), Store.OpenAtPath(DbPath))) { return false; }
+	Store.IngestProducer(TEXT("gameiq-docs@0.1.0"), { Entity(TEXT("doc:Docs/GDD.md"), TEXT("document"), TEXT("GDD")) }, {}, {});
+	Store.IngestProducer(TEXT("gameiq-cpp@0.1.0"), { Entity(TEXT("cpp:Foo"), TEXT("cpp-class"), TEXT("Foo")) }, {}, {});
+	Store.Close();
+
+	GameIQQuery::SetDbPathOverrideForTests(DbPath);
+	ON_SCOPE_EXIT { GameIQQuery::SetDbPathOverrideForTests(FString()); };
+	TSharedPtr<FJsonObject> Root0;
+	const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(GameIQQuery::Search(TEXT("GDD"), FString()));
+	if (!TestTrue(TEXT("envelope parses"), FJsonSerializer::Deserialize(Reader, Root0) && Root0.IsValid())) { return false; }
+	const TSharedPtr<FJsonObject> Index = Root0->GetObjectField(TEXT("index"));
+	const TSharedPtr<FJsonObject>* BySource = nullptr;
+	if (!TestTrue(TEXT("index.bySource present"), Index.IsValid() && Index->TryGetObjectField(TEXT("bySource"), BySource))) { return false; }
+	TestTrue(TEXT("docs freshness reported"), (*BySource)->HasField(TEXT("docs")));
+	TestTrue(TEXT("cpp freshness reported"), (*BySource)->HasField(TEXT("cpp")));
+	return true;
+}
+
+/** Issue #31: self-edges are never stored, and 'unused' ignores doc links and the asset's own
+ *  children, while assets named only by C++ literals are split out as possibly loaded by path. */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGameIQUnusedTest, "GameIQ.Query.UnusedIgnoresSelfDocAndChildEdges",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGameIQUnusedTest::RunTest(const FString& Parameters)
+{
+	using namespace GameIQTestUtil;
+	const FString DbPath = TempDbPath(TEXT("unused.db"));
+	auto Detail = [](const TCHAR* Class)
+	{
+		TSharedRef<FJsonObject> D = MakeShared<FJsonObject>();
+		D->SetStringField(TEXT("assetClass"), Class);
+		return D;
+	};
+	FGameIQStore Store;
+	if (!TestTrue(TEXT("open"), Store.OpenAtPath(DbPath))) { return false; }
+	Store.IngestProducer(TEXT("test"),
+		{
+			EntityWithDetail(TEXT("asset:/Game/Anim/A_Orphan"), TEXT("asset"), TEXT("A_Orphan"), Detail(TEXT("AnimSequence"))),
+			EntityWithDetail(TEXT("asset:/Game/Anim/A_DocOnly"), TEXT("asset"), TEXT("A_DocOnly"), Detail(TEXT("AnimSequence"))),
+			EntityWithDetail(TEXT("asset:/Game/Anim/A_Used"), TEXT("asset"), TEXT("A_Used"), Detail(TEXT("AnimSequence"))),
+			EntityWithDetail(TEXT("asset:/Game/Anim/A_ByLiteral"), TEXT("asset"), TEXT("A_ByLiteral"), Detail(TEXT("AnimSequence"))),
+			EntityWithDetail(TEXT("asset:/Game/Anim/A_Idle_Seated_REX"), TEXT("asset"), TEXT("A_Idle_Seated_REX"), Detail(TEXT("AnimSequence"))),
+			EntityWithDetail(TEXT("asset:/Game/Seq/LS_Scene"), TEXT("asset"), TEXT("LS_Scene"), Detail(TEXT("LevelSequence"))),
+			EntityWithDetail(TEXT("asset:/Game/Maps/L_Main"), TEXT("asset"), TEXT("L_Main"), Detail(TEXT("World"))),
+			EntityWithDetail(TEXT("asset:/Game/Maps/L_Main::actor::Lamp"), TEXT("level-actor"), TEXT("Lamp"), Detail(TEXT("PointLight")), TEXT("asset:/Game/Maps/L_Main")),
+			EntityWithDetail(TEXT("doc:Docs/Anim.md#idle"), TEXT("doc-section"), TEXT("Idle"), Detail(TEXT("")), nullptr, TEXT("stated-intent")),
+			Entity(TEXT("cpp:Director::Play"), TEXT("cpp-function"), TEXT("Play")),
+		},
+		{
+			Edge(TEXT("asset:/Game/Anim/A_Orphan"), TEXT("asset:/Game/Anim/A_Orphan"), TEXT("references")), // self: dropped
+			Edge(TEXT("doc:Docs/Anim.md#idle"), TEXT("asset:/Game/Anim/A_DocOnly"), TEXT("describes")),
+			EdgeVia(TEXT("doc:Docs/Anim.md#idle"), TEXT("asset:/Game/Anim/A_DocOnly"), TEXT("references"), TEXT("mention")),
+			Edge(TEXT("asset:/Game/Seq/LS_Scene"), TEXT("asset:/Game/Anim/A_Used"), TEXT("plays-anim")),
+			Edge(TEXT("asset:/Game/Maps/L_Main::actor::Lamp"), TEXT("asset:/Game/Maps/L_Main"), TEXT("placed-in-level")),
+			EdgeVia(TEXT("cpp:Director::Play"), TEXT("asset:/Game/Anim/A_ByLiteral"), TEXT("loads-by-path"), TEXT("/Game/Anim/A_ByLiteral.A_ByLiteral")),
+			EdgeVia(TEXT("cpp:Director::Play"), TEXT("asset-pattern:/Game/Anim/A_Idle_Seated_*"), TEXT("loads-by-path"), TEXT("/Game/Anim/A_Idle_Seated_%s.A_Idle_Seated_%s")),
+		},
+		{});
+	Store.Close();
+	TestEqual(TEXT("self-edge not stored"), CountRows(DbPath, TEXT("SELECT COUNT(*) FROM edges WHERE src = dst")), (int64)0);
+
+	GameIQQuery::SetDbPathOverrideForTests(DbPath);
+	ON_SCOPE_EXIT { GameIQQuery::SetDbPathOverrideForTests(FString()); };
+	const TSharedPtr<FJsonValue> Result = ParseResult(GameIQQuery::ProjectStats(TEXT("unused")));
+	const TSharedPtr<FJsonObject>* Payload = nullptr;
+	if (!TestTrue(TEXT("unused payload is an object"), Result.IsValid() && Result->TryGetObject(Payload))) { return false; }
+	const TSet<FString> Unused = IdsOf((*Payload)->GetArrayField(TEXT("unused")));
+	const TSet<FString> ByPath = IdsOf((*Payload)->GetArrayField(TEXT("possiblyLoadedByPath")));
+	TestTrue(TEXT("self-referencing orphan is unused"), Unused.Contains(TEXT("asset:/Game/Anim/A_Orphan")));
+	TestTrue(TEXT("doc-only mention is still unused"), Unused.Contains(TEXT("asset:/Game/Anim/A_DocOnly")));
+	TestTrue(TEXT("level referenced only by its own actors is unused"), Unused.Contains(TEXT("asset:/Game/Maps/L_Main")));
+	TestFalse(TEXT("sequence-played anim is used"), Unused.Contains(TEXT("asset:/Game/Anim/A_Used")) || ByPath.Contains(TEXT("asset:/Game/Anim/A_Used")));
+	TestTrue(TEXT("exact literal -> possibly loaded by path"), ByPath.Contains(TEXT("asset:/Game/Anim/A_ByLiteral")));
+	TestTrue(TEXT("format-string pattern -> possibly loaded by path"), ByPath.Contains(TEXT("asset:/Game/Anim/A_Idle_Seated_REX")));
+	TestFalse(TEXT("literal-loaded asset not listed as unused"), Unused.Contains(TEXT("asset:/Game/Anim/A_ByLiteral")));
+	return true;
+}
+
+/** Issue #31 migration: an index written by the previous schema (v4, self-edges stored) upgrades
+ *  in place on open — only the self-edges go, every real edge and row stays. */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGameIQSchemaV5UpgradeTest, "GameIQ.Store.UpgradesV4IndexDroppingOnlySelfEdges",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGameIQSchemaV5UpgradeTest::RunTest(const FString& Parameters)
+{
+	using namespace GameIQTestUtil;
+	const FString DbPath = TempDbPath(TEXT("upgrade_v4.db"));
+	FGameIQStore Store;
+	if (!TestTrue(TEXT("open"), Store.OpenAtPath(DbPath))) { return false; }
+	Store.IngestProducer(TEXT("test"),
+		{ Entity(TEXT("asset:/Game/A"), TEXT("asset"), TEXT("A")), Entity(TEXT("asset:/Game/B"), TEXT("asset"), TEXT("B")) },
+		{ Edge(TEXT("asset:/Game/A"), TEXT("asset:/Game/B"), TEXT("depends-on")) },
+		{ Chunk(TEXT("asset:/Game/A#summary"), TEXT("asset:/Game/A"), TEXT("alpha summary")) });
+	Store.Close();
+
+	// Put the file back into the v4 shape: a stored self-edge, no type index, user_version 4.
+	{
+		FSQLiteDatabase Db;
+		if (!TestTrue(TEXT("raw open"), Db.Open(*DbPath, ESQLiteDatabaseOpenMode::ReadWrite))) { return false; }
+		TestTrue(TEXT("plant self-edge"), Db.Execute(TEXT("INSERT INTO edges (src, dst, type, producer) VALUES ('asset:/Game/A', 'asset:/Game/A', 'references', 'test');")));
+		TestTrue(TEXT("drop v5 index"), Db.Execute(TEXT("DROP INDEX IF EXISTS idx_edges_type;")));
+		TestTrue(TEXT("back to v4"), Db.SetUserVersion(4));
+		Db.Close();
+	}
+	TestEqual(TEXT("v4 file holds the self-edge"), CountRows(DbPath, TEXT("SELECT COUNT(*) FROM edges WHERE src = dst")), (int64)1);
+
+	// The read-only query layer must already cope with the un-migrated file.
+	{
+		GameIQQuery::SetDbPathOverrideForTests(DbPath);
+		ON_SCOPE_EXIT { GameIQQuery::SetDbPathOverrideForTests(FString()); };
+		const TSharedPtr<FJsonValue> Result = ParseResult(GameIQQuery::ProjectStats(TEXT("unused")));
+		const TSharedPtr<FJsonObject>* Payload = nullptr;
+		if (!TestTrue(TEXT("unused answers on a v4 file"), Result.IsValid() && Result->TryGetObject(Payload))) { return false; }
+		TestTrue(TEXT("self-edge does not count as use before the migration"),
+			IdsOf((*Payload)->GetArrayField(TEXT("unused"))).Contains(TEXT("asset:/Game/A")));
+	}
+
+	FGameIQStore Upgraded;
+	if (!TestTrue(TEXT("v4 index opens with the new store"), Upgraded.OpenAtPath(DbPath))) { return false; }
+	Upgraded.Close();
+	TestEqual(TEXT("schema is v5"), CountRows(DbPath, TEXT("PRAGMA user_version")), (int64)5);
+	TestEqual(TEXT("self-edge removed"), CountRows(DbPath, TEXT("SELECT COUNT(*) FROM edges WHERE src = dst")), (int64)0);
+	TestEqual(TEXT("real edge kept"), CountRows(DbPath, TEXT("SELECT COUNT(*) FROM edges")), (int64)1);
+	TestEqual(TEXT("entities kept"), CountRows(DbPath, TEXT("SELECT COUNT(*) FROM entities")), (int64)2);
+	TestEqual(TEXT("chunks kept"), CountRows(DbPath, TEXT("SELECT COUNT(*) FROM chunks")), (int64)1);
+	TestEqual(TEXT("full-text rows kept"), CountRows(DbPath, TEXT("SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH 'alpha'")), (int64)1);
+	TestEqual(TEXT("type index created"), CountRows(DbPath, TEXT("SELECT COUNT(*) FROM sqlite_master WHERE name = 'idx_edges_type'")), (int64)1);
+	return true;
+}
+
+/** Issue #32: /Game string literals in code are found (comments ignored) and classified into
+ *  exact asset targets and wildcard patterns. */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGameIQCodeLiteralsTest, "GameIQ.Cpp.AssetPathLiterals",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGameIQCodeLiteralsTest::RunTest(const FString& Parameters)
+{
+	const FString Code = TEXT(R"cpp(
+// "/Game/Commented/Out.Out" must not count
+static const TCHAR* Music = TEXT("/Game/Audio/Music/MUS_Theme.MUS_Theme");
+UClass* W = LoadClass<UUserWidget>(nullptr, TEXT("/Game/UI/WBP_Hud.WBP_Hud_C"));
+const FString Idle = FString::Printf(TEXT("/Game/Anim/A_Idle_Seated_%s.A_Idle_Seated_%s"), *Speaker);
+const FString Folder = TEXT("/Game/Audio/SFX/");
+const FString Wound = FString(TEXT("/Game/UI/T_wound_")) + Kind;
+/* "/Game/Block/Comment.Comment" */
+)cpp");
+	TMap<FString, FString> ByLiteral;
+	for (const GameIQPaths::FLiteral& L : GameIQPaths::FindCodeLiterals(Code)) { ByLiteral.Add(L.Literal, L.Target); }
+	TestEqual(TEXT("five literals, comments ignored"), ByLiteral.Num(), 5);
+	TestEqual(TEXT("object path -> package"), ByLiteral.FindRef(TEXT("/Game/Audio/Music/MUS_Theme.MUS_Theme")), FString(TEXT("asset:/Game/Audio/Music/MUS_Theme")));
+	TestEqual(TEXT("class path -> package"), ByLiteral.FindRef(TEXT("/Game/UI/WBP_Hud.WBP_Hud_C")), FString(TEXT("asset:/Game/UI/WBP_Hud")));
+	TestEqual(TEXT("format string -> pattern"), ByLiteral.FindRef(TEXT("/Game/Anim/A_Idle_Seated_%s.A_Idle_Seated_%s")), FString(TEXT("asset-pattern:/Game/Anim/A_Idle_Seated_*")));
+	TestEqual(TEXT("folder -> pattern"), ByLiteral.FindRef(TEXT("/Game/Audio/SFX/")), FString(TEXT("asset-pattern:/Game/Audio/SFX/*")));
+	TestEqual(TEXT("name prefix -> pattern"), ByLiteral.FindRef(TEXT("/Game/UI/T_wound_")), FString(TEXT("asset-pattern:/Game/UI/T_wound_*")));
+
+	const TArray<FString> InCell = GameIQPaths::FindPackages(TEXT("(Sound=\"/Script/Engine.SoundWave'/Game/VO/VO_REX_01.VO_REX_01'\",Anim=/Game/Anims/FA_REX_01.FA_REX_01)"));
+	TestEqual(TEXT("cell text yields both packages"), InCell.Num(), 2);
+	TestTrue(TEXT("soft path in quotes"), InCell.Contains(TEXT("/Game/VO/VO_REX_01")));
+	return true;
+}
+
+/** Issue #33: the largest facet orders by on-disk size and rolls up by class and folder. */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGameIQLargestTest, "GameIQ.Query.LargestFacet",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGameIQLargestTest::RunTest(const FString& Parameters)
+{
+	using namespace GameIQTestUtil;
+	const FString DbPath = TempDbPath(TEXT("largest.db"));
+	auto Sized = [](const TCHAR* Class, double Bytes)
+	{
+		TSharedRef<FJsonObject> D = MakeShared<FJsonObject>();
+		D->SetStringField(TEXT("assetClass"), Class);
+		D->SetNumberField(TEXT("diskBytes"), Bytes);
+		TSharedRef<FJsonObject> Facts = MakeShared<FJsonObject>();
+		Facts->SetNumberField(TEXT("width"), 4096);
+		D->SetObjectField(TEXT("facts"), Facts);
+		return D;
+	};
+	FGameIQStore Store;
+	if (!TestTrue(TEXT("open"), Store.OpenAtPath(DbPath))) { return false; }
+	TArray<TSharedPtr<FJsonValue>> Entities = {
+		EntityWithDetail(TEXT("asset:/Game/Pack/Tex/T_Big"), TEXT("asset"), TEXT("T_Big"), Sized(TEXT("Texture2D"), 50e6)),
+		EntityWithDetail(TEXT("asset:/Game/Pack/Tex/T_Small"), TEXT("asset"), TEXT("T_Small"), Sized(TEXT("Texture2D"), 1e6)),
+		EntityWithDetail(TEXT("asset:/Game/Game/Mesh/SM_Mid"), TEXT("asset"), TEXT("SM_Mid"), Sized(TEXT("StaticMesh"), 20e6)),
+	};
+	for (const TSharedPtr<FJsonValue>& E : Entities)
+	{
+		FString Id = E->AsObject()->GetStringField(TEXT("id"));
+		E->AsObject()->SetStringField(TEXT("path"), Id.Mid(6));
+	}
+	Store.IngestProducer(TEXT("test"), Entities, {}, {});
+	Store.Close();
+
+	GameIQQuery::SetDbPathOverrideForTests(DbPath);
+	ON_SCOPE_EXIT { GameIQQuery::SetDbPathOverrideForTests(FString()); };
+	const TSharedPtr<FJsonValue> Result = ParseResult(GameIQQuery::ProjectStats(TEXT("largest")));
+	const TSharedPtr<FJsonObject>* Payload = nullptr;
+	if (!TestTrue(TEXT("largest payload"), Result.IsValid() && Result->TryGetObject(Payload))) { return false; }
+	const TArray<TSharedPtr<FJsonValue>>& Top = (*Payload)->GetArrayField(TEXT("largest"));
+	if (!TestEqual(TEXT("three sized assets"), Top.Num(), 3)) { return false; }
+	TestEqual(TEXT("biggest first"), Top[0]->AsObject()->GetStringField(TEXT("id")), FString(TEXT("asset:/Game/Pack/Tex/T_Big")));
+	TestTrue(TEXT("facts carried"), Top[0]->AsObject()->HasField(TEXT("facts")));
+	const TArray<TSharedPtr<FJsonValue>>& ByClass = (*Payload)->GetArrayField(TEXT("byClass"));
+	TestEqual(TEXT("textures lead the class rollup"), ByClass[0]->AsObject()->GetStringField(TEXT("assetClass")), FString(TEXT("Texture2D")));
+	TestEqual(TEXT("class rollup sums"), (int64)ByClass[0]->AsObject()->GetNumberField(TEXT("diskBytes")), (int64)51000000);
+	const TArray<TSharedPtr<FJsonValue>>& ByFolder = (*Payload)->GetArrayField(TEXT("byFolder"));
+	TestEqual(TEXT("folder rollup"), ByFolder[0]->AsObject()->GetStringField(TEXT("folder")), FString(TEXT("/Game/Pack/Tex")));
+
+	const TSharedPtr<FJsonValue> Filtered = ParseResult(GameIQQuery::ProjectStats(TEXT("largest:StaticMesh")));
+	TestEqual(TEXT("class filter"), Filtered->AsObject()->GetArrayField(TEXT("largest")).Num(), 1);
+	return true;
+}
+
+/** Issues #35/#26/#37: Doctor lists assets on disk but not indexed (by folder) and indexed assets
+ *  that are gone, and warns when no agent file carries the guide or .gameiq/ is not gitignored. */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGameIQDoctorGapTest, "GameIQ.Query.DoctorDiskGapAndAgentGuide",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGameIQDoctorGapTest::RunTest(const FString& Parameters)
+{
+	using namespace GameIQTestUtil;
+	const FString Root = TempDir(TEXT("doctorgap"));
+	WriteFile(Root / TEXT("Content/Game/Hero.uasset"));
+	WriteFile(Root / TEXT("Content/Adventure_Pack/Meshes/SM_Rock.uasset"));
+	WriteFile(Root / TEXT("Content/Adventure_Pack/Meshes/SM_Tree.uasset"));
+	WriteFile(Root / TEXT("Content/Maps/L_Main.umap"));
+	WriteFile(Root / TEXT("Content/__ExternalActors__/Maps/L_Main/0/AB/X.uasset"));
+	WriteFile(Root / TEXT(".git/HEAD"), TEXT("ref: refs/heads/main"));
+	WriteFile(Root / TEXT("CLAUDE.md"), TEXT("# Project rules\nNothing about the index here."));
+
+	const FString DbPath = Root / TEXT(".gameiq/index.db");
+	FGameIQStore Store;
+	if (!TestTrue(TEXT("open"), Store.OpenAtPath(DbPath))) { return false; }
+	Store.IngestProducer(TEXT("gameiq-ue-registry@0.1.0"),
+		{
+			Entity(TEXT("asset:/Game/Game/Hero"), TEXT("asset"), TEXT("Hero")),
+			Entity(TEXT("asset:/Game/Maps/L_Main"), TEXT("asset"), TEXT("L_Main")),
+			Entity(TEXT("asset:/Game/Old/Removed"), TEXT("asset"), TEXT("Removed")),
+		}, {}, {});
+	Store.Close();
+
+	GameIQQuery::SetDbPathOverrideForTests(DbPath);
+	ON_SCOPE_EXIT { GameIQQuery::SetDbPathOverrideForTests(FString()); };
+	const TSharedPtr<FJsonValue> Result = ParseResult(GameIQQuery::Doctor());
+	const TSharedPtr<FJsonObject>* Payload = nullptr;
+	if (!TestTrue(TEXT("doctor payload"), Result.IsValid() && Result->TryGetObject(Payload))) { return false; }
+	const TSharedPtr<FJsonObject> Gap = (*Payload)->GetObjectField(TEXT("diskVsIndex"));
+	if (!TestTrue(TEXT("diskVsIndex present"), Gap.IsValid())) { return false; }
+	TestEqual(TEXT("disk assets (OFPA excluded)"), (int32)Gap->GetNumberField(TEXT("diskAssets")), 4);
+	TestEqual(TEXT("missing from index"), (int32)Gap->GetNumberField(TEXT("missingFromIndex")), 2);
+	TestEqual(TEXT("gone from disk"), (int32)Gap->GetNumberField(TEXT("goneFromDisk")), 1);
+	const TArray<TSharedPtr<FJsonValue>>& Folders = Gap->GetArrayField(TEXT("missingByFolder"));
+	TestTrue(TEXT("gap grouped by folder"), Folders.Num() == 1 &&
+		Folders[0]->AsObject()->GetStringField(TEXT("folder")) == TEXT("/Game/Adventure_Pack/Meshes"));
+	TestFalse(TEXT("gap makes the index unhealthy"), (*Payload)->GetBoolField(TEXT("healthy")));
+
+	const TArray<TSharedPtr<FJsonValue>>& Warnings = (*Payload)->GetArrayField(TEXT("warnings"));
+	TestEqual(TEXT("guide + gitignore warnings"), Warnings.Num(), 2);
+
+	// GenerateAgentConfig's gitignore step, then the warning clears.
+	TestTrue(TEXT("gitignore updated"), GameIQAgentFiles::EnsureGitignore(Root));
+	TestFalse(TEXT("second call is a no-op"), GameIQAgentFiles::EnsureGitignore(Root));
+	WriteFile(Root / TEXT("AGENTS.md"), FString(GameIQAgentFiles::BeginMarker()) + TEXT("\nguide\n") + GameIQAgentFiles::EndMarker());
+	const TSharedPtr<FJsonValue> After = ParseResult(GameIQQuery::Doctor());
+	TestEqual(TEXT("warnings cleared"), After->AsObject()->GetArrayField(TEXT("warnings")).Num(), 0);
+	return true;
+}
+
+/** Issue #36: snapshots record the git commit, and Changes resolves a git ref or an ISO time. */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGameIQSnapshotGitTest, "GameIQ.Snapshots.GitRefAndTimeResolution",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGameIQSnapshotGitTest::RunTest(const FString& Parameters)
+{
+	using namespace GameIQTestUtil;
+	const FString Root = TempDir(TEXT("snapgit"));
+	FString Out;
+	if (!GameIQGit::Run(Root, TEXT("init -q"), Out))
+	{
+		AddWarning(TEXT("git is not on PATH — skipping the git-ref part of the snapshot test"));
+		return true;
+	}
+	GameIQGit::Run(Root, TEXT("-c user.email=t@t -c user.name=t commit -q --allow-empty -m first"), Out);
+	FString Head, Branch;
+	if (!TestTrue(TEXT("HEAD readable from files"), GameIQGit::ReadHead(Root, Head, Branch))) { return false; }
+	TestEqual(TEXT("file read matches git"), Head, GameIQGit::ResolveCommit(Root, TEXT("HEAD")));
+
+	const FString DbPath = Root / TEXT(".gameiq/index.db");
+	FGameIQStore Store;
+	if (!TestTrue(TEXT("open"), Store.OpenAtPath(DbPath))) { return false; }
+	Store.IngestProducer(TEXT("test"), { Entity(TEXT("asset:/Game/A"), TEXT("asset"), TEXT("A")) }, {}, {});
+	Store.Close();
+
+	GameIQQuery::SetDbPathOverrideForTests(DbPath);
+	ON_SCOPE_EXIT { GameIQQuery::SetDbPathOverrideForTests(FString()); };
+	const FString SnapId = GameIQSnapshots::CreateForCommit(Head, Branch, 5);
+	if (!TestFalse(TEXT("auto snapshot created"), SnapId.IsEmpty())) { return false; }
+	TestTrue(TEXT("second call for the same commit is a no-op"), GameIQSnapshots::CreateForCommit(Head, Branch, 5).IsEmpty());
+	TestEqual(TEXT("latest snapshot head"), GameIQSnapshots::LatestSnapshotGitHead(), Head);
+
+	// New commit + index change, then "what changed since HEAD~1".
+	GameIQGit::Run(Root, TEXT("-c user.email=t@t -c user.name=t commit -q --allow-empty -m second"), Out);
+	if (!TestTrue(TEXT("reopen"), Store.OpenAtPath(DbPath))) { return false; }
+	Store.IngestProducer(TEXT("test"), { Entity(TEXT("asset:/Game/A"), TEXT("asset"), TEXT("A")), Entity(TEXT("asset:/Game/B"), TEXT("asset"), TEXT("B")) }, {}, {});
+	Store.Close();
+
+	const TSharedPtr<FJsonValue> ByRef = ParseResult(GameIQSnapshots::Changes(TEXT("HEAD~1"), TEXT("current"), FString(), FString(), 50, 0));
+	if (!TestTrue(TEXT("changes by git ref"), ByRef.IsValid() && ByRef->Type == EJson::Object)) { return false; }
+	TestEqual(TEXT("ref resolved to the commit's snapshot"),
+		ByRef->AsObject()->GetObjectField(TEXT("since"))->GetStringField(TEXT("id")), SnapId);
+	TestTrue(TEXT("the entity created since that commit is reported"), ByRef->AsObject()->GetNumberField(TEXT("total")) >= 1);
+
+	const TSharedPtr<FJsonValue> ByTime = ParseResult(GameIQSnapshots::Changes(
+		(FDateTime::UtcNow() + FTimespan::FromHours(1)).ToIso8601(), TEXT("current"), FString(), FString(), 50, 0));
+	TestTrue(TEXT("changes by ISO time"), ByTime.IsValid() && ByTime->Type == EJson::Object);
+
+	GameIQSnapshots::Remove(SnapId);
 	return true;
 }
 

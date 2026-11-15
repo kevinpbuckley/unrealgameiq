@@ -115,22 +115,70 @@ namespace GameIQWalk
 		return false;
 	}
 
+	/** True when `S` matches a glob: `*` and `?` as in FString::MatchesWildcard (`*` also crosses
+	 *  `/`, so `**` works as "any depth"). Case-insensitive, like the rest of the walk on Windows. */
+	inline bool MatchesGlob(const FString& S, const FString& Pattern)
+	{
+		return S.MatchesWildcard(Pattern, ESearchCase::IgnoreCase);
+	}
+
+	/**
+	 * `exclude` entries are a directory name ("VibeUE"), a project-relative path ("Plugins/VibeUE"),
+	 * or a glob over the project-relative path or name ("Docs/Archive*", "Test?Data", "*.bak") — issue
+	 * #30. A glob ending in a slash plus one or two stars also excludes the directory it names.
+	 */
 	inline bool IsExcluded(const FString& Name, const FString& Rel, const TArray<FString>& Excludes)
 	{
 		for (const FString& E : Excludes)
 		{
+			if (E.Contains(TEXT("*")) || E.Contains(TEXT("?")))
+			{
+				if (MatchesGlob(Rel, E) || MatchesGlob(Name, E)) { return true; }
+				FString Base = E;
+				if (Base.RemoveFromEnd(TEXT("/**")) || Base.RemoveFromEnd(TEXT("/*")))
+				{
+					if (MatchesGlob(Rel, Base) || MatchesGlob(Name, Base)) { return true; }
+				}
+				continue;
+			}
 			if (Name == E || Rel == E || Rel.StartsWith(E + TEXT("/"))) { return true; }
 		}
 		return false;
 	}
 
-	inline void Collect(const FString& Root, const FString& Dir, const TArray<FString>& LowerExts,
-		const TArray<FString>& Excludes, TArray<FString>& Out)
+	/**
+	 * Directories the walk never enters (issue #30): build/cache output, every dot-directory
+	 * (.git, .gameiq, .claude, .vs, .idea, .vscode — agent worktrees under .claude/worktrees were
+	 * 46 of 105 indexed documents in one project), and any linked git worktree: a second copy of
+	 * the project that would duplicate every entity. A linked worktree is a directory holding a
+	 * `.git` FILE whose `gitdir:` points into a `worktrees/` folder. A git SUBMODULE also has a
+	 * `.git` file (pointing into `modules/`), but it is real project content (plugins are often
+	 * submodules), so it is kept, like a nested clone with a `.git` directory.
+	 */
+	inline bool IsLinkedWorktree(const FString& FullDir)
+	{
+		const FString GitMarker = FullDir / TEXT(".git");
+		IFileManager& FM = IFileManager::Get();
+		if (!FM.FileExists(*GitMarker) || FM.DirectoryExists(*GitMarker)) { return false; }
+		FString Text;
+		if (!FFileHelper::LoadFileToString(Text, *GitMarker)) { return false; }
+		Text.ReplaceInline(TEXT("\\"), TEXT("/"));
+		return Text.TrimStart().StartsWith(TEXT("gitdir:")) && Text.Contains(TEXT("/worktrees/"));
+	}
+
+	inline bool ShouldSkipDirectory(const FString& FullDir, const FString& Name)
 	{
 		static const TArray<FString> Skip = {
 			TEXT("Intermediate"), TEXT("Binaries"), TEXT("Saved"), TEXT("DerivedDataCache"),
-			TEXT(".git"), TEXT("node_modules"), TEXT(".gameiq") };
+			TEXT("node_modules") };
+		if (Name.StartsWith(TEXT("."))) { return true; }
+		if (Skip.Contains(Name)) { return true; }
+		return IsLinkedWorktree(FullDir);
+	}
 
+	inline void Collect(const FString& Root, const FString& Dir, const TArray<FString>& LowerExts,
+		const TArray<FString>& Excludes, TArray<FString>& Out)
+	{
 		IFileManager& FM = IFileManager::Get();
 
 		TArray<FString> Files;
@@ -138,15 +186,18 @@ namespace GameIQWalk
 		for (const FString& F : Files)
 		{
 			const FString Ext = FString(TEXT(".")) + FPaths::GetExtension(F).ToLower();
-			if (LowerExts.Contains(Ext)) { Out.Add(Dir / F); }
+			if (!LowerExts.Contains(Ext)) { continue; }
+			// File-level globs ("*.generated.h", "Docs/Archive/*") — directory entries never match a file name.
+			if (IsExcluded(F, RelPath(Root, Dir / F), Excludes)) { continue; }
+			Out.Add(Dir / F);
 		}
 
 		TArray<FString> Dirs;
 		FM.FindFiles(Dirs, *(Dir / TEXT("*")), /*Files=*/false, /*Directories=*/true);
 		for (const FString& D : Dirs)
 		{
-			if (Skip.Contains(D)) { continue; }
 			const FString Full = Dir / D;
+			if (ShouldSkipDirectory(Full, D)) { continue; }
 			if (IsExcluded(D, RelPath(Root, Full), Excludes)) { continue; }
 			Collect(Root, Full, LowerExts, Excludes, Out);
 		}

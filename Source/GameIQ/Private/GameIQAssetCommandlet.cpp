@@ -14,6 +14,15 @@
 #include "Engine/StaticMeshActor.h"
 #include "InputAction.h"
 #include "InputMappingContext.h"
+#include "LevelSequence.h"
+#include "MovieScene.h"
+#include "MovieScenePossessable.h"
+#include "MovieSceneSpawnable.h"
+#include "Sections/MovieSceneAudioSection.h"
+#include "Sections/MovieSceneCameraCutSection.h"
+#include "Sections/MovieSceneSkeletalAnimationSection.h"
+#include "Sections/MovieSceneSubSection.h"
+#include "Tracks/MovieSceneCameraCutTrack.h"
 #include "AssetRegistry/AssetData.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/IAssetRegistry.h"
@@ -30,6 +39,7 @@
 #include "GameIQFileWalk.h"
 #include "GameIQHash.h"
 #include "GameIQJson.h"
+#include "GameIQPaths.h"
 #include "GameIQStore.h"
 #include "GameIQTextUtil.h"
 #include "HAL/FileManager.h"
@@ -96,7 +106,9 @@ namespace
 			if (const FObjectPropertyBase* ObjProp = CastField<FObjectPropertyBase>(Prop))
 			{
 				UObject* Ref = ObjProp->GetObjectPropertyValue(ObjProp->ContainerPtrToValuePtr<void>(Asset));
-				if (Ref && IsProjectObject(Ref))
+				// Subobjects of the asset's own package (ThumbnailInfo, InternalCollection, …) are
+				// not a relationship — they produced 418 self-edges that hid unused assets (issue #31).
+				if (Ref && IsProjectObject(Ref) && Ref->GetOutermost() != Asset->GetOutermost())
 				{
 					Lines.Add(FString::Printf(TEXT("%s=%s"), *Prop->GetName(), *Ref->GetName()));
 					O.Edges.Add(MakeShared<FJsonValueObject>(
@@ -166,6 +178,7 @@ namespace
 			if (Value.IsEmpty() || Value.Len() > 96) { continue; }
 
 			const FString RefPackage = PackageFromTagValue(Value);
+			if (!RefPackage.IsEmpty() && RefPackage == Data.PackageName.ToString()) { continue; } // self, not a relation
 			if (!RefPackage.IsEmpty())
 			{
 				const FString RefName = FPaths::GetBaseFilename(RefPackage);
@@ -269,12 +282,81 @@ namespace
 		AddSummary(O, Id, FString::Printf(TEXT("%s (Skeleton)\nBones: %d"), *Name, Skel->GetReferenceSkeleton().GetNum()));
 	}
 
+	/** One DataTable cell as readable text: FText/FString/FName verbatim, everything else exported. */
+	FString CellText(const FProperty* Prop, const void* Row, UObject* Owner)
+	{
+		const void* Val = Prop->ContainerPtrToValuePtr<void>(Row);
+		if (const FTextProperty* TP = CastField<FTextProperty>(Prop)) { return TP->GetPropertyValue(Val).ToString(); }
+		if (const FStrProperty* SP = CastField<FStrProperty>(Prop)) { return SP->GetPropertyValue(Val); }
+		if (const FNameProperty* NP = CastField<FNameProperty>(Prop)) { return NP->GetPropertyValue(Val).ToString(); }
+		FString Out;
+		Prop->ExportTextItem_Direct(Out, Val, nullptr, Owner, PPF_None);
+		return Out;
+	}
+
+	/**
+	 * DataTable recipe (issue #32): the summary, plus every row as a searchable `datatable-row`
+	 * child entity whose chunk holds the row's cells ("where is this line of dialogue" now finds the
+	 * row), and `references` edges from the row to each /Game asset its cells name (soft or hard
+	 * references, nested structs and arrays included), so a sound or animation used only through a
+	 * table no longer reads as unused. Rows are capped; the summary always carries the full count.
+	 */
 	void RecipeDataTable(FOut& O, const UDataTable* Table, const FString& Id, const FString& Name)
 	{
+		constexpr int32 MaxRows = 5000;
+		constexpr int32 MaxRowChars = 2000;
 		const UScriptStruct* RowStruct = Table->GetRowStruct();
 		const TArray<FName> RowNames = Table->GetRowNames();
-		AddSummary(O, Id, FString::Printf(TEXT("%s (DataTable)\nRow struct: %s, Rows: %d"),
-			*Name, RowStruct ? *RowStruct->GetName() : TEXT("none"), RowNames.Num()));
+		AddSummary(O, Id, FString::Printf(TEXT("%s (DataTable)\nRow struct: %s, Rows: %d%s"),
+			*Name, RowStruct ? *RowStruct->GetName() : TEXT("none"), RowNames.Num(),
+			RowNames.Num() > MaxRows ? *FString::Printf(TEXT(" (first %d indexed as rows)"), MaxRows) : TEXT("")));
+		if (!RowStruct) { return; }
+
+		// The row struct is usually a C++ USTRUCT: link the table to it ("which tables use FMyRow").
+		if (RowStruct->IsNative())
+		{
+			O.Edges.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEdge(
+				Id, FString::Printf(TEXT("cpp:%s"), *RowStruct->GetName()), TEXT("references"), TEXT("RowStruct"))));
+		}
+
+		const FString PackagePath = Table->GetOutermost()->GetName();
+		UObject* Owner = const_cast<UDataTable*>(Table);
+		int32 Emitted = 0;
+		for (const TPair<FName, uint8*>& Pair : Table->GetRowMap())
+		{
+			if (Emitted++ >= MaxRows || !Pair.Value) { break; }
+			const FString RowName = Pair.Key.ToString();
+			const FString RowId = FString::Printf(TEXT("%s::row::%s"), *Id, *RowName);
+
+			TArray<FString> Cells;
+			TSharedRef<FJsonObject> Detail = MakeShared<FJsonObject>();
+			Detail->SetStringField(TEXT("table"), Name);
+			Detail->SetStringField(TEXT("rowStruct"), RowStruct->GetName());
+			TSet<FString> Linked;
+			for (TFieldIterator<FProperty> It(RowStruct); It; ++It)
+			{
+				const FProperty* Prop = *It;
+				const FString Value = GameIQ::OneLine(CellText(Prop, Pair.Value, Owner));
+				if (Value.IsEmpty()) { continue; }
+				const FString Column = Prop->GetAuthoredName();
+				Cells.Add(FString::Printf(TEXT("%s=%s"), *Column, *Value));
+				if (Value.Len() <= 200) { Detail->SetStringField(Column, Value); }
+				for (const FString& Package : GameIQPaths::FindPackages(Value))
+				{
+					if (Package == PackagePath || Linked.Contains(Package)) { continue; }
+					Linked.Add(Package);
+					O.Edges.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEdge(
+						RowId, FString::Printf(TEXT("asset:%s"), *Package), TEXT("references"), Column)));
+				}
+			}
+			const FString Body = FString::Join(Cells, TEXT("; "));
+			O.Entities.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEntity(
+				RowId, TEXT("datatable-row"), RowName, PackagePath, TEXT("asset"), Id,
+				FString::Printf(TEXT("%s row %s"), *Name, *RowName), Detail)));
+			O.Chunks.Add(MakeShared<FJsonValueObject>(GameIQ::MakeChunk(
+				RowId + TEXT("#row"), RowId, TEXT("datatable-row"),
+				FString::Printf(TEXT("%s row %s\n%s"), *Name, *RowName, *Body).Left(MaxRowChars))));
+		}
 	}
 
 	void RecipeMaterial(FOut& O, const UMaterialInterface* Mat, const FString& Id, const FString& Name)
@@ -739,6 +821,178 @@ namespace
 			*Name, Total, ClassCounts.Num(), *WpNote, *CapNote, *InfraNote, *EnvLine, *FString::Join(CountLines, TEXT(", "))));
 	}
 
+	/**
+	 * Level Sequence recipe (issue #34): bindings (possessable/spawnable + class), every skeletal
+	 * animation and audio section with its start/end time as typed `plays-anim` / `plays-audio`
+	 * edges (attrs.sections lists binding + seconds for each use), sub-sequences as
+	 * `plays-sequence`, and camera cuts. A timeline chunk ("4.9-7.2s REX: A_Talk_02") answers "who is
+	 * on screen at 14 s"; References(anim, "in", edgeType="plays-anim") answers "which sequences
+	 * play this animation".
+	 */
+	void RecipeLevelSequence(FOut& O, const ULevelSequence* Seq, const FString& Id, const FString& Name)
+	{
+		UMovieScene* MS = Seq->GetMovieScene();
+		if (!MS)
+		{
+			AddSummary(O, Id, FString::Printf(TEXT("%s (LevelSequence)\nno movie scene"), *Name));
+			return;
+		}
+		const FFrameRate Tick = MS->GetTickResolution();
+		const TRange<FFrameNumber> Playback = MS->GetPlaybackRange();
+		const double PlayStart = Playback.GetLowerBound().IsClosed() ? Tick.AsSeconds(FFrameTime(Playback.GetLowerBoundValue())) : 0.0;
+		const double PlayEnd = Playback.GetUpperBound().IsClosed() ? Tick.AsSeconds(FFrameTime(Playback.GetUpperBoundValue())) : PlayStart;
+		auto SectionSeconds = [&](const UMovieSceneSection* S, double& OutStart, double& OutEnd)
+		{
+			OutStart = S->HasStartFrame() ? Tick.AsSeconds(FFrameTime(S->GetInclusiveStartFrame())) : PlayStart;
+			OutEnd = S->HasEndFrame() ? Tick.AsSeconds(FFrameTime(S->GetExclusiveEndFrame())) : PlayEnd;
+		};
+
+		// Binding guid -> display name + class.
+		TMap<FGuid, FString> BindingNames;
+		TArray<FString> BindingLines;
+		for (int32 i = 0; i < MS->GetPossessableCount(); ++i)
+		{
+			const FMovieScenePossessable& P = MS->GetPossessable(i);
+			FString Class;
+#if WITH_EDITORONLY_DATA
+			if (const UClass* C = P.GetPossessedObjectClass()) { Class = C->GetName(); }
+#endif
+			BindingNames.Add(P.GetGuid(), P.GetName());
+			BindingLines.Add(Class.IsEmpty() ? P.GetName() : FString::Printf(TEXT("%s [%s]"), *P.GetName(), *Class));
+		}
+		for (int32 i = 0; i < MS->GetSpawnableCount(); ++i)
+		{
+			const FMovieSceneSpawnable& S = MS->GetSpawnable(i);
+			const UObject* Template = S.GetObjectTemplate();
+			BindingNames.Add(S.GetGuid(), S.GetName());
+			BindingLines.Add(FString::Printf(TEXT("%s [%s, spawnable]"), *S.GetName(),
+				Template ? *Template->GetClass()->GetName() : TEXT("?")));
+		}
+		// Component bindings (a character's "Body" mesh) carry the animation tracks: name them
+		// "Actor.Component" so the timeline says WHO plays the clip, not just "Body".
+		{
+			TMap<FGuid, FString> Qualified;
+			for (int32 i = 0; i < MS->GetPossessableCount(); ++i)
+			{
+				const FMovieScenePossessable& P = MS->GetPossessable(i);
+				if (const FString* ParentName = P.GetParent().IsValid() ? BindingNames.Find(P.GetParent()) : nullptr)
+				{
+					Qualified.Add(P.GetGuid(), *ParentName + TEXT(".") + P.GetName());
+				}
+			}
+			for (const TPair<FGuid, FString>& Q : Qualified) { BindingNames.Add(Q.Key, Q.Value); }
+		}
+
+		struct FPlay { FString Type; FString Dst; FString AssetName; TArray<TSharedPtr<FJsonValue>> Sections; TArray<FString> Bindings; };
+		TMap<FString, FPlay> Plays;
+		struct FTimelineRow { double Start; double End; FString Text; };
+		TArray<FTimelineRow> Timeline;
+		auto AddPlay = [&](const TCHAR* Type, const UObject* Asset, const FString& Binding, const UMovieSceneSection* S)
+		{
+			if (!Asset || !IsProjectObject(Asset)) { return; }
+			double Start = 0.0, End = 0.0;
+			SectionSeconds(S, Start, End);
+			const FString Dst = AssetIdOf(Asset);
+			FPlay& P = Plays.FindOrAdd(FString(Type) + TEXT("|") + Dst);
+			P.Type = Type; P.Dst = Dst; P.AssetName = Asset->GetName();
+			P.Bindings.AddUnique(Binding);
+			TSharedRef<FJsonObject> SectionJson = MakeShared<FJsonObject>();
+			SectionJson->SetStringField(TEXT("binding"), Binding);
+			SectionJson->SetNumberField(TEXT("startSeconds"), FMath::RoundToDouble(Start * 1000.0) / 1000.0);
+			SectionJson->SetNumberField(TEXT("endSeconds"), FMath::RoundToDouble(End * 1000.0) / 1000.0);
+			P.Sections.Add(MakeShared<FJsonValueObject>(SectionJson));
+			Timeline.Add({ Start, End, FString::Printf(TEXT("%s: %s %s"), *Binding,
+				FCString::Strcmp(Type, TEXT("plays-anim")) == 0 ? TEXT("anim") : (FCString::Strcmp(Type, TEXT("plays-audio")) == 0 ? TEXT("audio") : TEXT("sequence")),
+				*Asset->GetName()) });
+		};
+		auto ScanTracks = [&](const TArray<UMovieSceneTrack*>& Tracks, const FString& Binding)
+		{
+			for (const UMovieSceneTrack* Track : Tracks)
+			{
+				if (!Track) { continue; }
+				for (const UMovieSceneSection* S : Track->GetAllSections())
+				{
+					if (!S) { continue; }
+					if (const UMovieSceneSkeletalAnimationSection* Anim = Cast<UMovieSceneSkeletalAnimationSection>(S))
+					{
+						AddPlay(TEXT("plays-anim"), Anim->Params.Animation, Binding, S);
+					}
+					else if (const UMovieSceneAudioSection* Audio = Cast<UMovieSceneAudioSection>(S))
+					{
+						AddPlay(TEXT("plays-audio"), Audio->GetSound(), Binding, S);
+					}
+					else if (const UMovieSceneSubSection* Sub = Cast<UMovieSceneSubSection>(S))
+					{
+						AddPlay(TEXT("plays-sequence"), Sub->GetSequence(), Binding, S);
+					}
+				}
+			}
+		};
+		const UMovieScene* ConstMS = MS;
+		for (const FMovieSceneBinding& B : ConstMS->GetBindings())
+		{
+			const FString* Known = BindingNames.Find(B.GetObjectGuid());
+			ScanTracks(B.GetTracks(), Known ? *Known : B.GetObjectGuid().ToString(EGuidFormats::Short));
+		}
+		ScanTracks(MS->GetTracks(), TEXT("(sequence)")); // root audio/sub-sequence tracks
+
+		// Camera cuts.
+		TArray<FString> CutLines;
+		if (const UMovieSceneCameraCutTrack* CutTrack = Cast<UMovieSceneCameraCutTrack>(MS->GetCameraCutTrack()))
+		{
+			for (const UMovieSceneSection* S : CutTrack->GetAllSections())
+			{
+				const UMovieSceneCameraCutSection* Cut = Cast<UMovieSceneCameraCutSection>(S);
+				if (!Cut) { continue; }
+				double Start = 0.0, End = 0.0;
+				SectionSeconds(Cut, Start, End);
+				const FString* Camera = BindingNames.Find(Cut->GetCameraBindingID().GetGuid());
+				const FString CameraName = Camera ? *Camera : TEXT("?");
+				CutLines.Add(FString::Printf(TEXT("%.1f-%.1fs %s"), Start, End, *CameraName));
+				Timeline.Add({ Start, End, FString::Printf(TEXT("camera cut: %s"), *CameraName) });
+			}
+		}
+
+		TArray<FString> AnimLines, AudioLines, SubLines;
+		for (TPair<FString, FPlay>& Pair : Plays)
+		{
+			FPlay& P = Pair.Value;
+			TSharedRef<FJsonObject> Edge = GameIQ::MakeEdge(Id, P.Dst, P.Type, FString::Join(P.Bindings, TEXT(", ")));
+			TSharedRef<FJsonObject> Attrs = MakeShared<FJsonObject>();
+			Attrs->SetStringField(TEXT("via"), FString::Join(P.Bindings, TEXT(", ")));
+			Attrs->SetArrayField(TEXT("sections"), P.Sections);
+			Edge->SetObjectField(TEXT("attrs"), Attrs);
+			O.Edges.Add(MakeShared<FJsonValueObject>(Edge));
+			const FString Line = FString::Printf(TEXT("%s (%s, %d section%s)"), *P.AssetName,
+				*FString::Join(P.Bindings, TEXT(", ")), P.Sections.Num(), P.Sections.Num() == 1 ? TEXT("") : TEXT("s"));
+			(P.Type == TEXT("plays-anim") ? AnimLines : (P.Type == TEXT("plays-audio") ? AudioLines : SubLines)).Add(Line);
+		}
+		AnimLines.Sort(); AudioLines.Sort(); SubLines.Sort();
+
+		const FFrameRate Display = MS->GetDisplayRate();
+		FString Summary = FString::Printf(TEXT("%s (LevelSequence)\nLength: %.2fs at %.0f fps, Bindings: %d, Camera cuts: %d"),
+			*Name, PlayEnd - PlayStart, Display.AsDecimal(), BindingLines.Num(), CutLines.Num());
+		if (BindingLines.Num() > 0) { Summary += TEXT("\nBindings: ") + FString::Join(BindingLines, TEXT(", ")); }
+		if (CutLines.Num() > 0) { Summary += TEXT("\nCamera cuts: ") + FString::Join(CutLines, TEXT(", ")); }
+		if (AnimLines.Num() > 0) { Summary += TEXT("\nAnimations: ") + FString::Join(AnimLines, TEXT(", ")); }
+		if (AudioLines.Num() > 0) { Summary += TEXT("\nAudio: ") + FString::Join(AudioLines, TEXT(", ")); }
+		if (SubLines.Num() > 0) { Summary += TEXT("\nSub-sequences: ") + FString::Join(SubLines, TEXT(", ")); }
+		AddSummary(O, Id, Summary.Left(8000));
+
+		if (Timeline.Num() > 0)
+		{
+			Timeline.StableSort([](const FTimelineRow& A, const FTimelineRow& B) { return A.Start < B.Start; });
+			TArray<FString> Rows;
+			for (const FTimelineRow& R : Timeline)
+			{
+				Rows.Add(FString::Printf(TEXT("%.2f-%.2fs %s"), R.Start, R.End, *R.Text));
+			}
+			O.Chunks.Add(MakeShared<FJsonValueObject>(GameIQ::MakeChunk(
+				FString::Printf(TEXT("%s#timeline"), *Id), Id, TEXT("sequence-timeline"),
+				FString::Printf(TEXT("%s timeline\n%s"), *Name, *FString::Join(Rows, TEXT("\n"))).Left(8000))));
+		}
+	}
+
 	/** Asset classes whose bespoke recipe needs the UObject loaded. Everything else goes through
 	 *  the no-load tag path. (A custom C++ subclass of one of these registers under its own class
 	 *  name and falls to the tag path — Tier 0 still covers it fully.) */
@@ -747,7 +1001,7 @@ namespace
 		static const TSet<FString> LoadClasses = {
 			TEXT("StaticMesh"), TEXT("SkeletalMesh"), TEXT("Skeleton"), TEXT("DataTable"),
 			TEXT("Material"), TEXT("MaterialInstanceConstant"),
-			TEXT("InputMappingContext"), TEXT("InputAction"), TEXT("World") };
+			TEXT("InputMappingContext"), TEXT("InputAction"), TEXT("World"), TEXT("LevelSequence") };
 		return LoadClasses.Contains(AssetClassName);
 	}
 }
@@ -774,6 +1028,7 @@ void GameIQAsset::ExtractAsset(
 	else if (const UInputMappingContext* IMC = Cast<UInputMappingContext>(Asset)) { RecipeInputMappingContext(O, IMC, Id, Name); }
 	else if (const UInputAction* IA = Cast<UInputAction>(Asset)) { RecipeInputAction(O, IA, Id, Name); }
 	else if (UWorld* World = Cast<UWorld>(Asset)) { RecipeLevel(O, World, Id, Name, bIncludeExternalActors); }
+	else if (const ULevelSequence* Seq = Cast<ULevelSequence>(Asset)) { RecipeLevelSequence(O, Seq, Id, Name); }
 	else
 	{
 		const FString Props = GenericReflectionSummary(O, Asset, Id);
@@ -782,6 +1037,19 @@ void GameIQAsset::ExtractAsset(
 			? FString::Printf(TEXT("%s (%s)"), *Name, *ClassName)
 			: FString::Printf(TEXT("%s (%s)\n%s"), *Name, *ClassName, *Props));
 	}
+}
+
+void GameIQAsset::ExtractFromRegistryTags(
+	const FAssetData& Data,
+	TArray<TSharedPtr<FJsonValue>>& Entities,
+	TArray<TSharedPtr<FJsonValue>>& Edges,
+	TArray<TSharedPtr<FJsonValue>>& Chunks)
+{
+	FOut O{ Entities, Edges, Chunks };
+	const FString Id = GameIQHash::AssetIdOfPackage(Data.PackageName);
+	const FString Name = Data.AssetName.ToString();
+	if (Data.AssetClassPath.GetAssetName() == FName(TEXT("Texture2D")) && ExtractTextureNoLoad(O, Data, Id, Name)) { return; }
+	ExtractFromTags(O, Data, Id, Name);
 }
 
 UGameIQAssetsCommandlet::UGameIQAssetsCommandlet()

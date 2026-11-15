@@ -9,15 +9,25 @@
 #include "Dom/JsonObject.h"
 #include "Engine/Blueprint.h"
 #include "Engine/World.h"
+#include "DirectoryWatcherModule.h"
 #include "GameIQAssetCommandlet.h"
+#include "GameIQAssetFacts.h"
 #include "GameIQBlueprintCommandlet.h"
 #include "GameIQBuildRunner.h"
 #include "GameIQCppFingerprint.h"
+#include "GameIQGit.h"
 #include "GameIQJson.h"
+#include "GameIQProjectChecks.h"
 #include "GameIQSettings.h"
+#include "GameIQSnapshots.h"
 #include "GameIQStore.h"
+#include "IDirectoryWatcher.h"
+#include "Misc/CommandLine.h"
+#include "Misc/PackageName.h"
+#include "Misc/Parse.h"
 #include "Misc/Paths.h"
 #include "Modules/ModuleManager.h"
+#include "SQLiteDatabase.h"
 #include "UObject/Package.h"
 #include "UObject/UObjectHash.h"
 
@@ -73,10 +83,29 @@ void UGameIQSaveHookSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 			if (UGameIQSaveHookSubsystem* This = WeakThis.Get())
 			{
 				This->StartupCppCheckHandle.Reset();
+				const FString ProjectRoot = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir());
+				if (!IsRunningCommandlet() && !GameIQAgentFiles::Check(ProjectRoot)->GetBoolField(TEXT("present")))
+				{
+					UE_LOG(LogGameIQHook, Warning, TEXT("Game IQ: no agent file (CLAUDE.md, AGENTS.md, GEMINI.md, .github/copilot-instructions.md) carries the GameIQ guide, so coding agents are not told the index exists. Run the console command GameIQ.GenerateAgentConfig (or Tools > Game IQ > Write Agent Guide)."));
+				}
 				This->CheckCppFreshness();
+				This->CheckDocsFreshness();
+				This->StartDocsWatcher();
+				// Catch-up waits for the registry's initial scan; if it already finished, go now.
+				IAssetRegistry& AR = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+				if (!AR.IsLoadingAssets()) { This->StartCatchUpScan(); }
 			}
 			return false; // one-shot
 		}), 5.0f);
+
+	if (AutomationAllowed())
+	{
+		// Content that arrived without an editor save (issue #35): diff once the registry has scanned.
+		FilesLoadedHandle = ARM.Get().OnFilesLoaded().AddUObject(this, &UGameIQSaveHookSubsystem::StartCatchUpScan);
+		// Per-commit snapshots (issue #36): HEAD is a file read, cheap enough to poll.
+		GitHeadHandle = FTSTicker::GetCoreTicker().AddTicker(
+			FTickerDelegate::CreateUObject(this, &UGameIQSaveHookSubsystem::CheckGitHead), 30.0f);
+	}
 
 #if WITH_LIVE_CODING
 	if (ILiveCodingModule* LiveCoding = FModuleManager::GetModulePtr<ILiveCodingModule>(LIVE_CODING_MODULE_NAME))
@@ -100,6 +129,23 @@ void UGameIQSaveHookSubsystem::Deinitialize()
 	{
 		FTSTicker::GetCoreTicker().RemoveTicker(StartupCppCheckHandle);
 		StartupCppCheckHandle.Reset();
+	}
+	for (FTSTicker::FDelegateHandle* Handle : { &DocsDebounceHandle, &QueueHandle, &CatchUpHandle, &GitHeadHandle })
+	{
+		if (Handle->IsValid())
+		{
+			FTSTicker::GetCoreTicker().RemoveTicker(*Handle);
+			Handle->Reset();
+		}
+	}
+	StopDocsWatcher();
+	if (FilesLoadedHandle.IsValid())
+	{
+		if (FAssetRegistryModule* ARMod = FModuleManager::GetModulePtr<FAssetRegistryModule>(TEXT("AssetRegistry")))
+		{
+			ARMod->Get().OnFilesLoaded().Remove(FilesLoadedHandle);
+		}
+		FilesLoadedHandle.Reset();
 	}
 #if WITH_LIVE_CODING
 	if (LiveCodingHandle.IsValid())
@@ -198,6 +244,15 @@ void UGameIQSaveHookSubsystem::PatchSavedPackage(const FString& PackageName)
 	TArray<TSharedPtr<FJsonValue>> Entities, Edges, Chunks;
 	const FString Id = AssetIdFromPackage(PackageName);
 
+	// Registry view of the just-saved package: size and class facts (issue #33), same as the build.
+	FAssetRegistryModule& ARM = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+	TArray<FAssetData> PackageAssets;
+	ARM.Get().GetAssetsByPackageName(Package->GetFName(), PackageAssets);
+	auto AddFacts = [&PackageAssets](const TSharedRef<FJsonObject>& Detail)
+	{
+		if (PackageAssets.Num() > 0) { GameIQAssetFacts::FillFacts(PackageAssets[0], Detail); }
+	};
+
 	if (BP)
 	{
 		// The blueprint entity itself (registry producer normally emits this; the delta replaces
@@ -205,6 +260,7 @@ void UGameIQSaveHookSubsystem::PatchSavedPackage(const FString& PackageName)
 		TSharedRef<FJsonObject> Detail = MakeShared<FJsonObject>();
 		Detail->SetStringField(TEXT("assetClass"), TEXT("Blueprint"));
 		if (BP->ParentClass) { Detail->SetStringField(TEXT("parentClass"), BP->ParentClass->GetName()); }
+		AddFacts(Detail);
 		Entities.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEntity(
 			Id, TEXT("blueprint"), BP->GetName(), PackageName, TEXT("asset"), FString(),
 			FString::Printf(TEXT("Blueprint %s"), *BP->GetName()), Detail)));
@@ -225,15 +281,16 @@ void UGameIQSaveHookSubsystem::PatchSavedPackage(const FString& PackageName)
 		const FString ClassName = Asset->GetClass()->GetName();
 		TSharedRef<FJsonObject> Detail = MakeShared<FJsonObject>();
 		Detail->SetStringField(TEXT("assetClass"), ClassName);
+		AddFacts(Detail);
 		Entities.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEntity(
 			Id, TEXT("asset"), Asset->GetName(), PackageName, TEXT("asset"), FString(),
 			FString::Printf(TEXT("%s (%s)"), *Asset->GetName(), *ClassName), Detail)));
 
-		GameIQAsset::ExtractAsset(Asset, Entities, Edges, Chunks, /*RegistryData=*/nullptr, /*bIncludeExternalActors=*/false);
+		GameIQAsset::ExtractAsset(Asset, Entities, Edges, Chunks, PackageAssets.Num() > 0 ? &PackageAssets[0] : nullptr,
+			/*bIncludeExternalActors=*/false);
 	}
 
 	// Dependency edges (keep "what this asset uses" fresh).
-	FAssetRegistryModule& ARM = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
 	TArray<FName> Deps;
 	ARM.Get().GetDependencies(Package->GetFName(), Deps, UE::AssetRegistry::EDependencyCategory::Package);
 	for (const FName& Dep : Deps)
@@ -304,7 +361,7 @@ void UGameIQSaveHookSubsystem::DropSubtree(const FString& EntityId)
 
 void UGameIQSaveHookSubsystem::CheckCppFreshness()
 {
-	if (bCppCheckInFlight) { return; }
+	if (bCppCheckInFlight || !AutomationAllowed()) { return; }
 	if (!GetDefault<UGameIQSettings>()->bAutoReindexCpp) { return; }
 
 	const FString Root = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir());
@@ -312,7 +369,6 @@ void UGameIQSaveHookSubsystem::CheckCppFreshness()
 	// deliberate user action (GameIQ.Rebuild), not something to launch behind their back.
 	if (!FPaths::FileExists(FPaths::Combine(Root, TEXT(".gameiq"), TEXT("index.db")))) { return; }
 	if (!FPaths::FileExists(GameIQCppFingerprint::CppJsonPath(Root))) { return; }
-	if (FGameIQBuildRunner::Get().IsBuilding()) { return; }
 
 	// The fingerprint is stat-only but still walks the whole source tree — keep it off the game
 	// thread; only the compare + build kick hop back.
@@ -330,10 +386,290 @@ void UGameIQSaveHookSubsystem::CheckCppFreshness()
 			// An empty Stored (pre-fingerprint index) counts as stale: the reindex it triggers
 			// stamps the first fingerprint, so this self-heals one build later.
 			if (Current == Stored) { return; }
-			if (FGameIQBuildRunner::Get().IsBuilding()) { return; }
 			UE_LOG(LogGameIQHook, Display, TEXT("Game IQ: C++ sources changed since the last code extraction — reindexing code in the background."));
-			FGameIQBuildRunner::Get().StartBuild(TEXT("GameIQCppBuild"),
-				NSLOCTEXT("GameIQ", "AutoReindexCppStarted", "Game IQ: C++ changed — reindexing code in the background…"));
+			// Queued, not dropped, when another build holds the runner (a docs reindex used to make
+			// the C++ check give up until the next editor start).
+			This->QueueReindex(TEXT("GameIQCppBuild"));
 		});
 	});
+}
+
+bool UGameIQSaveHookSubsystem::AutomationAllowed()
+{
+	return !IsRunningCommandlet() && !FParse::Param(FCommandLine::Get(), TEXT("NoGameIQAuto"));
+}
+
+// ---- Background reindex queue --------------------------------------------------------------
+
+void UGameIQSaveHookSubsystem::QueueReindex(const FString& RunArg)
+{
+	QueuedRuns.AddUnique(RunArg);
+	if (!QueueHandle.IsValid())
+	{
+		QueueHandle = FTSTicker::GetCoreTicker().AddTicker(
+			FTickerDelegate::CreateUObject(this, &UGameIQSaveHookSubsystem::PumpReindexQueue), 1.0f);
+	}
+}
+
+bool UGameIQSaveHookSubsystem::PumpReindexQueue(float /*DeltaTime*/)
+{
+	if (QueuedRuns.Num() == 0)
+	{
+		QueueHandle.Reset();
+		return false;
+	}
+	if (FGameIQBuildRunner::Get().IsBuilding()) { return true; } // try again next second
+	const FString Run = QueuedRuns[0];
+	QueuedRuns.RemoveAt(0);
+	const FText Label = Run == TEXT("GameIQDocsBuild")
+		? NSLOCTEXT("GameIQ", "AutoReindexDocsStarted", "Game IQ: design docs changed — reindexing documents in the background…")
+		: NSLOCTEXT("GameIQ", "AutoReindexCppStarted", "Game IQ: C++ changed — reindexing code in the background…");
+	FGameIQBuildRunner::Get().StartBuild(Run, Label);
+	return true;
+}
+
+// ---- Docs auto-reindex (issue #29) ---------------------------------------------------------
+
+void UGameIQSaveHookSubsystem::CheckDocsFreshness()
+{
+	if (bDocsCheckInFlight || !AutomationAllowed()) { return; }
+	if (!GetDefault<UGameIQSettings>()->bAutoReindexDocs) { return; }
+
+	const FString Root = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir());
+	// Same rule as C++: no index, or the docs stage never ran → a first build is the user's call.
+	if (!FPaths::FileExists(FPaths::Combine(Root, TEXT(".gameiq"), TEXT("index.db")))) { return; }
+	if (!FPaths::FileExists(FPaths::Combine(Root, TEXT(".gameiq"), TEXT("extract"), TEXT("docs.json")))) { return; }
+
+	bDocsCheckInFlight = true;
+	TWeakObjectPtr<UGameIQSaveHookSubsystem> WeakThis(this);
+	Async(EAsyncExecution::Thread, [WeakThis, Root]()
+	{
+		const FString Current = GameIQDocsFingerprint::Compute(Root);
+		const FString Stored = GameIQDocsFingerprint::ReadStored(Root);
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, Current, Stored]()
+		{
+			UGameIQSaveHookSubsystem* This = WeakThis.Get();
+			if (!This) { return; }
+			This->bDocsCheckInFlight = false;
+			// Empty Stored = an index from before docs fingerprints: reindex once, which stamps one.
+			if (Current == Stored) { return; }
+			UE_LOG(LogGameIQHook, Display, TEXT("Game IQ: design docs changed since the last docs extraction — reindexing documents in the background."));
+			This->LastDocsReindexQueuedAt = FPlatformTime::Seconds();
+			This->QueueReindex(TEXT("GameIQDocsBuild"));
+		});
+	});
+}
+
+void UGameIQSaveHookSubsystem::StartDocsWatcher()
+{
+	if (!AutomationAllowed() || !GetDefault<UGameIQSettings>()->bAutoReindexDocs || DocsWatcherHandle.IsValid()) { return; }
+	FDirectoryWatcherModule& DWM = FModuleManager::LoadModuleChecked<FDirectoryWatcherModule>(TEXT("DirectoryWatcher"));
+	IDirectoryWatcher* Watcher = DWM.Get();
+	if (!Watcher) { return; }
+
+	const FString Root = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir());
+	WatchedDocsDir = GameIQDocsFingerprint::DocsRoot(Root);
+	if (!IFileManager::Get().DirectoryExists(*WatchedDocsDir)) { return; }
+	Watcher->RegisterDirectoryChangedCallback_Handle(WatchedDocsDir,
+		IDirectoryWatcher::FDirectoryChanged::CreateUObject(this, &UGameIQSaveHookSubsystem::OnDocsDirectoryChanged),
+		DocsWatcherHandle, 0);
+	UE_LOG(LogGameIQHook, Log, TEXT("Game IQ: watching %s for design-doc changes (auto docs reindex)."), *WatchedDocsDir);
+}
+
+void UGameIQSaveHookSubsystem::StopDocsWatcher()
+{
+	if (!DocsWatcherHandle.IsValid()) { return; }
+	if (FDirectoryWatcherModule* DWM = FModuleManager::GetModulePtr<FDirectoryWatcherModule>(TEXT("DirectoryWatcher")))
+	{
+		if (IDirectoryWatcher* Watcher = DWM->Get())
+		{
+			Watcher->UnregisterDirectoryChangedCallback_Handle(WatchedDocsDir, DocsWatcherHandle);
+		}
+	}
+	DocsWatcherHandle.Reset();
+}
+
+void UGameIQSaveHookSubsystem::OnDocsDirectoryChanged(const TArray<FFileChangeData>& Changes)
+{
+	const FString Root = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir());
+	bool bDocTouched = false;
+	for (const FFileChangeData& Change : Changes)
+	{
+		if (GameIQDocsFingerprint::IsDocFile(Root, FPaths::ConvertRelativePathToFull(Change.Filename)))
+		{
+			bDocTouched = true;
+			break;
+		}
+	}
+	if (!bDocTouched) { return; }
+
+	// Debounce: an editor saving a doc fires several events, and an agent edits docs in bursts.
+	// Re-arm a 10 s timer on every doc event; the fingerprint check runs once things go quiet.
+	// A reindex is a whole UnrealEditor-Cmd process, so the timer also never fires sooner than
+	// the minimum interval after the previous automatic docs reindex.
+	float Delay = 10.0f;
+	if (LastDocsReindexQueuedAt > 0.0)
+	{
+		const double MinInterval = static_cast<double>(GetDefault<UGameIQSettings>()->AutoReindexDocsMinIntervalSeconds);
+		Delay = FMath::Max(Delay, static_cast<float>(MinInterval - (FPlatformTime::Seconds() - LastDocsReindexQueuedAt)));
+	}
+	if (DocsDebounceHandle.IsValid())
+	{
+		FTSTicker::GetCoreTicker().RemoveTicker(DocsDebounceHandle);
+	}
+	DocsDebounceHandle = FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+		[WeakThis = TWeakObjectPtr<UGameIQSaveHookSubsystem>(this)](float) -> bool
+		{
+			if (UGameIQSaveHookSubsystem* This = WeakThis.Get())
+			{
+				This->DocsDebounceHandle.Reset();
+				This->CheckDocsFreshness();
+			}
+			return false;
+		}), Delay);
+}
+
+// ---- Startup catch-up scan (issue #35) -----------------------------------------------------
+
+void UGameIQSaveHookSubsystem::StartCatchUpScan()
+{
+	if (bCatchUpDone || !AutomationAllowed() || !GetDefault<UGameIQSettings>()->bCatchUpOnStartup) { return; }
+	bCatchUpDone = true;
+
+	const FString Root = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir());
+	const FString DbPath = FPaths::Combine(Root, TEXT(".gameiq"), TEXT("index.db"));
+	if (!FPaths::FileExists(DbPath)) { return; } // no index yet: the first build is the user's call
+
+	// Root asset ids currently in the index.
+	TSet<FString> Indexed;
+	{
+		FSQLiteDatabase Db;
+		if (!Db.Open(*DbPath, ESQLiteDatabaseOpenMode::ReadOnly)) { return; }
+		{
+			FSQLitePreparedStatement Stmt(Db,
+				TEXT("SELECT substr(id, 7) AS pkg FROM entities WHERE id LIKE 'asset:/Game/%' AND parent IS NULL"));
+			while (Stmt.IsValid() && Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+			{
+				FString Pkg;
+				Stmt.GetColumnValueByName(TEXT("pkg"), Pkg);
+				Indexed.Add(Pkg);
+			}
+		}
+		Db.Close();
+	}
+	if (Indexed.Num() == 0) { return; } // empty index: a full build, not a catch-up, is what's needed
+
+	IAssetRegistry& AR = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+	TArray<FAssetData> Assets;
+	AR.GetAssetsByPath(FName(TEXT("/Game")), Assets, /*bRecursive=*/true, /*bIncludeOnlyOnDiskAssets=*/true);
+
+	TSet<FString> InRegistry;
+	for (const FAssetData& Data : Assets)
+	{
+		const FString Pkg = Data.PackageName.ToString();
+		if (Pkg.Contains(TEXT("/__ExternalActors__/")) || Pkg.Contains(TEXT("/__ExternalObjects__/"))) { continue; }
+		if (InRegistry.Contains(Pkg)) { continue; } // one row per package (its first asset)
+		InRegistry.Add(Pkg);
+		if (!Indexed.Contains(Pkg)) { CatchUpMissing.Add(Data); }
+	}
+	for (const FString& Pkg : Indexed)
+	{
+		if (Pkg.Contains(TEXT("/__ExternalActors__/")) || Pkg.Contains(TEXT("/__ExternalObjects__/"))) { continue; }
+		if (!InRegistry.Contains(Pkg) && !FPackageName::DoesPackageExist(Pkg)) { CatchUpGone.Add(Pkg); }
+	}
+
+	UE_LOG(LogGameIQHook, Display, TEXT("Game IQ: catch-up scan — %d asset(s) on disk missing from the index, %d indexed asset(s) gone from disk."),
+		CatchUpMissing.Num(), CatchUpGone.Num());
+	if (CatchUpMissing.Num() > 0 || CatchUpGone.Num() > 0)
+	{
+		CatchUpHandle = FTSTicker::GetCoreTicker().AddTicker(
+			FTickerDelegate::CreateUObject(this, &UGameIQSaveHookSubsystem::CatchUpTick), 0.1f);
+	}
+}
+
+bool UGameIQSaveHookSubsystem::CatchUpTick(float /*DeltaTime*/)
+{
+	// A running build re-exports the whole registry anyway; let it finish first.
+	if (FGameIQBuildRunner::Get().IsBuilding()) { return true; }
+
+	static const TCHAR* CatchUpRegistryProducer = TEXT("gameiq-ue-registry@0.1.0");
+	FGameIQStore Store;
+	if (!Store.Open()) { CatchUpHandle.Reset(); return false; }
+
+	if (CatchUpGone.Num() > 0)
+	{
+		// Full subtree drop (every producer): the package no longer exists.
+		Store.Patch(CatchUpGone, {}, {}, {}, HookAssetsProducer);
+		UE_LOG(LogGameIQHook, Display, TEXT("Game IQ: catch-up removed %d asset(s) no longer on disk."), CatchUpGone.Num());
+		CatchUpGone.Reset();
+	}
+
+	// Registry-only work (no loads), 200 packages per tick keeps each hitch small.
+	const int32 Batch = FMath::Min(200, CatchUpMissing.Num());
+	if (Batch > 0)
+	{
+		IAssetRegistry& AR = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+		TArray<FString> Ids;
+		TArray<TSharedPtr<FJsonValue>> RegEntities, RegEdges, TagEntities, TagEdges, TagChunks;
+		for (int32 i = 0; i < Batch; ++i)
+		{
+			const FAssetData& Data = CatchUpMissing[i];
+			Ids.Add(AssetIdFromPackage(Data.PackageName.ToString()));
+			GameIQAssetFacts::AppendTier0(AR, Data, RegEntities, RegEdges);
+			GameIQAsset::ExtractFromRegistryTags(Data, TagEntities, TagEdges, TagChunks);
+		}
+		const bool bOk = Store.PatchProducerScoped(Ids, RegEntities, RegEdges, {}, CatchUpRegistryProducer)
+			&& Store.PatchProducerScoped(Ids, TagEntities, TagEdges, TagChunks, HookAssetsProducer);
+		CatchUpMissing.RemoveAt(0, Batch);
+		CatchUpAdded += bOk ? Batch : 0;
+	}
+	Store.Close();
+
+	if (CatchUpMissing.Num() == 0)
+	{
+		if (CatchUpAdded > 0)
+		{
+			UE_LOG(LogGameIQHook, Display, TEXT("Game IQ: catch-up added %d asset(s) that arrived without an editor save (registry-level rows; GameIQ.Rebuild adds deep recipes)."),
+				CatchUpAdded);
+		}
+		CatchUpHandle.Reset();
+		return false;
+	}
+	return true;
+}
+
+// ---- Per-commit snapshots (issue #36) ------------------------------------------------------
+
+bool UGameIQSaveHookSubsystem::CheckGitHead(float /*DeltaTime*/)
+{
+	const UGameIQSettings* Settings = GetDefault<UGameIQSettings>();
+	if (!Settings->bSnapshotPerCommit || bSnapshotInFlight) { return true; }
+
+	const FString Root = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir());
+	if (!FPaths::FileExists(FPaths::Combine(Root, TEXT(".gameiq"), TEXT("index.db")))) { return true; }
+	FString Sha, Branch;
+	if (!GameIQGit::ReadHead(Root, Sha, Branch) || Sha == LastSeenGitHead) { return true; }
+	// Snapshot a quiescent index: a running build is mid-ingest.
+	if (FGameIQBuildRunner::Get().IsBuilding()) { return true; }
+
+	bSnapshotInFlight = true;
+	const int32 MaxAuto = Settings->MaxAutoSnapshots;
+	TWeakObjectPtr<UGameIQSaveHookSubsystem> WeakThis(this);
+	Async(EAsyncExecution::Thread, [WeakThis, Sha, Branch, MaxAuto]()
+	{
+		const FString Id = GameIQSnapshots::CreateForCommit(Sha, Branch, MaxAuto);
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, Sha, Id]()
+		{
+			UGameIQSaveHookSubsystem* This = WeakThis.Get();
+			if (!This) { return; }
+			This->bSnapshotInFlight = false;
+			This->LastSeenGitHead = Sha;
+			if (!Id.IsEmpty())
+			{
+				UE_LOG(LogGameIQHook, Display, TEXT("Game IQ: git HEAD is now %s — took index snapshot %s (Changes accepts the commit as 'since')."),
+					*Sha.Left(10), *Id);
+			}
+		});
+	});
+	return true;
 }

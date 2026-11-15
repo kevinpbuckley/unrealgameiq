@@ -24,10 +24,13 @@ public class GameIQ : ModuleRules
 			"EnhancedInput",     // Tier 1 recipe: InputMappingContext key->action mappings (default UE5 input)
 			"InputCore",         // FKey for input mappings
 			"SQLiteCore",        // in-editor toolset reads the .gameiq/index.db (FTS5) natively, no Node
-			"ToolsetRegistry",   // UE 5.8 native AI toolset registry — exposes GameIQ queries on Epic's MCP endpoint
+			"ToolsetRegistry",   // UE 5.8+ native AI toolset registry — exposes GameIQ queries on Epic's MCP endpoint
 			"ImageWrapper",      // read image dimensions (png/jpg/…) for the docs image extractor (issue #7)
 			"zlib",              // inflate PDF FlateDecode content streams for text extraction (issue #5)
 			"UMG",               // widget-tree summary for WidgetBlueprints (issue #14)
+			"LevelSequence",     // Level Sequence recipe: bindings, sections, camera cuts (issue #34)
+			"MovieScene",
+			"MovieSceneTracks",
 		});
 
 		// Editor-only machinery for the live in-editor bridge and Tier 2 graph export
@@ -46,6 +49,7 @@ public class GameIQ : ModuleRules
 				"WorkspaceMenuStructure", // Tools category for the dockable tab
 				"FileUtilities",   // FZipArchiveReader (over bundled libzip) — read DOCX word/document.xml (issue #5)
 				"UMGEditor",       // UWidgetBlueprint for the widget-tree summary (issue #14)
+				"DirectoryWatcher", // docs auto-reindex: watch the docs folder (issue #29)
 			});
 
 			if (Target.bWithLiveCoding)

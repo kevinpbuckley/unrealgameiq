@@ -44,6 +44,43 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Indexing")
 	bool bAutoReindexCpp = true;
 
+	/**
+	 * Keep design docs fresh automatically: the docs folder (Docs Directory, or the project tree) is
+	 * watched, and a change to a doc file (or a mismatch found at editor startup) runs a background
+	 * docs-only reindex. Disable to refresh docs only via GameIQ.ReindexDocs.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Indexing")
+	bool bAutoReindexDocs = true;
+
+	/**
+	 * Shortest time between two automatic docs reindexes started by the docs watcher. Each reindex
+	 * runs a headless UnrealEditor-Cmd process next to the editor, so a project whose docs change
+	 * every few seconds (agents writing notes) must not start one per change: changes that arrive
+	 * inside the interval are picked up by one reindex when it ends.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Indexing", meta = (ClampMin = "10", ClampMax = "86400", Units = "s"))
+	int32 AutoReindexDocsMinIntervalSeconds = 300;
+
+	/**
+	 * On editor startup (once the Asset Registry has scanned), add every /Game asset that is on disk
+	 * but missing from the index (marketplace packs, a VCS sync — anything that arrived without an
+	 * editor save) as registry-level entries with size facts and dependencies, and drop entries whose
+	 * package is gone. Deep recipes and Blueprint pseudocode still need GameIQ.Rebuild.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Indexing")
+	bool bCatchUpOnStartup = true;
+
+	/**
+	 * Take an automatic snapshot of the index each time git HEAD moves (checked every 30 s while
+	 * the editor is open), so Changes can answer "what changed since <commit>". Only the newest
+	 * Max Auto Snapshots are kept.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Snapshots")
+	bool bSnapshotPerCommit = true;
+
+	UPROPERTY(config, EditAnywhere, Category = "Snapshots", meta = (ClampMin = "1", ClampMax = "500"))
+	int32 MaxAutoSnapshots = 20;
+
 	//~ UDeveloperSettings — surface under the "Plugins" category
 	virtual FName GetCategoryName() const override { return TEXT("Plugins"); }
 

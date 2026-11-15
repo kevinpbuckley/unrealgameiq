@@ -4,7 +4,12 @@ This project includes the Unreal Game IQ plugin, which builds an in-editor index
 
 ## How to call GameIQ
 
-**Fastest path — direct Python** (inside `execute_python_code` or the editor Python console). Every
+Query the index BEFORE grepping or reading files whenever the question is about this project's
+assets, Blueprints, C++, docs or how they connect: `.uasset` files are binary, so a grep cannot see
+half the game. The plugin also ships a skill (`/Skills/GameIQ/gameiq`, listed by `ListSkills`).
+
+**Fastest path — direct Python** (inside the UE 5.9 `execute_python` tool of
+`editor_toolset.toolsets.python_scripting.PythonScriptingTools`, or the editor Python console). Every
 query is a static method on `unreal.GameIQService`; each returns a **JSON string** whose payload is
 under the `"result"` key:
 
@@ -32,33 +37,54 @@ Python signatures (defaults apply — a bare `search("query")` searches all kind
 - `get_blueprint_context(id_or_path, detail_level="logic", max_chars=40000, format="json")` — compact BP export
 - `export_graph(topic_or_id, format="mermaid", direction="both", depth=1, edge_types="", kinds="", max_nodes=50)`
 - `create_snapshot(name, metadata_json="{}")`, `list_snapshots(limit=50)`, `delete_snapshot(id)`
-- `changes(since_snapshot, until_snapshot="current", kind="", path_prefix="", limit=200, offset=0)`
-- `project_stats(facet="overview")` — facets: `overview`, `kinds`, `edges`, `unused`, `largest-deps`, `authority`, `doc-types`
+- `changes(since_snapshot, until_snapshot="current", kind="", path_prefix="", limit=200, offset=0)` —
+  `since`/`until` take a snapshot id, `"current"`, a git ref (`"HEAD~3"`, a sha, a branch) or an ISO time
+- `project_stats(facet="overview")` — facets: `overview`, `kinds`, `edges`, `unused`, `largest`,
+  `largest:<AssetClass>`, `largest-deps`, `authority`, `doc-types`
 - `drift()` — doc-stated `property = value` claims that contradict the extracted implementation
 - `coverage(doc_type="")` — which stated design intent is backed by a real implementation
 - `doctor()` — index health check; use to tell "empty project" apart from "broken index" before trusting empty results
 
-**Via MCP `call_tool` or `unreal.ToolsetRegistry.execute_tool`** the toolset name is
-`GameIQ.GameIQService` (tools: `Search`, `GetEntity`, `Children`, `References`, `Impact`, `Explain`,
-`GetBlueprintContext`, `ExportGraph`, snapshot tools, `Changes`, `ProjectStats`, `Drift`, `Coverage`,
-`Doctor`). At this layer `Search` **requires** `kind` (pass `""`
-for all kinds) and `References` requires `edgeType` + `kind`. Results arrive as
-`{"returnValue": "<json string>"}` — parse twice:
+**Inside a UE 5.9 `execute_python` script**, `call_tool` is injected: `await` it with the tool's
+parameter names in camelCase. It returns the tool's value (the JSON string) directly.
+(`unreal.ToolsetRegistry.execute_tool` and `execute_python_code` are gone in 5.9: the runner rejects
+the first and the second no longer exists.)
 
 ```python
-res = unreal.ToolsetRegistry.execute_tool("GameIQ.GameIQService", "Search",
-                                          json.dumps({"query": "player input", "kind": ""}))
-data = json.loads(json.loads(res.get_value_as_json_string())["returnValue"])["result"]
+import json
+data = json.loads(await call_tool("GameIQ.GameIQService.Search", query="player input", kind=""))["result"]
+```
+
+**Over MCP `call_tool`** the toolset name is `GameIQ.GameIQService` (tools: `Search`, `GetEntity`,
+`Children`, `References`, `Impact`, `Explain`, `GetBlueprintContext`, `ExportGraph`, `CreateSnapshot`,
+`ListSnapshots`, `DeleteSnapshot`, `Changes`, `ProjectStats`, `Drift`, `Coverage`, `Doctor`). At this
+layer `Search` **requires** `kind` (pass `""` for all kinds) and `References` requires `edgeType` +
+`kind`. Results arrive as `{"returnValue": "<json string>"}` — parse twice.
+
+**Without the editor** (another agent holds it; Codex, Cursor, a subagent): the read-only CLI answers
+the same queries from `.gameiq/index.db` with stock Python — never `grep -a` the database:
+
+```
+python Plugins/GameIQ/scripts/gameiq_query.py search "player input" --kind blueprint
+python Plugins/GameIQ/scripts/gameiq_query.py references <id> --direction in
+python Plugins/GameIQ/scripts/gameiq_query.py stats unused
+python Plugins/GameIQ/scripts/gameiq_query.py changes HEAD~3
+python Plugins/GameIQ/scripts/gameiq_query.py doctor
 ```
 
 ## Entity kinds and id formats
 
-- Kinds (for `kind` filters): `asset`, `blueprint`, `level-actor`, `bp-function`, `bp-component`,
-  `bp-variable`, `cpp-class`, `cpp-function`, `cpp-property`, `cpp-struct`, `config-section`, `plugin`.
+- Kinds (for `kind` filters): `asset`, `blueprint`, `level-actor`, `datatable-row`, `bp-function`,
+  `bp-component`, `bp-variable`, `cpp-class`, `cpp-function`, `cpp-property`, `cpp-struct`, `cpp-file`,
+  `config-section`, `plugin`, `document`, `doc-section`, `image`.
   A wrong kind returns an empty list silently — when unsure pass `""`.
 - Entity id formats: `asset:/Game/Path/Name` (assets and Blueprints),
   `cpp:ClassName` / `cpp:ClassName::FunctionName` (C++),
-  `asset:/Game/Path/BP_Name::GraphName` (Blueprint graphs/functions).
+  `asset:/Game/Path/BP_Name::GraphName` (Blueprint graphs/functions),
+  `asset:/Game/Path/DT_Name::row::RowName` (DataTable rows — each row is searchable text).
+- Typed edges worth filtering on: `loads-by-path` (a C++ `/Game/...` string literal loads the asset),
+  `plays-anim` / `plays-audio` / `plays-sequence` (Level Sequence sections; `attrs.sections` has the
+  binding and start/end seconds), `uses-skeleton`, `uses-material`, `placed-in-level`.
   Search results include the exact id — copy it into `get_entity` / `references` / `impact`.
 - C++ ids are stored with the UE reflection prefix STRIPPED (`cpp:EnemyAIController`, not
   `cpp:AEnemyAIController`). Prefixed spellings are auto-aliased to the stored form (the response
@@ -74,7 +100,11 @@ Grep, Glob, `list_assets`, or the Content Browser:
 
 - **"Which BP/asset owns / uses / references X?"** → `references(id)` — not a registry scan.
 - **Before deleting or renaming ANYTHING** → `impact(id)` first; it is the "what breaks" answer.
-- **"Is this dead code / unused?"** → `impact(id)` + `project_stats("unused")`.
+- **"Is this dead code / unused?"** → `impact(id)` + `project_stats("unused")` (its
+  `possiblyLoadedByPath` list = assets only a C++ path literal names — not safe to delete).
+- **"What is biggest / what bloats the build?"** → `project_stats("largest")` or `"largest:Texture2D"`.
+- **"Which cutscenes play this clip / sound?"** → `references(id, "in", edge_type="plays-anim")`.
+- **"What changed since commit X?"** → `changes("X")` — the editor snapshots the index each time git HEAD moves.
 - **"Where is X implemented?"** → `search(x)` — grep only for C++ *flow tracing* afterwards.
 - **Widget Blueprints**: `get_entity` summaries include the designer widget tree — or the explicit
   line `Designer tree: empty (UI likely constructed in the graph)`, which is itself the answer.
@@ -110,7 +140,9 @@ Grep, Glob, `list_assets`, or the Content Browser:
 
 ## Working conventions
 
-- The index is built from the project's .gameiq directory and updated live as assets are saved. C++ refreshes itself too: on editor startup and after Live Coding patches, changed sources trigger a background code-only reindex (toggle: Project Settings ▸ Plugins ▸ Game IQ ▸ Auto Reindex Cpp) — so `cpp:*` entities normally match the working tree without manual rebuilds.
+- The index is built from the project's .gameiq directory and updated live as assets are saved. C++ refreshes itself too: on editor startup and after Live Coding patches, changed sources trigger a background code-only reindex (toggle: Project Settings ▸ Plugins ▸ Game IQ ▸ Auto Reindex Cpp) — so `cpp:*` entities normally match the working tree without manual rebuilds. Design docs are watched the same way (Auto Reindex Docs), and on editor start a catch-up scan adds assets that arrived without an editor save (marketplace packs, a VCS sync).
+- Every response's `index.bySource` gives the last ingest time per source (cpp, assets, blueprints, docs, …); `index.lastIngestAtIso` moves on any write, so check the source you rely on.
+- `.gameiq/` is a local cache: keep it out of git (`GameIQ.GenerateAgentConfig` adds it to `.gitignore`), and never filter it out of `git status` by hand.
 - If results look stale or missing, rebuild: in a running editor, run the console command `GameIQ.Rebuild` (full), `GameIQ.ReindexDocs` (docs/images/external sources only), or `GameIQ.ReindexCode` (C++ only), or click Tools ▸ Game IQ ▸ Rebuild Index. Headless (editor closed), run the `GameIQBuild` commandlet via UnrealEditor-Cmd with `-run=GameIQBuild`. All report progress via editor notifications and the Output Log (`LogGameIQRunner`).
 - When the user asks for architecture, ownership, or "where is X implemented?", use GameIQ before broad manual search.
 - When the user asks for likely breakage or impact from changing something, use `impact`.

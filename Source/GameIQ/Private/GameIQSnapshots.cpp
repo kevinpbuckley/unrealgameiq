@@ -1,9 +1,11 @@
 // Copyright Buckley Builds LLC. All Rights Reserved.
 
 #include "GameIQSnapshots.h"
+#include "GameIQSqlBind.h"
 
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
+#include "GameIQGit.h"
 #include "GameIQQuery.h"
 #include "HAL/FileManager.h"
 #include "Misc/FileHelper.h"
@@ -142,8 +144,47 @@ namespace
 	{
 		FSQLitePreparedStatement Stmt = Db.PrepareStatement(TEXT("SELECT value FROM meta WHERE key = ?"));
 		if (!Stmt.IsValid()) { return FString(); }
-		Stmt.SetBindingValueByIndex(1, Key);
+		GameIQSql::Bind(Stmt, 1, Key);
 		return Stmt.Step() == ESQLitePreparedStatementStepResult::Row ? Col(Stmt, TEXT("value")) : FString();
+	}
+
+	/** Project root that owns the index (parent of `.gameiq/`). */
+	FString ProjectRootForSnapshots()
+	{
+		return FPaths::GetPath(FPaths::GetPath(GameIQQuery::GetDbPathForServices()));
+	}
+
+	/** Every snapshot manifest, newest first (ids start with a UTC stamp, so name order = time order). */
+	TArray<TSharedPtr<FJsonObject>> AllManifests()
+	{
+		TArray<FString> Files;
+		IFileManager::Get().FindFiles(Files, *FPaths::Combine(SnapshotDir(), TEXT("*.json")), true, false);
+		Files.Sort([](const FString& A, const FString& B) { return A > B; });
+		TArray<TSharedPtr<FJsonObject>> Out;
+		for (const FString& F : Files)
+		{
+			TSharedPtr<FJsonObject> M = ReadJsonObject(FPaths::Combine(SnapshotDir(), F));
+			if (M.IsValid() && M->HasField(TEXT("id"))) { Out.Add(M); }
+		}
+		return Out;
+	}
+
+	FDateTime ManifestTime(const TSharedPtr<FJsonObject>& M)
+	{
+		FDateTime T = FDateTime::MinValue();
+		FString Iso;
+		if (M->TryGetStringField(TEXT("createdAtIso"), Iso)) { FDateTime::ParseIso8601(*Iso, T); }
+		return T;
+	}
+
+	/** Newest snapshot created at or before `When`, or null. */
+	TSharedPtr<FJsonObject> NewestAtOrBefore(const FDateTime& When)
+	{
+		for (const TSharedPtr<FJsonObject>& M : AllManifests())
+		{
+			if (ManifestTime(M) <= When) { return M; }
+		}
+		return nullptr;
 	}
 
 	bool ResolveSnapshot(const FString& IdOrCurrent, FString& OutDbPath, TSharedPtr<FJsonObject>& OutManifest,
@@ -156,23 +197,70 @@ namespace
 			OutManifest->SetStringField(TEXT("id"), TEXT("current"));
 			return true;
 		}
-		if (!IsSafeId(IdOrCurrent))
+
+		TSharedPtr<FJsonObject> Manifest;
+		FString ResolvedFrom;
+		if (IsSafeId(IdOrCurrent))
 		{
-			OutError = TEXT("snapshot id contains invalid characters");
-			return false;
+			Manifest = ReadJsonObject(ManifestPath(IdOrCurrent));
 		}
-		OutManifest = ReadJsonObject(ManifestPath(IdOrCurrent));
-		if (!OutManifest.IsValid())
+		// Not a snapshot id: an ISO time ("2026-11-14T18:00:00Z") picks the newest snapshot at or before it.
+		FDateTime When;
+		if (!Manifest.IsValid() && IdOrCurrent.Contains(TEXT("-")) && IdOrCurrent.Contains(TEXT(":"))
+			&& FDateTime::ParseIso8601(*IdOrCurrent, When))
+		{
+			Manifest = NewestAtOrBefore(When);
+			ResolvedFrom = FString::Printf(TEXT("time %s"), *IdOrCurrent);
+			if (!Manifest.IsValid())
+			{
+				OutError = FString::Printf(TEXT("no snapshot exists at or before %s"), *IdOrCurrent);
+				return false;
+			}
+		}
+		// A git ref: the snapshot taken at that commit, else the newest one taken before the commit time.
+		if (!Manifest.IsValid())
+		{
+			const FString Root = ProjectRootForSnapshots();
+			const FString Sha = GameIQGit::ResolveCommit(Root, IdOrCurrent);
+			if (Sha.IsEmpty())
+			{
+				OutError = FString::Printf(TEXT("'%s' is not a snapshot id, an ISO time, or a git ref git can resolve here"), *IdOrCurrent);
+				return false;
+			}
+			for (const TSharedPtr<FJsonObject>& M : AllManifests())
+			{
+				FString Head;
+				if (M->TryGetStringField(TEXT("gitHead"), Head) && Head == Sha) { Manifest = M; break; }
+			}
+			ResolvedFrom = FString::Printf(TEXT("git %s (%s)"), *IdOrCurrent, *Sha.Left(10));
+			if (!Manifest.IsValid())
+			{
+				const FDateTime CommitTime = GameIQGit::CommitTime(Root, Sha);
+				Manifest = NewestAtOrBefore(CommitTime);
+				ResolvedFrom += TEXT(" — no snapshot at that commit; using the newest one taken before its commit time");
+			}
+			if (!Manifest.IsValid())
+			{
+				OutError = FString::Printf(TEXT("no snapshot exists at or before commit %s — snapshots start when the editor "
+					"first sees a commit (Project Settings > Plugins > Game IQ > Snapshot Per Commit)"), *Sha.Left(10));
+				return false;
+			}
+		}
+		if (!Manifest.IsValid())
 		{
 			OutError = FString::Printf(TEXT("snapshot not found: %s"), *IdOrCurrent);
 			return false;
 		}
-		OutDbPath = SnapshotDbPath(IdOrCurrent);
+
+		const FString Id = Manifest->GetStringField(TEXT("id"));
+		OutDbPath = SnapshotDbPath(Id);
 		if (!FPaths::FileExists(OutDbPath))
 		{
-			OutError = FString::Printf(TEXT("snapshot database is missing: %s"), *IdOrCurrent);
+			OutError = FString::Printf(TEXT("snapshot database is missing: %s"), *Id);
 			return false;
 		}
+		OutManifest = MakeShared<FJsonObject>(*Manifest);
+		if (!ResolvedFrom.IsEmpty()) { OutManifest->SetStringField(TEXT("resolvedFrom"), ResolvedFrom); }
 		return true;
 	}
 
@@ -315,6 +403,13 @@ FString GameIQSnapshots::Create(const FString& Name, const FString& MetadataJson
 	Manifest->SetStringField(TEXT("sourceLastIngestAtIso"), Meta(Db, TEXT("lastIngestAtIso")));
 	Manifest->SetStringField(TEXT("database"), FPaths::GetCleanFilename(DbPath));
 	Manifest->SetObjectField(TEXT("metadata"), Metadata.ToSharedRef());
+	// Tie every snapshot to the commit it was taken at (issue #36): Changes resolves git refs through this.
+	FString GitHead, GitBranch;
+	if (GameIQGit::ReadHead(ProjectRootForSnapshots(), GitHead, GitBranch))
+	{
+		Manifest->SetStringField(TEXT("gitHead"), GitHead);
+		if (!GitBranch.IsEmpty()) { Manifest->SetStringField(TEXT("gitBranch"), GitBranch); }
+	}
 	if (!WriteJsonObject(ManifestPath(Id), Manifest))
 	{
 		IFileManager::Get().Delete(*DbPath, false, true, true);
@@ -324,6 +419,58 @@ FString GameIQSnapshots::Create(const FString& Name, const FString& MetadataJson
 	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetObjectField(TEXT("result"), Manifest);
 	return SerializeSnapshotJson(Root);
+}
+
+FString GameIQSnapshots::LatestSnapshotGitHead()
+{
+	for (const TSharedPtr<FJsonObject>& M : AllManifests())
+	{
+		FString Head;
+		if (M->TryGetStringField(TEXT("gitHead"), Head) && !Head.IsEmpty()) { return Head; }
+	}
+	return FString();
+}
+
+FString GameIQSnapshots::CreateForCommit(const FString& GitHead, const FString& GitBranch, int32 MaxAuto)
+{
+	if (GitHead.IsEmpty()) { return FString(); }
+	TArray<TSharedPtr<FJsonObject>> Manifests = AllManifests();
+	for (const TSharedPtr<FJsonObject>& M : Manifests)
+	{
+		FString Head;
+		if (M->TryGetStringField(TEXT("gitHead"), Head) && Head == GitHead) { return FString(); }
+	}
+
+	const FString Subject = GameIQGit::Subject(ProjectRootForSnapshots(), GitHead);
+	TSharedRef<FJsonObject> Meta = MakeShared<FJsonObject>();
+	Meta->SetBoolField(TEXT("auto"), true);
+	Meta->SetStringField(TEXT("reason"), TEXT("git HEAD moved"));
+	if (!Subject.IsEmpty()) { Meta->SetStringField(TEXT("commitSubject"), Subject); }
+	const FString Name = FString::Printf(TEXT("commit %s%s%s"), *GitHead.Left(10),
+		GitBranch.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" on %s"), *GitBranch),
+		Subject.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(": %s"), *Subject));
+
+	const TSharedPtr<FJsonValue> Created = [&]()
+	{
+		TSharedPtr<FJsonObject> Root;
+		const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Create(Name, SerializeSnapshotJson(Meta)));
+		return FJsonSerializer::Deserialize(Reader, Root) && Root.IsValid() ? Root->TryGetField(TEXT("result")) : nullptr;
+	}();
+	const TSharedPtr<FJsonObject>* CreatedObj = nullptr;
+	if (!Created.IsValid() || !Created->TryGetObject(CreatedObj)) { return FString(); }
+	const FString Id = (*CreatedObj)->GetStringField(TEXT("id"));
+
+	// Keep only the newest MaxAuto automatic snapshots; named (manual) ones are never pruned.
+	int32 AutoSeen = 0;
+	for (const TSharedPtr<FJsonObject>& M : AllManifests())
+	{
+		const TSharedPtr<FJsonObject>* Metadata = nullptr;
+		bool bAuto = false;
+		if (M->TryGetObjectField(TEXT("metadata"), Metadata)) { (*Metadata)->TryGetBoolField(TEXT("auto"), bAuto); }
+		if (!bAuto) { continue; }
+		if (++AutoSeen > FMath::Max(1, MaxAuto)) { Remove(M->GetStringField(TEXT("id"))); }
+	}
+	return Id;
 }
 
 FString GameIQSnapshots::List(int32 Limit)

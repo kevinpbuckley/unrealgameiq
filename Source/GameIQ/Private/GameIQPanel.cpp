@@ -3,7 +3,9 @@
 #include "GameIQPanel.h"
 
 #include "Dom/JsonObject.h"
+#include "Engine/Engine.h"
 #include "GameIQBuildRunner.h"
+#include "GameIQProjectChecks.h"
 #include "GameIQQuery.h"
 #include "HAL/FileManager.h"
 #include "Misc/Paths.h"
@@ -90,7 +92,17 @@ namespace
 		Out += FString::Printf(TEXT("Index:       %s\n"), *DbPath);
 		Out += FString::Printf(TEXT("Size:        %.1f MB\n"), SizeMB);
 		Out += FString::Printf(TEXT("Last built:  %s\n"), *PrettyTime(R->GetStringField(TEXT("lastGeneratedAtIso"))));
-		Out += FString::Printf(TEXT("Last update: %s\n\n"), *PrettyTime(R->GetStringField(TEXT("lastIngestAtIso"))));
+		Out += FString::Printf(TEXT("Last update: %s\n"), *PrettyTime(R->GetStringField(TEXT("lastIngestAtIso"))));
+		// Per-source freshness (issue #29): the global stamp moves on any write and hides an old docs extract.
+		const TSharedPtr<FJsonObject>* BySource = nullptr;
+		if (R->TryGetObjectField(TEXT("bySource"), BySource))
+		{
+			for (const TPair<FString, TSharedPtr<FJsonValue>>& P : (*BySource)->Values)
+			{
+				Out += FString::Printf(TEXT("    %-12s %s\n"), *P.Key, *PrettyTime(P.Value->AsString()));
+			}
+		}
+		Out += TEXT("\n");
 		Out += FString::Printf(TEXT("Entities:    %d\n"), Total);
 		Out += FString::Join(KindLines, TEXT("\n"));
 		Out += FString::Printf(TEXT("\n\nEdges:       %d\n"), EdgeTotal);
@@ -143,6 +155,32 @@ void SGameIQPanel::Construct(const FArguments& InArgs)
 			]
 		]
 
+		// Agent-guide warning (issue #26): agents that are never told the index exists don't use it.
+		+ SVerticalBox::Slot().AutoHeight().Padding(12, 0, 12, 8)
+		[
+			SNew(SBorder)
+			.Visibility_Lambda([this]() { return bAgentGuideMissing ? EVisibility::Visible : EVisibility::Collapsed; })
+			.BorderImage(FAppStyle::Get().GetBrush("ToolPanel.GroupBorder"))
+			.Padding(8)
+			[
+				SNew(SHorizontalBox)
+				+ SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center)
+				[
+					SNew(STextBlock)
+					.Text(LOCTEXT("GuideMissing", "No agent file (CLAUDE.md, AGENTS.md, GEMINI.md) mentions Game IQ, so coding agents won't know to query it."))
+					.ColorAndOpacity(FLinearColor(1.0f, 0.75f, 0.2f))
+					.AutoWrapText(true)
+				]
+				+ SHorizontalBox::Slot().AutoWidth().Padding(8, 0, 0, 0).VAlign(VAlign_Center)
+				[
+					SNew(SButton)
+					.Text(LOCTEXT("WriteGuide", "Write Agent Guide"))
+					.ToolTipText(LOCTEXT("WriteGuideTip", "Write the Game IQ usage block into CLAUDE.md, GEMINI.md and AGENTS.md at the project root and add .gameiq/ to .gitignore. Same as console command GameIQ.GenerateAgentConfig All."))
+					.OnClicked(this, &SGameIQPanel::OnWriteGuideClicked)
+				]
+			]
+		]
+
 		// Live stage/log readout — only visible while a build is running.
 		+ SVerticalBox::Slot().AutoHeight().Padding(12, 0, 12, 8)
 		[
@@ -190,6 +228,18 @@ void SGameIQPanel::Construct(const FArguments& InArgs)
 void SGameIQPanel::Refresh()
 {
 	StatsText = BuildStatsText();
+	const FString Root = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir());
+	bAgentGuideMissing = !GameIQAgentFiles::Check(Root)->GetBoolField(TEXT("present"));
+}
+
+FReply SGameIQPanel::OnWriteGuideClicked()
+{
+	if (GEngine)
+	{
+		GEngine->Exec(nullptr, TEXT("GameIQ.GenerateAgentConfig All"));
+	}
+	Refresh();
+	return FReply::Handled();
 }
 
 FReply SGameIQPanel::OnRefreshClicked()

@@ -5,6 +5,7 @@
 #include "AssetRegistry/AssetData.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/IAssetRegistry.h"
+#include "GameIQAssetFacts.h"
 #include "GameIQJson.h"
 #include "HAL/FileManager.h"
 #include "Misc/Parse.h"
@@ -23,26 +24,6 @@ namespace
 		return PackageName.StartsWith(TEXT("/Game"));
 	}
 
-	/** Pull the prefix-less native parent class name from a Blueprint's registry tags, if present. */
-	bool TryGetNativeParentClassName(const FAssetData& Data, FString& OutClassName)
-	{
-		FString Raw;
-		if (!Data.GetTagValue(FName(TEXT("NativeParentClass")), Raw) &&
-			!Data.GetTagValue(FName(TEXT("ParentClass")), Raw))
-		{
-			return false;
-		}
-		// Raw looks like "/Script/Engine.Character" or "Class'/Script/Engine.Character'"
-		Raw.RemoveFromStart(TEXT("Class'"));
-		Raw.RemoveFromEnd(TEXT("'"));
-		int32 Dot = INDEX_NONE;
-		if (Raw.FindLastChar(TEXT('.'), Dot))
-		{
-			OutClassName = Raw.RightChop(Dot + 1);
-			return !OutClassName.IsEmpty();
-		}
-		return false;
-	}
 }
 
 UGameIQExportCommandlet::UGameIQExportCommandlet()
@@ -85,40 +66,17 @@ int32 UGameIQExportCommandlet::Main(const FString& Params)
 		{
 			continue;
 		}
+		// One-File-Per-Actor packages are level actors: the level recipe indexes them as typed
+		// level-actor entities (the assets stage and the save hook skip them the same way).
+		if (Package.Contains(TEXT("/__ExternalActors__/")) || Package.Contains(TEXT("/__ExternalObjects__/")))
+		{
+			continue;
+		}
 		++Considered;
 
-		const FString Id = FString::Printf(TEXT("asset:%s"), *Package);
-		const FString ClassName = Data.AssetClassPath.GetAssetName().ToString();
-		const bool bIsBlueprint = ClassName.EndsWith(TEXT("Blueprint"));
-		const FString Kind = bIsBlueprint ? TEXT("blueprint") : TEXT("asset");
-
-		TSharedRef<FJsonObject> Detail = MakeShared<FJsonObject>();
-		Detail->SetStringField(TEXT("assetClass"), ClassName);
-		Detail->SetStringField(TEXT("objectPath"), Data.GetObjectPathString());
-
-		Entities.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEntity(
-			Id, Kind, Data.AssetName.ToString(), Package, TEXT("asset"), FString(), FString(), Detail)));
-
-		// Tier 0 dependency graph (generic, from the registry — answers "what uses X?")
-		TArray<FName> Deps;
-		AR.GetDependencies(Data.PackageName, Deps, UE::AssetRegistry::EDependencyCategory::Package);
-		for (const FName& Dep : Deps)
-		{
-			const FString DepName = Dep.ToString();
-			if (IsProjectPackage(DepName))
-			{
-				Edges.Add(MakeShared<FJsonValueObject>(
-					GameIQ::MakeEdge(Id, FString::Printf(TEXT("asset:%s"), *DepName), TEXT("depends-on"))));
-			}
-		}
-
-		// Cross-link Blueprints to their native C++ parent (matches the C++ extractor's canonical ids)
-		FString ParentClassName;
-		if (bIsBlueprint && TryGetNativeParentClassName(Data, ParentClassName))
-		{
-			Edges.Add(MakeShared<FJsonValueObject>(
-				GameIQ::MakeEdge(Id, FString::Printf(TEXT("cpp:%s"), *ParentClassName), TEXT("inherits"))));
-		}
+		// Tier 0 identity (+ size facts, issue #33), dependency graph and native-parent link —
+		// shared with the save hook and the editor catch-up scan (GameIQAssetFacts.h).
+		GameIQAssetFacts::AppendTier0(AR, Data, Entities, Edges);
 	}
 
 	if (!GameIQ::WriteOutput(OutDir, TEXT("registry.json"), RegistryProducer, Entities, Edges, NoChunks))

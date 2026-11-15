@@ -7,6 +7,7 @@
 #include "GameIQCppParse.h"
 #include "GameIQFileWalk.h"
 #include "GameIQJson.h"
+#include "GameIQPaths.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 
@@ -242,9 +243,70 @@ int32 UGameIQCodeCommandlet::Main(const FString& /*Params*/)
 		}
 	}
 
+	// ---- asset-path literal pass (issue #32): "/Game/..." strings in code are how C++ loads
+	// content by path (LoadObject, ConstructorHelpers, soft paths, FString::Printf templates).
+	// Each becomes a `loads-by-path` edge from the function holding it — or, outside any parsed
+	// body (header constants, free functions, static tables), from a `cpp-file` entity — so
+	// "who loads this asset" is answerable and ProjectStats('unused') can tell "loaded by path"
+	// from "unused". Format strings and folder literals become `asset-pattern:` wildcards. ----
+	int32 NumLiteralEdges = 0;
+	{
+		TSet<FString> EdgeKeys;
+		auto AddLiteralEdge = [&](const FString& Src, const GameIQPaths::FLiteral& L)
+		{
+			const FString Key = Src + TEXT("|") + L.Target;
+			if (EdgeKeys.Contains(Key)) { return; }
+			EdgeKeys.Add(Key);
+			Edges.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEdge(Src, L.Target, TEXT("loads-by-path"), L.Literal)));
+			++NumLiteralEdges;
+		};
+
+		TMap<FString, TSet<FString>> CoveredByRel; // literals already attributed to a function, per file
+		for (int32 BodyIdx = 0; BodyIdx < AllBodies.Num(); ++BodyIdx)
+		{
+			const FCppBody& B = AllBodies[BodyIdx];
+			const FString Fid = FString::Printf(TEXT("cpp:%s::%s"), *ReflectionName(B.ClassName), *B.Func);
+			for (const GameIQPaths::FLiteral& L : GameIQPaths::FindCodeLiterals(B.Body))
+			{
+				AddLiteralEdge(Fid, L);
+				CoveredByRel.FindOrAdd(AllBodyRels[BodyIdx]).Add(L.Literal);
+			}
+		}
+
+		for (const FString& File : GameIQWalk::WalkFiles(Root, { TEXT(".h"), TEXT(".cpp"), TEXT(".inl") }))
+		{
+			FString Text;
+			if (!FFileHelper::LoadFileToString(Text, *File) || !Text.Contains(TEXT("/Game/"))) { continue; }
+			const FString Rel = GameIQWalk::RelPath(Root, File);
+			const TSet<FString>* Covered = CoveredByRel.Find(Rel);
+			TArray<GameIQPaths::FLiteral> Loose;
+			for (const GameIQPaths::FLiteral& L : GameIQPaths::FindCodeLiterals(Text))
+			{
+				if (!Covered || !Covered->Contains(L.Literal)) { Loose.Add(L); }
+			}
+			if (Loose.Num() == 0) { continue; }
+			const FString FileId = FString::Printf(TEXT("cpp-file:%s"), *Rel);
+			TArray<FString> Lines;
+			for (const GameIQPaths::FLiteral& L : Loose)
+			{
+				AddLiteralEdge(FileId, L);
+				Lines.Add(L.Literal);
+			}
+			TSharedRef<FJsonObject> FileDetail = MakeShared<FJsonObject>();
+			FileDetail->SetStringField(TEXT("file"), Rel);
+			Entities.Add(MakeShared<FJsonValueObject>(GameIQ::MakeEntity(
+				FileId, TEXT("cpp-file"), FPaths::GetCleanFilename(Rel), Rel, TEXT("code"), FString(),
+				FString::Printf(TEXT("%s (asset paths outside parsed functions)"), *Rel), FileDetail)));
+			Chunks.Add(MakeShared<FJsonValueObject>(GameIQ::MakeChunk(
+				FileId + TEXT("#paths"), FileId, TEXT("cpp-signature"),
+				FString::Printf(TEXT("%s loads by path:\n%s"), *Rel, *FString::Join(Lines, TEXT("\n"))))));
+		}
+	}
+
 	const FString OutDir = FPaths::Combine(Root, TEXT(".gameiq"), TEXT("extract"));
 	IFileManager::Get().MakeDirectory(*OutDir, true);
 	GameIQ::WriteOutput(OutDir, TEXT("cpp.json"), TEXT("gameiq-cpp@0.1.0"), Entities, Edges, Chunks);
+	UE_LOG(LogGameIQCode, Display, TEXT("Game IQ code: %d loads-by-path edges from /Game string literals."), NumLiteralEdges);
 	// Stamp the source fingerprint this extraction saw — the editor's staleness check compares
 	// against it to decide whether an automatic C++-only reindex is needed (GameIQSaveHook).
 	GameIQCppFingerprint::Write(Root, GameIQCppFingerprint::Compute(Root));
