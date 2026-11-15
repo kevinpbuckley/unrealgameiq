@@ -215,7 +215,7 @@ namespace GameIQAgentFiles
 		return IFileManager::Get().DirectoryExists(*Git) || IFileManager::Get().FileExists(*Git);
 	}
 
-	/** True when a .gitignore line ignores the .gameiq folder (".gameiq", "/.gameiq/", ".gameiq/**"). */
+	/** True when a .gitignore line ignores the .gameiq folder (".gameiq", "/.gameiq/", ".gameiq/(double star)"). */
 	inline bool GitignoreCoversIndex(const FString& Root)
 	{
 		FString Text;

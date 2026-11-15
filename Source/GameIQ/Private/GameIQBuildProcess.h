@@ -9,7 +9,7 @@
 
 /**
  * UI-agnostic helper for running heavyweight Game IQ extraction stages as concurrent
- * UnrealEditor-Cmd subprocesses (each stage writes its own .gameiq/extract/*.json, order
+ * UnrealEditor-Cmd subprocesses (each stage writes its own .gameiq/extract/<name>.json, order
  * doesn't matter). Deliberately never threads stages in-process: Assets/Blueprints call
  * GetAsset() (UE asset loading is expected to run on the game thread of a single process),
  * and every stage constructs a fresh UCommandlet UObject via NewObject(), which isn't safe

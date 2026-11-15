@@ -97,8 +97,10 @@ namespace
 		const TSharedPtr<FJsonObject>* BySource = nullptr;
 		if (R->TryGetObjectField(TEXT("bySource"), BySource))
 		{
-			for (const TPair<FString, TSharedPtr<FJsonValue>>& P : (*BySource)->Values)
+			for (const auto& PRaw : (*BySource)->Values)
 			{
+				// UE 5.8: FJsonObject keys are TSharedString, not FString
+				const TPair<FString, TSharedPtr<FJsonValue>> P(FString(*PRaw.Key), PRaw.Value);
 				Out += FString::Printf(TEXT("    %-12s %s\n"), *P.Key, *PrettyTime(P.Value->AsString()));
 			}
 		}
