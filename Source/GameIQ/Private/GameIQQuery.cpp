@@ -1,6 +1,7 @@
 // Copyright Buckley Builds LLC. All Rights Reserved.
 
 #include "GameIQQuery.h"
+#include "GameIQProjectChecks.h"
 #include "GameIQSqlBind.h"
 
 #include "Dom/JsonObject.h"
@@ -126,13 +127,43 @@ namespace
 		return V;
 	}
 
-	/** Index-age stamp (design §8), mirrored from the meta table so agents know staleness. */
+	/** Friendly source name for a producer id: "gameiq-docs@0.1.0" -> "docs". */
+	FString SourceOfProducer(const FString& Producer)
+	{
+		FString P = Producer;
+		int32 At = INDEX_NONE;
+		if (P.FindChar(TEXT('@'), At)) { P.LeftInline(At); }
+		P.RemoveFromStart(TEXT("gameiq-"));
+		P.RemoveFromStart(TEXT("ue-"));
+		return P == TEXT("bp") ? FString(TEXT("blueprints")) : P;
+	}
+
+	/** Per-producer last-ingest times (issue #29), keyed by friendly source name (cpp, assets,
+	 *  blueprints, registry, docs, images, config, external-docs, …). */
+	TSharedRef<FJsonObject> ProducerFreshness(FSQLiteDatabase& Db)
+	{
+		TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+		FSQLitePreparedStatement Stmt = Db.PrepareStatement(
+			TEXT("SELECT key, value FROM meta WHERE key LIKE 'producerIngestAtIso:%' ORDER BY key"));
+		if (!Stmt.IsValid()) { return Out; }
+		while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+		{
+			FString Key = ColStr(Stmt, TEXT("key"));
+			Key.RemoveFromStart(TEXT("producerIngestAtIso:"));
+			Out->SetStringField(SourceOfProducer(Key), ColStr(Stmt, TEXT("value")));
+		}
+		return Out;
+	}
+
+	/** Index-age stamp (design §8), mirrored from the meta table so agents know staleness.
+	 *  `lastIngestAtIso` moves on ANY write; `bySource` says how old each source is (issue #29). */
 	TSharedRef<FJsonObject> IndexNote(FSQLiteDatabase& Db)
 	{
 		TSharedRef<FJsonObject> Note = MakeShared<FJsonObject>();
 		Note->SetField(TEXT("lastIngestAtIso"), NullOrString(MetaValue(Db, TEXT("lastIngestAtIso"))));
 		Note->SetField(TEXT("lastGeneratedAtIso"), NullOrString(MetaValue(Db, TEXT("lastGeneratedAtIso"))));
 		Note->SetField(TEXT("projectName"), NullOrString(MetaValue(Db, TEXT("projectName"))));
+		Note->SetObjectField(TEXT("bySource"), ProducerFreshness(Db));
 		return Note;
 	}
 
@@ -280,6 +311,8 @@ namespace
 			{ TEXT("uses-skeleton"), 8 }, { TEXT("uses-material"), 7 }, { TEXT("uses-texture"), 5 },
 			{ TEXT("overrides-parameter"), 6 }, { TEXT("casts-to"), 6 }, { TEXT("placed-in-level"), 5 },
 			{ TEXT("instance-of"), 5 }, // placed actor → its Blueprint/C++ class
+			{ TEXT("loads-by-path"), 6 }, // a C++ literal path breaks silently at run time on rename
+			{ TEXT("plays-anim"), 5 }, { TEXT("plays-audio"), 5 }, { TEXT("plays-sequence"), 5 },
 			{ TEXT("plays-on"), 4 }, { TEXT("depends-on"), 4 }, { TEXT("references"), 3 },
 			{ TEXT("describes"), 2 }, { TEXT("constrains"), 2 }, { TEXT("illustrates"), 2 },
 		};
@@ -656,6 +689,222 @@ namespace
 		Text.ReplaceInline(TEXT("\r"), TEXT(" "));
 		Text.ReplaceInline(TEXT("\n"), TEXT(" "));
 		return Text;
+	}
+
+	/** `via` from an edge's attrs JSON, or empty. */
+	FString AttrVia(const FString& AttrsRaw)
+	{
+		const TSharedPtr<FJsonValue> V = ParseJsonColumn(AttrsRaw);
+		const TSharedPtr<FJsonObject>* O = nullptr;
+		FString Via;
+		if (V.IsValid() && V->TryGetObject(O)) { (*O)->TryGetStringField(TEXT("via"), Via); }
+		return Via;
+	}
+
+	/**
+	 * Unused-asset candidates (issue #31). An asset counts as USED only through a real inbound
+	 * edge: not a self-edge, not from a document (stated intent — a design doc naming an asset
+	 * doesn't load it), not from the asset's own child entities (a level's placed actors point
+	 * back at the level). Assets whose only "use" is a C++ string literal — an exact
+	 * `loads-by-path` edge, or a `/Game/...%s...` format string / folder literal stored as an
+	 * `asset-pattern:` edge — are reported separately as possibly loaded by path: neither proven
+	 * used nor safe to delete.
+	 */
+	TSharedRef<FJsonObject> UnusedAssets(FSQLiteDatabase& Db)
+	{
+		struct FCandidate { FString Id, Kind, Name, Path, Class; int64 Bytes = -1; };
+		TArray<FCandidate> Candidates;
+		{
+			FSQLitePreparedStatement Stmt = Db.PrepareStatement(TEXT(
+				"SELECT e.id AS id, e.kind AS kind, e.name AS name, e.path AS path,"
+				" COALESCE(json_extract(e.detail,'$.assetClass'),'') AS assetClass,"
+				" COALESCE(json_extract(e.detail,'$.diskBytes'),-1) AS diskBytes "
+				"FROM entities e WHERE e.kind IN ('asset','blueprint') AND NOT EXISTS ("
+				"  SELECT 1 FROM edges x LEFT JOIN entities s ON s.id = x.src"
+				"  WHERE x.dst = e.id AND x.src <> x.dst"
+				"  AND x.type NOT IN ('describes','illustrates','loads-by-path')"
+				"  AND COALESCE(s.authority,'extracted-fact') <> 'stated-intent'"
+				"  AND COALESCE(s.parent,'') <> e.id"
+				") ORDER BY e.id"));
+			if (Stmt.IsValid())
+			{
+				while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+				{
+					FCandidate C{ ColStr(Stmt, TEXT("id")), ColStr(Stmt, TEXT("kind")), ColStr(Stmt, TEXT("name")),
+						ColStr(Stmt, TEXT("path")), ColStr(Stmt, TEXT("assetClass")) };
+					Stmt.GetColumnValueByName(TEXT("diskBytes"), C.Bytes);
+					Candidates.Add(MoveTemp(C));
+				}
+			}
+		}
+
+		// Exact path literals: dst -> the literal that names it.
+		TMap<FString, FString> ExactByPath;
+		// Pattern literals: package wildcard ("/Game/Anim/A_Idle_Seated_*") -> literal.
+		TArray<TPair<FString, FString>> Patterns;
+		{
+			FSQLitePreparedStatement Stmt = Db.PrepareStatement(TEXT(
+				"SELECT src, dst, COALESCE(attrs,'') AS attrs FROM edges WHERE type = 'loads-by-path'"));
+			if (Stmt.IsValid())
+			{
+				while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+				{
+					const FString Dst = ColStr(Stmt, TEXT("dst"));
+					const FString Via = AttrVia(ColStr(Stmt, TEXT("attrs")));
+					const FString Label = FString::Printf(TEXT("%s (%s)"), *(Via.IsEmpty() ? Dst : Via), *ColStr(Stmt, TEXT("src")));
+					if (Dst.StartsWith(TEXT("asset-pattern:")))
+					{
+						Patterns.Add({ Dst.Mid(14), Label });
+					}
+					else
+					{
+						ExactByPath.Add(Dst, Label);
+					}
+				}
+			}
+		}
+
+		TArray<TSharedPtr<FJsonValue>> Unused, ByPath;
+		TMap<FString, int32> UnusedByClass;
+		int32 NumUnused = 0, NumByPath = 0;
+		constexpr int32 Cap = 500;
+		for (const FCandidate& C : Candidates)
+		{
+			FString MatchedBy;
+			if (const FString* Exact = ExactByPath.Find(C.Id)) { MatchedBy = *Exact; }
+			else
+			{
+				const FString Package = C.Id.StartsWith(TEXT("asset:")) ? C.Id.Mid(6) : C.Path;
+				for (const TPair<FString, FString>& P : Patterns)
+				{
+					if (Package.MatchesWildcard(P.Key, ESearchCase::IgnoreCase)) { MatchedBy = P.Value; break; }
+				}
+			}
+
+			TSharedRef<FJsonObject> Row = MakeShared<FJsonObject>();
+			Row->SetStringField(TEXT("id"), C.Id);
+			Row->SetStringField(TEXT("kind"), C.Kind);
+			Row->SetStringField(TEXT("name"), C.Name);
+			Row->SetStringField(TEXT("path"), C.Path);
+			if (!C.Class.IsEmpty()) { Row->SetStringField(TEXT("assetClass"), C.Class); }
+			if (C.Bytes >= 0) { Row->SetNumberField(TEXT("diskBytes"), static_cast<double>(C.Bytes)); }
+			if (!MatchedBy.IsEmpty())
+			{
+				++NumByPath;
+				Row->SetStringField(TEXT("matchedBy"), MatchedBy);
+				if (ByPath.Num() < Cap) { ByPath.Add(MakeShared<FJsonValueObject>(Row)); }
+			}
+			else
+			{
+				++NumUnused;
+				UnusedByClass.FindOrAdd(C.Class.IsEmpty() ? C.Kind : C.Class)++;
+				if (Unused.Num() < Cap) { Unused.Add(MakeShared<FJsonValueObject>(Row)); }
+			}
+		}
+
+		UnusedByClass.ValueSort([](int32 A, int32 B) { return A > B; });
+		TSharedRef<FJsonObject> ByClassJson = MakeShared<FJsonObject>();
+		for (const TPair<FString, int32>& P : UnusedByClass) { ByClassJson->SetNumberField(P.Key, P.Value); }
+
+		TSharedRef<FJsonObject> Counts = MakeShared<FJsonObject>();
+		Counts->SetNumberField(TEXT("unused"), NumUnused);
+		Counts->SetNumberField(TEXT("possiblyLoadedByPath"), NumByPath);
+		Counts->SetObjectField(TEXT("unusedByClass"), ByClassJson);
+
+		TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+		Out->SetArrayField(TEXT("unused"), Unused);
+		Out->SetArrayField(TEXT("possiblyLoadedByPath"), ByPath);
+		Out->SetObjectField(TEXT("counts"), Counts);
+		Out->SetBoolField(TEXT("truncated"), NumUnused > Cap || NumByPath > Cap);
+		Out->SetStringField(TEXT("note"),
+			TEXT("'unused' = no inbound edge except self-edges, design-doc links and the asset's own child entities. "
+			     "'possiblyLoadedByPath' = only a C++ /Game/... string literal (or a %s format/folder literal) names it: "
+			     "check the code before deleting. Maps, startup assets and assets loaded through the Asset Manager or "
+			     "config (.ini) paths can still show as unused; confirm with references(id) and a grep of Config/."));
+		return Out;
+	}
+
+	/** Size facet (issue #33): biggest assets by on-disk package size, totals by class and folder.
+	 *  `ClassFilter` (e.g. "Texture2D") restricts every list to one asset class. */
+	TSharedRef<FJsonObject> LargestAssets(FSQLiteDatabase& Db, const FString& ClassFilter)
+	{
+		TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+		TArray<TSharedPtr<FJsonValue>> Top;
+		TMap<FString, TPair<int32, int64>> ByClass, ByFolder;
+		int64 Total = 0;
+		int32 WithSize = 0;
+		FSQLitePreparedStatement Stmt = Db.PrepareStatement(TEXT(
+			"SELECT id, name, path, kind, detail, json_extract(detail,'$.diskBytes') AS diskBytes,"
+			" COALESCE(json_extract(detail,'$.assetClass'), kind) AS assetClass "
+			"FROM entities WHERE kind IN ('asset','blueprint') AND json_extract(detail,'$.diskBytes') IS NOT NULL "
+			"AND (?1 = '' OR json_extract(detail,'$.assetClass') = ?1) "
+			"ORDER BY json_extract(detail,'$.diskBytes') DESC"));
+		if (Stmt.IsValid())
+		{
+			GameIQSql::Bind(Stmt, 1, ClassFilter);
+			while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+			{
+				int64 Bytes = 0;
+				Stmt.GetColumnValueByName(TEXT("diskBytes"), Bytes);
+				const FString Class = ColStr(Stmt, TEXT("assetClass"));
+				const FString Path = ColStr(Stmt, TEXT("path"));
+				++WithSize;
+				Total += Bytes;
+				TPair<int32, int64>& C = ByClass.FindOrAdd(Class);
+				++C.Key; C.Value += Bytes;
+				// Folder rollup two levels under the mount: /Game/DirectorsCut/Characters.
+				TArray<FString> Parts;
+				Path.ParseIntoArray(Parts, TEXT("/"));
+				const FString Folder = Parts.Num() >= 4
+					? FString::Printf(TEXT("/%s/%s/%s"), *Parts[0], *Parts[1], *Parts[2])
+					: (Parts.Num() >= 2 ? FString::Printf(TEXT("/%s/%s"), *Parts[0], *Parts[1]) : Path);
+				TPair<int32, int64>& Fo = ByFolder.FindOrAdd(Folder);
+				++Fo.Key; Fo.Value += Bytes;
+				if (Top.Num() < 50)
+				{
+					TSharedRef<FJsonObject> Row = MakeShared<FJsonObject>();
+					Row->SetStringField(TEXT("id"), ColStr(Stmt, TEXT("id")));
+					Row->SetStringField(TEXT("name"), ColStr(Stmt, TEXT("name")));
+					Row->SetStringField(TEXT("assetClass"), Class);
+					Row->SetNumberField(TEXT("diskBytes"), static_cast<double>(Bytes));
+					// Carry the class facts (dimensions, format, triangles, duration, …) recorded with it.
+					const TSharedPtr<FJsonValue> Detail = ParseJsonColumn(ColStr(Stmt, TEXT("detail")));
+					const TSharedPtr<FJsonObject>* DetailObj = nullptr;
+					const TSharedPtr<FJsonObject>* Facts = nullptr;
+					if (Detail.IsValid() && Detail->TryGetObject(DetailObj) && (*DetailObj)->TryGetObjectField(TEXT("facts"), Facts))
+					{
+						Row->SetObjectField(TEXT("facts"), *Facts);
+					}
+					Top.Add(MakeShared<FJsonValueObject>(Row));
+				}
+			}
+		}
+		auto Rollup = [](TMap<FString, TPair<int32, int64>>& Map, const TCHAR* KeyName, int32 Max)
+		{
+			Map.ValueSort([](const TPair<int32, int64>& A, const TPair<int32, int64>& B) { return A.Value > B.Value; });
+			TArray<TSharedPtr<FJsonValue>> Rows;
+			for (const TPair<FString, TPair<int32, int64>>& P : Map)
+			{
+				if (Rows.Num() >= Max) { break; }
+				TSharedRef<FJsonObject> Row = MakeShared<FJsonObject>();
+				Row->SetStringField(KeyName, P.Key);
+				Row->SetNumberField(TEXT("count"), P.Value.Key);
+				Row->SetNumberField(TEXT("diskBytes"), static_cast<double>(P.Value.Value));
+				Rows.Add(MakeShared<FJsonValueObject>(Row));
+			}
+			return Rows;
+		};
+		Out->SetStringField(TEXT("classFilter"), ClassFilter);
+		Out->SetArrayField(TEXT("largest"), Top);
+		Out->SetArrayField(TEXT("byClass"), Rollup(ByClass, TEXT("assetClass"), 40));
+		Out->SetArrayField(TEXT("byFolder"), Rollup(ByFolder, TEXT("folder"), 40));
+		Out->SetNumberField(TEXT("assetsWithSize"), WithSize);
+		Out->SetNumberField(TEXT("totalDiskBytes"), static_cast<double>(Total));
+		Out->SetStringField(TEXT("note"),
+			TEXT("Sizes are uncooked on-disk package sizes (.uasset + .uexp + .ubulk), not cooked sizes. "
+			     "Use facet 'largest:<AssetClass>' (e.g. largest:Texture2D) for one class. "
+			     "Assets indexed before size facts existed have no diskBytes until a rebuild or their next save."));
+		return Out;
 	}
 }
 
@@ -1385,11 +1634,13 @@ FString GameIQQuery::ProjectStats(const FString& Facet)
 	}
 	if (F == TEXT("unused"))
 	{
-		return Envelope(Db, MakeShared<FJsonValueArray>(SelectRows(Db,
-			TEXT("SELECT e.id AS id, e.kind AS kind, e.name AS name, e.path AS path FROM entities e "
-			     "WHERE e.kind IN ('asset','blueprint') "
-			     "AND NOT EXISTS (SELECT 1 FROM edges x WHERE x.dst = e.id) LIMIT 500"),
-			{ TEXT("id"), TEXT("kind"), TEXT("name"), TEXT("path") }, {})));
+		return Envelope(Db, MakeShared<FJsonValueObject>(UnusedAssets(Db)));
+	}
+	if (F == TEXT("largest") || F.StartsWith(TEXT("largest:")))
+	{
+		FString ClassFilter;
+		F.Split(TEXT(":"), nullptr, &ClassFilter);
+		return Envelope(Db, MakeShared<FJsonValueObject>(LargestAssets(Db, ClassFilter.TrimStartAndEnd())));
 	}
 	if (F == TEXT("largest-deps"))
 	{
@@ -1427,6 +1678,7 @@ FString GameIQQuery::ProjectStats(const FString& Facet)
 	Overview->SetField(TEXT("projectName"), NullOrString(MetaValue(Db, TEXT("projectName"))));
 	Overview->SetField(TEXT("lastIngestAtIso"), NullOrString(MetaValue(Db, TEXT("lastIngestAtIso"))));
 	Overview->SetField(TEXT("lastGeneratedAtIso"), NullOrString(MetaValue(Db, TEXT("lastGeneratedAtIso"))));
+	Overview->SetObjectField(TEXT("bySource"), ProducerFreshness(Db));
 	return Envelope(Db, MakeShared<FJsonValueObject>(Overview));
 }
 
@@ -1589,11 +1841,82 @@ FString GameIQQuery::Doctor()
 	Payload->SetField(TEXT("dbGeneration"), NullOrString(MetaValue(Db, TEXT("dbGeneration"))));
 	Payload->SetField(TEXT("lastIngestAtIso"), NullOrString(MetaValue(Db, TEXT("lastIngestAtIso"))));
 	Payload->SetField(TEXT("lastGeneratedAtIso"), NullOrString(MetaValue(Db, TEXT("lastGeneratedAtIso"))));
+	Payload->SetObjectField(TEXT("bySource"), ProducerFreshness(Db));
+
+	TArray<FString> Warnings;
+	const FString ProjectRoot = FPaths::GetPath(FPaths::GetPath(IndexDbPath()));
+
+	// Disk versus index (issue #35): content copied in on disk (marketplace packs, a VCS sync)
+	// never triggers a save, so the save hook never sees it.
+	if (MissingTables.Num() == 0)
+	{
+		TSet<FString> Indexed;
+		{
+			FSQLitePreparedStatement Stmt = Db.PrepareStatement(TEXT(
+				"SELECT substr(id, 7) AS pkg FROM entities WHERE id LIKE 'asset:/Game/%' AND parent IS NULL"));
+			if (Stmt.IsValid())
+			{
+				while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row) { Indexed.Add(ColStr(Stmt, TEXT("pkg"))); }
+			}
+		}
+		const TSharedRef<FJsonObject> Gap = GameIQDiskGap::Compare(ProjectRoot, Indexed);
+		Payload->SetObjectField(TEXT("diskVsIndex"), Gap);
+		const int32 Missing = static_cast<int32>(Gap->GetNumberField(TEXT("missingFromIndex")));
+		const int32 Gone = static_cast<int32>(Gap->GetNumberField(TEXT("goneFromDisk")));
+		if (Missing > 0)
+		{
+			Problems.Add(FString::Printf(
+				TEXT("%d of %d assets on disk are not in the index (see diskVsIndex.missingByFolder) — open the editor "
+				     "(the startup catch-up scan adds them) or run GameIQ.Rebuild"),
+				Missing, static_cast<int32>(Gap->GetNumberField(TEXT("diskAssets")))));
+		}
+		if (Gone > 0)
+		{
+			Problems.Add(FString::Printf(
+				TEXT("%d indexed assets no longer exist on disk (see diskVsIndex.goneSample) — the startup catch-up scan "
+				     "or GameIQ.Rebuild removes them"), Gone));
+		}
+	}
+
+	// Docs freshness (issue #29): the docs extract is stamped with a fingerprint of the doc files.
+	{
+		const FString Stored = GameIQDocsFingerprint::ReadStored(ProjectRoot);
+		if (!Stored.IsEmpty())
+		{
+			const FString Current = GameIQDocsFingerprint::Compute(ProjectRoot);
+			const bool bDocsStale = Current != Stored;
+			Payload->SetBoolField(TEXT("docsChangedSinceExtract"), bDocsStale);
+			if (bDocsStale)
+			{
+				Problems.Add(TEXT("design docs changed since the last docs extraction — the editor reindexes them "
+				                  "automatically (Auto Reindex Docs); otherwise run GameIQ.ReindexDocs"));
+			}
+		}
+	}
+
+	// Agent discoverability (issue #26) and .gitignore (issue #37): not index health, so warnings.
+	{
+		TSharedRef<FJsonObject> Guide = GameIQAgentFiles::Check(ProjectRoot);
+		Payload->SetObjectField(TEXT("agentGuide"), Guide);
+		if (!Guide->GetBoolField(TEXT("present")))
+		{
+			Warnings.Add(TEXT("no agent file (CLAUDE.md, AGENTS.md, GEMINI.md, .github/copilot-instructions.md) carries the "
+			                  "GameIQ guide block, so agents are not told the index exists — run the console command "
+			                  "GameIQ.GenerateAgentConfig (or the panel's Write Agent Guide button)"));
+		}
+		if (Guide->GetBoolField(TEXT("gitRepo")) && !Guide->GetBoolField(TEXT("gitignoresIndex")))
+		{
+			Warnings.Add(TEXT(".gameiq/ is not in .gitignore, so the index shows as untracked — GameIQ.GenerateAgentConfig adds it"));
+		}
+	}
 
 	Payload->SetBoolField(TEXT("healthy"), Problems.Num() == 0);
 	TArray<TSharedPtr<FJsonValue>> ProblemsJson;
 	for (const FString& P : Problems) { ProblemsJson.Add(MakeShared<FJsonValueString>(P)); }
 	Payload->SetArrayField(TEXT("problems"), ProblemsJson);
+	TArray<TSharedPtr<FJsonValue>> WarningsJson;
+	for (const FString& W : Warnings) { WarningsJson.Add(MakeShared<FJsonValueString>(W)); }
+	Payload->SetArrayField(TEXT("warnings"), WarningsJson);
 	return Envelope(Db, MakeShared<FJsonValueObject>(Payload));
 }
 

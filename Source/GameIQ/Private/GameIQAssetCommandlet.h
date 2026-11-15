@@ -26,6 +26,15 @@ namespace GameIQAsset
 		TArray<TSharedPtr<FJsonValue>>& Chunks,
 		const FAssetData* RegistryData = nullptr,
 		bool bIncludeExternalActors = true);
+
+	/** No-load Tier 1 summary from Asset Registry tags alone (the path every class without a
+	 *  bespoke recipe takes). Used by the editor's startup catch-up scan for assets that arrived
+	 *  without an editor save (issue #35). */
+	void ExtractFromRegistryTags(
+		const FAssetData& Data,
+		TArray<TSharedPtr<FJsonValue>>& Entities,
+		TArray<TSharedPtr<FJsonValue>>& Edges,
+		TArray<TSharedPtr<FJsonValue>>& Chunks);
 }
 
 /**

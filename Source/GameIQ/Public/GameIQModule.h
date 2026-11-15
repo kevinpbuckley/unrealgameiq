@@ -17,7 +17,7 @@ public:
 	virtual void ShutdownModule() override;
 
 private:
-	/** Expose UGameIQService on UE 5.8's native ToolsetRegistry / MCP endpoint (needs GEditor). */
+	/** Expose UGameIQService on UE 5.9's native ToolsetRegistry / MCP endpoint (needs GEditor). */
 	void RegisterToolsets();
 
 	/** Register the Tools > Game IQ panel (dockable tab + menu entry) and unregister on shutdown. */

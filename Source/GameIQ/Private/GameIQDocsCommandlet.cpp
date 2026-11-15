@@ -4,6 +4,7 @@
 
 #include "Dom/JsonObject.h"
 #include "GameIQDocsExtract.h"
+#include "GameIQProjectChecks.h"
 #include "GameIQJson.h"
 #include "HAL/FileManager.h"
 #include "Misc/Paths.h"
@@ -47,6 +48,8 @@ int32 UGameIQDocsCommandlet::Main(const FString& /*Params*/)
 	const FString OutDir = FPaths::Combine(Root, TEXT(".gameiq"), TEXT("extract"));
 	IFileManager::Get().MakeDirectory(*OutDir, true);
 	GameIQ::WriteOutput(OutDir, TEXT("docs.json"), DocsProducer, Entities, Edges, Chunks);
+	// Stamp what this extraction saw: the editor's docs watcher and Doctor compare against it (issue #29).
+	GameIQDocsFingerprint::Write(Root, GameIQDocsFingerprint::Compute(Root));
 
 	UE_LOG(LogGameIQDocs, Display,
 		TEXT("Game IQ docs: %d documents (%d files walked, %d skipped) → %d entities, %d chunks → docs.json"),

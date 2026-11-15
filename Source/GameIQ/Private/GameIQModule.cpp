@@ -7,6 +7,7 @@
 #include "Framework/Docking/TabManager.h"
 #include "GameIQBuildRunner.h"
 #include "GameIQPanel.h"
+#include "GameIQProjectChecks.h"
 #include "GameIQToolset.h"
 #include "HAL/FileManager.h"
 #include "Interfaces/IPluginManager.h"
@@ -113,8 +114,8 @@ static void GenerateGameIQAgentConfig(const TArray<FString>& Args, FOutputDevice
 		return;
 	}
 
-	const FString BeginMarker = TEXT("<!-- BEGIN GameIQ agent guidance -->");
-	const FString EndMarker = TEXT("<!-- END GameIQ agent guidance -->");
+	const FString BeginMarker = GameIQAgentFiles::BeginMarker();
+	const FString EndMarker = GameIQAgentFiles::EndMarker();
 
 	// Older bundled samples carried the guidance markers themselves; strip any embedded copies so
 	// the block (wrapped in markers below) never nests them — nested markers break the refresh
@@ -199,6 +200,12 @@ static void GenerateGameIQAgentConfig(const TArray<FString>& Args, FOutputDevice
 		{
 			Ar.Logf(TEXT("GameIQ.GenerateAgentConfig: ERROR — failed to write %s"), *FullPath);
 		}
+	}
+
+	// The index is local, machine-specific and rebuilt on demand: keep it out of git (issue #37).
+	if (GameIQAgentFiles::EnsureGitignore(ProjectRoot))
+	{
+		Ar.Logf(TEXT("GameIQ.GenerateAgentConfig: added .gameiq/ to %s"), *FPaths::Combine(ProjectRoot, TEXT(".gitignore")));
 	}
 
 	Ar.Logf(TEXT("GameIQ.GenerateAgentConfig: done (source: %s)."), *SamplePath);

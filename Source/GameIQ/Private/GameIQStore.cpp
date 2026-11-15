@@ -73,7 +73,14 @@ namespace
 		TEXT("INSERT INTO chunks_fts(rowid, text, aux) SELECT rowid, text, COALESCE(aux,'') FROM chunks;"),
 	};
 
-	constexpr int32 SchemaMigrations = 4; // C++ store schema version (TS store retired)
+	// Issue #31: drop self-edges already in older indexes (InsertEdge refuses new ones). Plus an
+	// index on edge type: the unused / loads-by-path / plays-* queries filter by it.
+	const TCHAR* Migration5[] = {
+		TEXT("DELETE FROM edges WHERE src = dst;"),
+		TEXT("CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(type);"),
+	};
+
+	constexpr int32 SchemaMigrations = 5; // C++ store schema version (TS store retired)
 
 	FString AsObject(const FJsonObject& O, const TCHAR* Field)
 	{
@@ -407,6 +414,7 @@ bool FGameIQStore::EnsureSchema()
 	if (Version < 2 && !RunMigration(Migration2, UE_ARRAY_COUNT(Migration2), 2)) { return false; }
 	if (Version < 3 && !RunMigration(Migration3, UE_ARRAY_COUNT(Migration3), 3)) { return false; }
 	if (Version < 4 && !RunMigration(Migration4, UE_ARRAY_COUNT(Migration4), 4)) { return false; }
+	if (Version < 5 && !RunMigration(Migration5, UE_ARRAY_COUNT(Migration5), 5)) { return false; }
 	return SchemaLooksValid();
 }
 
@@ -518,8 +526,13 @@ void FGameIQStore::InsertEdge(const FJsonObject& E, const FString& Producer)
 		TEXT("INSERT INTO edges (src, dst, type, attrs, producer) VALUES (?, ?, ?, ?, ?) "
 		     "ON CONFLICT(src, dst, type) DO UPDATE SET attrs=excluded.attrs, producer=excluded.producer"));
 	if (!Stmt.IsValid()) { return; }
-	GameIQSql::Bind(Stmt, 1, E.GetStringField(TEXT("src")));
-	GameIQSql::Bind(Stmt, 2, E.GetStringField(TEXT("dst")));
+	const FString Src = E.GetStringField(TEXT("src"));
+	const FString Dst = E.GetStringField(TEXT("dst"));
+	// Self-edges carry no relationship (an asset's ThumbnailInfo / InternalCollection subobject
+	// "references" its own package) and made every such asset look used (issue #31).
+	if (Src.IsEmpty() || Dst.IsEmpty() || Src == Dst) { return; }
+	GameIQSql::Bind(Stmt, 1, Src);
+	GameIQSql::Bind(Stmt, 2, Dst);
 	GameIQSql::Bind(Stmt, 3, E.GetStringField(TEXT("type")));
 	const FString Attrs = AsObject(E, TEXT("attrs"));
 	if (!Attrs.IsEmpty()) { GameIQSql::Bind(Stmt, 4, Attrs); }
@@ -666,7 +679,7 @@ bool FGameIQStore::Patch(
 	if (!BeginTransaction()) { return false; }
 	for (const FString& Root : Roots) { DeleteSubtree(Root); }
 	InsertRows(Entities, Edges, Chunks, Producer);
-	SetMeta(TEXT("lastIngestAtIso"), FDateTime::UtcNow().ToIso8601());
+	StampIngest(Producer);
 	return Commit();
 }
 
@@ -681,7 +694,7 @@ bool FGameIQStore::PatchProducerScoped(
 	if (!BeginTransaction()) { return false; }
 	for (const FString& Root : Replaces) { DeleteSubtreeForProducer(Root, Producer); }
 	InsertRows(Entities, Edges, Chunks, Producer);
-	SetMeta(TEXT("lastIngestAtIso"), FDateTime::UtcNow().ToIso8601());
+	StampIngest(Producer);
 	return Commit();
 }
 
@@ -695,8 +708,23 @@ bool FGameIQStore::IngestProducer(
 	if (!BeginTransaction()) { return false; }
 	DeleteByProducer(Producer);
 	InsertRows(Entities, Edges, Chunks, Producer);
-	SetMeta(TEXT("lastIngestAtIso"), FDateTime::UtcNow().ToIso8601());
+	StampIngest(Producer);
 	return Commit();
+}
+
+FString FGameIQStore::ProducerIngestKey(const FString& Producer)
+{
+	return FString(TEXT("producerIngestAtIso:")) + Producer;
+}
+
+void FGameIQStore::StampIngest(const FString& Producer)
+{
+	// The global stamp moves on every write (the C++ auto-reindex alone refreshed it 20 times a
+	// day), so it hid a docs extract that was three days old. Keep one stamp per producer as well,
+	// so every response and Doctor can say how fresh each source is (issue #29).
+	const FString Now = FDateTime::UtcNow().ToIso8601();
+	SetMeta(TEXT("lastIngestAtIso"), Now);
+	if (!Producer.IsEmpty()) { SetMeta(ProducerIngestKey(Producer), Now); }
 }
 
 void FGameIQStore::SetProjectMeta(const FString& Name, const FString& Root, const FString& GeneratedAtIso)

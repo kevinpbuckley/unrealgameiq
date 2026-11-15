@@ -7,15 +7,17 @@
 #include "GameIQToolset.generated.h"
 
 /**
- * Game IQ as a native UE 5.8 AI toolset (design §6.1). Registering a UToolsetDefinition
+ * Game IQ as a native UE 5.9 AI toolset (design §6.1). Registering a UToolsetDefinition
  * with `AICallable` static functions surfaces GameIQ's queries on Epic's MCP endpoint —
  * so any agent already on the native UE MCP or VibeUE can ask GameIQ questions with zero
  * extra setup, and each answer is served in-process from the SQLite index (no Node, no
- * per-call editor API round-trips). The standalone stdio MCP server stays for headless use.
+ * per-call editor API round-trips). With the editor closed (or held by another agent), the
+ * read-only CLI scripts/gameiq_query.py answers the same queries from .gameiq/index.db.
  *
  * Python access mirrors VibeUE's services, e.g.:
  *   unreal.GameIQService.search("reload ammo", "blueprint")
  *   unreal.GameIQService.get_entity("asset:/Game/Blueprints/BP_Rifle")
+ * Inside UE 5.9 execute_python: await call_tool("GameIQ.GameIQService.Search", query="reload", kind="")
  */
 UCLASS(BlueprintType)
 class UGameIQService : public UToolsetDefinition
@@ -88,14 +90,21 @@ public:
 	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "GameIQ")
 	static FString DeleteSnapshot(const FString& Id);
 
-	/** Semantic entity/edge/chunk changes between snapshots, or a snapshot and "current". */
+	/** Semantic entity/edge/chunk changes between two index states. `SinceSnapshot` and
+	 *  `UntilSnapshot` each take a snapshot id, "current", a git ref (commit sha, branch, tag,
+	 *  "HEAD~3") or an ISO-8601 time — e.g. Changes("HEAD~5") = what changed in assets, code and docs
+	 *  since that commit. The editor snapshots the index automatically each time git HEAD moves;
+	 *  a ref resolves to that commit's snapshot (or the newest one before it, noted in resolvedFrom). */
 	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "GameIQ")
 	static FString Changes(const FString& SinceSnapshot, const FString& UntilSnapshot = TEXT("current"),
 		const FString& Kind = TEXT(""), const FString& PathPrefix = TEXT(""),
 		int32 Limit = 200, int32 Offset = 0);
 
-	/** Project-wide stats. `Facet` is "overview", "kinds", "edges", "unused", "largest-deps",
-	 *  "authority" (extracted-fact vs stated-intent), or "doc-types". Returns a JSON string. */
+	/** Project-wide stats. `Facet` is "overview", "kinds", "edges", "unused" (assets with no real
+	 *  inbound use, plus a separate list of assets only a C++ /Game/... literal names), "largest"
+	 *  (biggest assets by on-disk size with totals by class and folder; "largest:Texture2D" for one
+	 *  class), "largest-deps", "authority" (extracted-fact vs stated-intent), or "doc-types".
+	 *  Returns a JSON string. */
 	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "GameIQ")
 	static FString ProjectStats(const FString& Facet = TEXT("overview"));
 
@@ -112,8 +121,10 @@ public:
 	static FString Drift();
 
 	/** Index health check: schema/tables, row counts, per-producer breakdown, FTS consistency,
-	 *  freshness stamps. Use to tell "empty project" apart from "broken index" before trusting
-	 *  empty query results. Returns a JSON string. */
+	 *  freshness per source (cpp, assets, blueprints, docs, …), assets on disk but missing from the
+	 *  index (by folder), docs changed since their last extraction, and warnings when no agent file
+	 *  carries the GameIQ guide or .gameiq/ is not gitignored. Use to tell "empty project" apart from
+	 *  "broken index" before trusting empty query results. Returns a JSON string. */
 	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "GameIQ")
 	static FString Doctor();
 };

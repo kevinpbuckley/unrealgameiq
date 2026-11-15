@@ -23,9 +23,12 @@ private:
 	FReply OnRebuildClicked();
 	FReply OnReindexDocsClicked();
 	FReply OnRefreshClicked();
+	FReply OnWriteGuideClicked();
 	void Refresh();
 	void OnBuildFinished(bool bSuccess);
 
 	FText StatsText;
+	/** No project agent file carries the GameIQ guide block (issue #26). */
+	bool bAgentGuideMissing = false;
 	FDelegateHandle BuildFinishedHandle;
 };

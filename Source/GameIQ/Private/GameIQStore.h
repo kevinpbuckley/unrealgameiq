@@ -82,6 +82,9 @@ public:
 	void SetMeta(const FString& Key, const FString& Value);
 	FString GetMeta(const FString& Key);
 
+	/** Meta key holding one producer's last ingest time ("producerIngestAtIso:<producer>"). */
+	static FString ProducerIngestKey(const FString& Producer);
+
 	/** Row counts for verification/health: entities, edges, chunks. */
 	void GetCounts(int64& OutEntities, int64& OutEdges, int64& OutChunks);
 
@@ -91,6 +94,9 @@ public:
 private:
 	FSQLiteDatabase Db;
 	FString OpenedPath;
+
+	/** Stamp the global and the per-producer last-ingest meta (issue #29). */
+	void StampIngest(const FString& Producer);
 
 	/** Execute one statement, logging on failure. */
 	bool Exec(const TCHAR* Sql);
