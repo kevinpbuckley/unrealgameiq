@@ -34,6 +34,6 @@ namespace GameIQSql
 	{
 		return Value.IsEmpty()
 			? Stmt.SetBindingValueByIndex(Index, TEXT(""))
-			: Stmt.SetBindingValueByIndex(Index, Value);
+			: Stmt.SetBindingValueByIndex(Index, FString(Value)); // UE 5.8 has no FStringView overload
 	}
 }

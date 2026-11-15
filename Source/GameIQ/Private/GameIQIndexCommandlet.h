@@ -8,7 +8,7 @@
 
 /**
  * Full index build in C++ (design §5.2, Phase 3b): ingest the extractor outputs under
- * `<ProjectDir>/.gameiq/extract/*.json` straight into the SQLite index via FGameIQStore —
+ * `<ProjectDir>/.gameiq/extract/<name>.json` straight into the SQLite index via FGameIQStore —
  * the same job the Node `gameiq index` did, now editor-native so the pipeline needs no Node.
  * Producer-scoped merge, so re-running replaces each producer's rows. Run headless after the
  * extract commandlets:

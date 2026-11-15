@@ -90,8 +90,10 @@ namespace GameIQHash
 			return Result;
 		}
 
-		for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : (*SigsObj)->Values)
+		for (const auto& PairRaw : (*SigsObj)->Values)
 		{
+			// UE 5.8: FJsonObject keys are TSharedString, not FString
+			const TPair<FString, TSharedPtr<FJsonValue>> Pair(FString(*PairRaw.Key), PairRaw.Value);
 			FString Sig;
 			if (Pair.Value.IsValid() && Pair.Value->TryGetString(Sig) && !Sig.IsEmpty())
 			{
